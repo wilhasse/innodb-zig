@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const module_map = @import("module_map.zig");
 
 pub const ut = @import("ut/mod.zig");
+pub const mem = @import("mem/mod.zig");
 pub const BuildOptions = build_options;
 
 comptime {
