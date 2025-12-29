@@ -33,4 +33,4 @@ subsystem layout.
 - thr: Thread helpers and scheduling wrappers.
 - trx: Transaction system, rollback segments, and state.
 - usr: Session/user state and transaction bindings.
-- ut: Utilities, assertions, and small helpers (C-compat types/macros live here).
+- ut: Utilities, assertions, logging, and error helpers (C-compat types/macros live here).
