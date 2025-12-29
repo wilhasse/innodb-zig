@@ -26,6 +26,16 @@ pub fn build(b: *std.Build) void {
         "atomic_ops",
         "Select atomic ops implementation (auto|gcc_builtins|solaris|innodb)",
     ) orelse .auto;
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Only run tests matching this substring",
+    );
+    const test_verbose = b.option(
+        bool,
+        "test-verbose",
+        "Show stdout/stderr for tests",
+    ) orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_compression", enable_compression);
@@ -49,6 +59,7 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .name = "lib_tests",
         .root_module = lib_module,
+        .filters = if (test_filter) |filter| &[_][]const u8{filter} else &.{},
     });
 
     const map_module = b.createModule(.{
@@ -61,11 +72,16 @@ pub fn build(b: *std.Build) void {
     const map_tests = b.addTest(.{
         .name = "module_map_tests",
         .root_module = map_module,
+        .filters = if (test_filter) |filter| &[_][]const u8{filter} else &.{},
     });
 
     const test_step = b.step("test", "Run unit tests");
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const run_map_tests = b.addRunArtifact(map_tests);
+    if (test_verbose) {
+        run_lib_tests.stdio = .inherit;
+        run_map_tests.stdio = .inherit;
+    }
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_map_tests.step);
 }
