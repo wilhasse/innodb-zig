@@ -8,8 +8,8 @@ all Zig changes aim to mirror the original intent while keeping the port
 readable for study.
 
 ## Layout
-- src/zig/ : Zig port modules (mirrors C subsystem layout)
-- docs/    : roadmap and design notes
+- src/  : Zig port modules (mirrors C subsystem layout)
+- docs/ : roadmap and design notes
 
 ## Workflow
 - Work is tracked as Plane tickets in project INNODB (identifier IBD).
