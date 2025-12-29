@@ -11,6 +11,10 @@ readable for study.
 - src/  : Zig port modules (mirrors C subsystem layout)
 - docs/ : roadmap and module boundary notes
 
+## Build
+- `zig build` builds the static library.
+- `zig build test` runs unit tests.
+
 ## Workflow
 - Work is tracked as Plane tickets in project INNODB (identifier IBD).
 - For each ticket: study C implementation, summarize, implement Zig equivalent,
