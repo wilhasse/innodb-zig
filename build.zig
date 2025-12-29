@@ -69,6 +69,26 @@ pub fn build(b: *std.Build) void {
         "test-verbose",
         "Show stdout/stderr for tests",
     ) orelse false;
+    const c_tests_root = b.option(
+        []const u8,
+        "c-tests-root",
+        "Path to the embedded InnoDB C source tree for running tests",
+    ) orelse "/home/cslog/oss-embedded-innodb";
+    const c_tests_list = b.option(
+        []const u8,
+        "c-tests-list",
+        "Override TEST_EXECUTABLES for C tests (space-separated)",
+    );
+    const c_tests_stress_list = b.option(
+        []const u8,
+        "c-tests-stress-list",
+        "Override TEST_STRESS_EXECUTABLES for stress C tests (space-separated)",
+    );
+    const c_tests_make = b.option(
+        []const u8,
+        "c-tests-make",
+        "Make binary to use for C test runs",
+    ) orelse "make";
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_compression", enable_compression);
@@ -120,4 +140,20 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_lib_tests.step);
         test_step.dependOn(&run_map_tests.step);
     }
+
+    const c_tests = b.step("c-tests", "Build and run embedded InnoDB C tests");
+    const c_tests_cmd = b.addSystemCommand(&.{ c_tests_make, "-C", c_tests_root, "test" });
+    c_tests_cmd.stdio = .inherit;
+    if (c_tests_list) |list| {
+        c_tests_cmd.addArg(b.fmt("TEST_EXECUTABLES={s}", .{list}));
+    }
+    c_tests.dependOn(&c_tests_cmd.step);
+
+    const c_tests_stress = b.step("c-tests-stress", "Build and run embedded InnoDB C stress tests");
+    const c_tests_stress_cmd = b.addSystemCommand(&.{ c_tests_make, "-C", c_tests_root, "test-stress" });
+    c_tests_stress_cmd.stdio = .inherit;
+    if (c_tests_stress_list) |list| {
+        c_tests_stress_cmd.addArg(b.fmt("TEST_STRESS_EXECUTABLES={s}", .{list}));
+    }
+    c_tests_stress.dependOn(&c_tests_stress_cmd.step);
 }
