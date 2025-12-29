@@ -1,7 +1,7 @@
 # Project Scope
 - Educational, non-production Zig port of early InnoDB sources.
 - C source reference: /home/cslog/oss-embedded-innodb (authoritative behavior).
-- Zig port lives in this repo; module tree under zig/.
+- Zig port lives in this repo; module tree under src/zig/.
 - Work is tracked as Plane tickets in project INNODB (identifier IBD).
 
 # Workflow
@@ -9,4 +9,4 @@
 - Keep steps small and wait for user approval before moving to the next ticket.
 
 # Documentation
-- Maintain porting roadmap and module map under zig/.
+- Maintain porting roadmap under docs/ and module map under src/zig/.
