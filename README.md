@@ -15,7 +15,7 @@ readable for study.
 - `zig build` builds the static library.
 - `zig build test` runs unit tests.
 - Build options (defaults): `-Dcompression=true`, `-Dshared=false`, `-Datomic_ops=auto` (auto|gcc_builtins|solaris|innodb).
-- Test options: `-Dtest-filter=<substring>` to select tests, `-Dtest-verbose=true` to show test output.
+- Test options: `-Dtest-filter=<substring>` to select tests, `-Dtest-verbose=true` to run `zig test` with visible output.
 
 ## Workflow
 - Work is tracked as Plane tickets in project INNODB (identifier IBD).

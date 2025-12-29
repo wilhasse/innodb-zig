@@ -7,6 +7,39 @@ const AtomicOps = enum {
     innodb,
 };
 
+fn addVerboseTest(
+    b: *std.Build,
+    source: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_filter: ?[]const u8,
+    build_options: ?*std.Build.Step.Options,
+) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{ b.graph.zig_exe, "test" });
+    run.stdio = .inherit;
+
+    const target_triple = target.query.zigTriple(b.allocator) catch @panic("OOM");
+    run.addArg("-target");
+    run.addArg(target_triple);
+    run.addArg("-O");
+    run.addArg(@tagName(optimize));
+
+    if (build_options != null) {
+        run.addArg("--dep");
+        run.addArg("build_options");
+    }
+    run.addPrefixedFileArg("-Mroot=", b.path(source));
+    if (build_options) |opts| {
+        run.addPrefixedFileArg("-Mbuild_options=", opts.getOutput());
+    }
+    if (test_filter) |filter| {
+        run.addArg("--test-filter");
+        run.addArg(filter);
+    }
+
+    return run;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -76,12 +109,15 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run unit tests");
-    const run_lib_tests = b.addRunArtifact(lib_tests);
-    const run_map_tests = b.addRunArtifact(map_tests);
     if (test_verbose) {
-        run_lib_tests.stdio = .inherit;
-        run_map_tests.stdio = .inherit;
+        const verbose_lib = addVerboseTest(b, "src/lib.zig", target, optimize, test_filter, build_options);
+        const verbose_map = addVerboseTest(b, "src/module_map.zig", target, optimize, test_filter, null);
+        test_step.dependOn(&verbose_lib.step);
+        test_step.dependOn(&verbose_map.step);
+    } else {
+        const run_lib_tests = b.addRunArtifact(lib_tests);
+        const run_map_tests = b.addRunArtifact(map_tests);
+        test_step.dependOn(&run_lib_tests.step);
+        test_step.dependOn(&run_map_tests.step);
     }
-    test_step.dependOn(&run_lib_tests.step);
-    test_step.dependOn(&run_map_tests.step);
 }
