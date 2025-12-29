@@ -63,5 +63,14 @@ test "module map names and dependencies are valid" {
             try std.testing.expect(!std.mem.eql(u8, dep, mod.name));
             try std.testing.expect(hasModule(dep));
         }
+
+        const file_path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{s}/mod.zig",
+            .{mod.zig_path},
+        );
+        defer std.testing.allocator.free(file_path);
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        file.close();
     }
 }

@@ -9,7 +9,7 @@ readable for study.
 
 ## Layout
 - src/  : Zig port modules (mirrors C subsystem layout)
-- docs/ : roadmap and design notes
+- docs/ : roadmap and module boundary notes
 
 ## Workflow
 - Work is tracked as Plane tickets in project INNODB (identifier IBD).
