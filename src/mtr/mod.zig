@@ -9,10 +9,21 @@ pub const module_name = "mtr";
 pub const byte = compat.byte;
 pub const ulint = compat.ulint;
 pub const dulint = compat.Dulint;
+pub const ibool = compat.ibool;
 
 pub const MTR_LOG_ALL: ulint = 21;
 pub const MTR_LOG_NONE: ulint = 22;
 pub const MTR_LOG_SHORT_INSERTS: ulint = 24;
+
+pub const MTR_ACTIVE: ulint = 12231;
+pub const MTR_COMMITTING: ulint = 56456;
+pub const MTR_COMMITTED: ulint = 34676;
+pub const MTR_MAGIC_N: ulint = 54551;
+
+pub const mtr_memo_slot_t = struct {
+    type_: ulint,
+    object: *anyopaque,
+};
 
 pub const MLOG_SINGLE_REC_FLAG: byte = 128;
 pub const MLOG_1BYTE: ulint = 1;
@@ -22,17 +33,65 @@ pub const MLOG_8BYTES: ulint = 8;
 pub const MLOG_BIGGEST_TYPE: byte = 51;
 
 pub const mtr_t = struct {
+    state: ulint = MTR_ACTIVE,
+    memo: dyn.dyn_array_t = undefined,
     log_mode: ulint = MTR_LOG_ALL,
     log: dyn.dyn_array_t = undefined,
+    modifications: ibool = compat.FALSE,
+    n_log_recs: ulint = 0,
+    start_lsn: u64 = 0,
+    end_lsn: u64 = 0,
+    magic_n: ulint = MTR_MAGIC_N,
 };
 
 pub fn mtr_init(mtr: *mtr_t) void {
-    mtr.log_mode = MTR_LOG_ALL;
+    _ = mtr_start(mtr);
+}
+
+pub fn mtr_start(mtr: *mtr_t) *mtr_t {
+    _ = dyn.dyn_array_create(&mtr.memo);
     _ = dyn.dyn_array_create(&mtr.log);
+    mtr.log_mode = MTR_LOG_ALL;
+    mtr.modifications = compat.FALSE;
+    mtr.n_log_recs = 0;
+    mtr.state = MTR_ACTIVE;
+    mtr.magic_n = MTR_MAGIC_N;
+    return mtr;
+}
+
+pub fn mtr_commit(mtr: *mtr_t) void {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    std.debug.assert(mtr.state == MTR_ACTIVE);
+    mtr.state = MTR_COMMITTING;
+    if (mtr.memo.magic_n == dyn.DYN_BLOCK_MAGIC_N) {
+        dyn.dyn_array_free(&mtr.memo);
+    }
+    if (mtr.log.magic_n == dyn.DYN_BLOCK_MAGIC_N) {
+        dyn.dyn_array_free(&mtr.log);
+    }
+    mtr.state = MTR_COMMITTED;
 }
 
 pub fn mtr_get_log_mode(mtr: *const mtr_t) ulint {
     return mtr.log_mode;
+}
+
+pub fn mtr_set_log_mode(mtr: *mtr_t, mode: ulint) ulint {
+    const old = mtr.log_mode;
+    mtr.log_mode = mode;
+    return old;
+}
+
+pub fn mtr_memo_push(mtr: *mtr_t, object: *anyopaque, type_: ulint) void {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    const slot_buf = dyn.dyn_array_push(&mtr.memo, @sizeOf(mtr_memo_slot_t));
+    const slot = @as(*mtr_memo_slot_t, @ptrCast(@alignCast(slot_buf)));
+    slot.* = .{ .type_ = type_, .object = object };
+}
+
+pub fn mtr_set_savepoint(mtr: *mtr_t) ulint {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    return dyn.dyn_array_get_data_size(&mtr.memo);
 }
 
 pub fn mlog_catenate_string(mtr: *mtr_t, str: [*]const byte, len: ulint) void {
@@ -181,4 +240,22 @@ test "mlog_parse_nbytes marks corrupt on bad offset" {
     const res = mlog_parse_nbytes(MLOG_1BYTE, buf[0..].ptr, buf[0..].ptr + buf.len, null, null);
     try std.testing.expect(res == null);
     try std.testing.expect(recv_sys_local.found_corrupt_log == compat.TRUE);
+}
+
+test "mtr start/commit and memo push" {
+    var mtr = mtr_t{};
+    _ = mtr_start(&mtr);
+    try std.testing.expect(mtr.state == MTR_ACTIVE);
+    try std.testing.expect(mtr_get_log_mode(&mtr) == MTR_LOG_ALL);
+
+    var dummy: u32 = 0;
+    mtr_memo_push(&mtr, @ptrCast(&dummy), 1);
+    const savepoint = mtr_set_savepoint(&mtr);
+    try std.testing.expect(savepoint == @sizeOf(mtr_memo_slot_t));
+
+    _ = mtr_set_log_mode(&mtr, MTR_LOG_NONE);
+    try std.testing.expect(mtr_get_log_mode(&mtr) == MTR_LOG_NONE);
+
+    mtr_commit(&mtr);
+    try std.testing.expect(mtr.state == MTR_COMMITTED);
 }
