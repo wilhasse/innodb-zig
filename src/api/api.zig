@@ -156,6 +156,11 @@ pub const ib_cfg_type_t = enum(u32) {
     IB_CFG_TEXT = 3,
     IB_CFG_CB = 4,
 };
+pub const ib_cfg_flag_t = enum(u32) {
+    IB_CFG_FLAG_NONE = 0x1,
+    IB_CFG_FLAG_READONLY_AFTER_STARTUP = 0x2,
+    IB_CFG_FLAG_READONLY = 0x4,
+};
 
 pub const ib_i8_t = i8;
 pub const ib_u8_t = u8;
@@ -367,105 +372,312 @@ const CfgValue = union(ib_cfg_type_t) {
     IB_CFG_ULINT: ib_ulint_t,
     IB_CFG_ULONG: ib_ulint_t,
     IB_CFG_TEXT: []const u8,
-    IB_CFG_CB: ib_cb_t,
+    IB_CFG_CB: ?ib_cb_t,
 };
 
 const CfgVar = struct {
     name: []const u8,
     cfg_type: ib_cfg_type_t,
+    flag: ib_cfg_flag_t,
+    min_val: ib_u64_t,
+    max_val: ib_u64_t,
     value: CfgValue,
 };
 
 const cfg_vars_defaults = [_]CfgVar{
     .{
+        .name = "adaptive_hash_index",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
+        .name = "adaptive_flushing",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
         .name = "additional_mem_pool_size",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 512 * 1024,
+        .max_val = @as(ib_u64_t, compat.IB_UINT64_T_MAX),
         .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 4 * 1024 * 1024) },
+    },
+    .{
+        .name = "autoextend_increment",
+        .cfg_type = .IB_CFG_ULONG,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 1,
+        .max_val = 1000,
+        .value = .{ .IB_CFG_ULONG = 1 },
     },
     .{
         .name = "buffer_pool_size",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 5 * 1024 * 1024,
+        .max_val = @as(ib_u64_t, @intCast(compat.ULINT_MAX)),
         .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 8 * 1024 * 1024) },
+    },
+    .{
+        .name = "checksums",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
     },
     .{
         .name = "data_file_path",
         .cfg_type = .IB_CFG_TEXT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
         .value = .{ .IB_CFG_TEXT = "ibdata1:32M:autoextend" },
     },
     .{
         .name = "data_home_dir",
         .cfg_type = .IB_CFG_TEXT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
         .value = .{ .IB_CFG_TEXT = "./" },
+    },
+    .{
+        .name = "doublewrite",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
+        .name = "file_format",
+        .cfg_type = .IB_CFG_TEXT,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_TEXT = "Antelope" },
     },
     .{
         .name = "file_io_threads",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 4,
+        .max_val = 64,
         .value = .{ .IB_CFG_ULINT = 4 },
     },
     .{
         .name = "file_per_table",
         .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
         .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
+        .name = "flush_log_at_trx_commit",
+        .cfg_type = .IB_CFG_ULONG,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 2,
+        .value = .{ .IB_CFG_ULONG = 1 },
     },
     .{
         .name = "flush_method",
         .cfg_type = .IB_CFG_TEXT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
         .value = .{ .IB_CFG_TEXT = "fsync" },
+    },
+    .{
+        .name = "force_recovery",
+        .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 6,
+        .value = .{ .IB_CFG_ULINT = 0 },
+    },
+    .{
+        .name = "io_capacity",
+        .cfg_type = .IB_CFG_ULONG,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 100,
+        .max_val = 1_000_000,
+        .value = .{ .IB_CFG_ULONG = 200 },
     },
     .{
         .name = "lock_wait_timeout",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 1,
+        .max_val = 1_073_741_824,
         .value = .{ .IB_CFG_ULINT = 60 },
     },
     .{
         .name = "log_buffer_size",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 256 * 1024,
+        .max_val = @as(ib_u64_t, compat.IB_UINT64_T_MAX),
         .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 384 * 1024) },
     },
     .{
         .name = "log_file_size",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 1024 * 1024,
+        .max_val = @as(ib_u64_t, @intCast(compat.ULINT_MAX)),
         .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 16 * 1024 * 1024) },
     },
     .{
         .name = "log_files_in_group",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 2,
+        .max_val = 100,
         .value = .{ .IB_CFG_ULINT = 2 },
     },
     .{
         .name = "log_group_home_dir",
         .cfg_type = .IB_CFG_TEXT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 0,
+        .max_val = 0,
         .value = .{ .IB_CFG_TEXT = "." },
+    },
+    .{
+        .name = "max_dirty_pages_pct",
+        .cfg_type = .IB_CFG_ULONG,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 100,
+        .value = .{ .IB_CFG_ULONG = 75 },
+    },
+    .{
+        .name = "max_purge_lag",
+        .cfg_type = .IB_CFG_ULONG,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = @as(ib_u64_t, compat.IB_UINT64_T_MAX),
+        .value = .{ .IB_CFG_ULONG = 0 },
     },
     .{
         .name = "lru_old_blocks_pct",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 5,
+        .max_val = 95,
         .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 3 * 100 / 8) },
     },
     .{
         .name = "lru_block_access_recency",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0xFFFF_FFFF,
         .value = .{ .IB_CFG_ULINT = 0 },
     },
     .{
-        .name = "rollback_on_timeout",
-        .cfg_type = .IB_CFG_IBOOL,
-        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+        .name = "open_files",
+        .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 10,
+        .max_val = @as(ib_u64_t, compat.IB_UINT64_T_MAX),
+        .value = .{ .IB_CFG_ULINT = 10 },
     },
     .{
         .name = "read_io_threads",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 1,
+        .max_val = 64,
         .value = .{ .IB_CFG_ULINT = 4 },
     },
     .{
         .name = "write_io_threads",
         .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
+        .min_val = 1,
+        .max_val = 64,
         .value = .{ .IB_CFG_ULINT = 4 },
+    },
+    .{
+        .name = "pre_rollback_hook",
+        .cfg_type = .IB_CFG_CB,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_CB = null },
+    },
+    .{
+        .name = "print_verbose_log",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_FALSE },
+    },
+    .{
+        .name = "rollback_on_timeout",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
+        .name = "stats_sample_pages",
+        .cfg_type = .IB_CFG_ULINT,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 1,
+        .max_val = @as(ib_u64_t, @intCast(compat.ULINT_MAX)),
+        .value = .{ .IB_CFG_ULINT = 8 },
+    },
+    .{
+        .name = "status_file",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_FALSE },
+    },
+    .{
+        .name = "sync_spin_loops",
+        .cfg_type = .IB_CFG_ULONG,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = @as(ib_u64_t, compat.IB_UINT64_T_MAX),
+        .value = .{ .IB_CFG_ULONG = 0 },
+    },
+    .{
+        .name = "use_sys_malloc",
+        .cfg_type = .IB_CFG_IBOOL,
+        .flag = .IB_CFG_FLAG_NONE,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_FALSE },
+    },
+    .{
+        .name = "version",
+        .cfg_type = .IB_CFG_TEXT,
+        .flag = .IB_CFG_FLAG_READONLY,
+        .min_val = 0,
+        .max_val = 0,
+        .value = .{ .IB_CFG_TEXT = "zig-port" },
     },
 };
 
 var cfg_vars = cfg_vars_defaults;
 var cfg_initialized = false;
+var cfg_started = false;
 var cfg_mutex = std.Thread.Mutex{};
 
 pub fn ib_init() ib_err_t {
@@ -490,6 +702,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
         db_format.name = file_format_names[db_format.id];
     }
 
+    cfg_started = true;
     return .DB_SUCCESS;
 }
 
@@ -558,6 +771,12 @@ fn cfgTextFromAny(value: anytype) ?[]const u8 {
             if (ptr.size == .slice and ptr.child == u8) {
                 return value[0..];
             }
+            if ((ptr.size == .many or ptr.size == .c) and ptr.sentinel != null) {
+                if (ptr.child == u8) {
+                    const c_ptr: [*:0]const u8 = @ptrCast(value);
+                    return std.mem.span(c_ptr);
+                }
+            }
             if (ptr.size == .one) {
                 const child_info = @typeInfo(ptr.child);
                 if (child_info == .array and child_info.array.child == u8) {
@@ -579,7 +798,81 @@ fn cfgTextFromAny(value: anytype) ?[]const u8 {
     return null;
 }
 
+fn cfgIsReadOnly(cfg_var: *const CfgVar) bool {
+    const flag_val = @intFromEnum(cfg_var.flag);
+    if ((flag_val & @intFromEnum(ib_cfg_flag_t.IB_CFG_FLAG_READONLY)) != 0) {
+        return true;
+    }
+    if (cfg_started and (flag_val & @intFromEnum(ib_cfg_flag_t.IB_CFG_FLAG_READONLY_AFTER_STARTUP)) != 0) {
+        return true;
+    }
+    return false;
+}
+
+fn cfgValidateNumeric(cfg_var: *const CfgVar, value: ib_u64_t) ib_err_t {
+    if (cfg_var.min_val != 0 or cfg_var.max_val != 0) {
+        if (value < cfg_var.min_val or value > cfg_var.max_val) {
+            return .DB_INVALID_INPUT;
+        }
+    }
+    return .DB_SUCCESS;
+}
+
+fn cfgFlushMethodValid(value: []const u8) bool {
+    const allowed = [_][]const u8{
+        "fsync",
+        "O_DSYNC",
+        "O_DIRECT",
+        "littlesync",
+        "nosync",
+        "normal",
+        "unbuffered",
+        "async_unbuffered",
+    };
+
+    for (allowed) |name| {
+        if (std.mem.eql(u8, value, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn cfgValidateText(cfg_var: *const CfgVar, value: []const u8) ib_err_t {
+    if (schemaNameEq(cfg_var.name, "data_home_dir")) {
+        if (value.len == 0) {
+            return .DB_INVALID_INPUT;
+        }
+        const last = value[value.len - 1];
+        if (last != '/' and last != '\\') {
+            return .DB_INVALID_INPUT;
+        }
+    } else if (schemaNameEq(cfg_var.name, "data_file_path")) {
+        if (value.len == 0) {
+            return .DB_INVALID_INPUT;
+        }
+    } else if (schemaNameEq(cfg_var.name, "file_format")) {
+        if (parseFileFormat(value) == null) {
+            return .DB_INVALID_INPUT;
+        }
+    } else if (schemaNameEq(cfg_var.name, "flush_method")) {
+        if (!cfgFlushMethodValid(value)) {
+            return .DB_INVALID_INPUT;
+        }
+    } else if (schemaNameEq(cfg_var.name, "log_group_home_dir")) {
+        if (value.len == 0) {
+            return .DB_INVALID_INPUT;
+        }
+    }
+
+    return .DB_SUCCESS;
+}
+
 fn cfgSetValue(cfg_var: *CfgVar, value: anytype) ib_err_t {
+    if (cfgIsReadOnly(cfg_var)) {
+        return .DB_READONLY;
+    }
+
     switch (cfg_var.cfg_type) {
         .IB_CFG_IBOOL => {
             const val = cfgBoolFromAny(value) orelse return .DB_INVALID_INPUT;
@@ -588,25 +881,46 @@ fn cfgSetValue(cfg_var: *CfgVar, value: anytype) ib_err_t {
         },
         .IB_CFG_ULINT => {
             const val = cfgUlintFromAny(value) orelse return .DB_INVALID_INPUT;
+            const err = cfgValidateNumeric(cfg_var, @as(ib_u64_t, @intCast(val)));
+            if (err != .DB_SUCCESS) {
+                return err;
+            }
             cfg_var.value = .{ .IB_CFG_ULINT = val };
             return .DB_SUCCESS;
         },
         .IB_CFG_ULONG => {
             const val = cfgUlintFromAny(value) orelse return .DB_INVALID_INPUT;
+            const err = cfgValidateNumeric(cfg_var, @as(ib_u64_t, @intCast(val)));
+            if (err != .DB_SUCCESS) {
+                return err;
+            }
             cfg_var.value = .{ .IB_CFG_ULONG = val };
             return .DB_SUCCESS;
         },
         .IB_CFG_TEXT => {
             const val = cfgTextFromAny(value) orelse return .DB_INVALID_INPUT;
+            const err = cfgValidateText(cfg_var, val);
+            if (err != .DB_SUCCESS) {
+                return err;
+            }
+            if (schemaNameEq(cfg_var.name, "file_format")) {
+                const id = parseFileFormat(val) orelse return .DB_INVALID_INPUT;
+                cfg_var.value = .{ .IB_CFG_TEXT = file_format_names[id] };
+                return .DB_SUCCESS;
+            }
             cfg_var.value = .{ .IB_CFG_TEXT = val };
             return .DB_SUCCESS;
         },
         .IB_CFG_CB => {
-            if (@TypeOf(value) != ib_cb_t) {
-                return .DB_INVALID_INPUT;
+            if (@TypeOf(value) == ib_cb_t) {
+                cfg_var.value = .{ .IB_CFG_CB = value };
+                return .DB_SUCCESS;
             }
-            cfg_var.value = .{ .IB_CFG_CB = value };
-            return .DB_SUCCESS;
+            if (@TypeOf(value) == ?ib_cb_t) {
+                cfg_var.value = .{ .IB_CFG_CB = value };
+                return .DB_SUCCESS;
+            }
+            return .DB_INVALID_INPUT;
         },
     }
 }
@@ -653,9 +967,16 @@ fn cfgGetValue(cfg_var: *const CfgVar, out: anytype) ib_err_t {
             return .DB_INVALID_INPUT;
         },
         .IB_CFG_CB => {
-            if (Child == ib_cb_t) {
+            if (Child == ?ib_cb_t) {
                 out.* = cfg_var.value.IB_CFG_CB;
                 return .DB_SUCCESS;
+            }
+            if (Child == ib_cb_t) {
+                if (cfg_var.value.IB_CFG_CB) |cb| {
+                    out.* = cb;
+                    return .DB_SUCCESS;
+                }
+                return .DB_NOT_FOUND;
             }
             return .DB_INVALID_INPUT;
         },
@@ -725,6 +1046,7 @@ pub fn ib_cfg_init() ib_err_t {
     defer cfg_mutex.unlock();
     cfg_vars = cfg_vars_defaults;
     cfg_initialized = true;
+    cfg_started = false;
     return .DB_SUCCESS;
 }
 
@@ -733,6 +1055,7 @@ pub fn ib_cfg_shutdown() ib_err_t {
     defer cfg_mutex.unlock();
     cfg_vars = cfg_vars_defaults;
     cfg_initialized = false;
+    cfg_started = false;
     return .DB_SUCCESS;
 }
 
@@ -3351,6 +3674,7 @@ test "config set get and list" {
     var data_home: []const u8 = "";
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_get("data_home_dir", &data_home));
     try std.testing.expect(std.mem.eql(u8, data_home, "data/"));
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_cfg_set("data_home_dir", "data"));
 
     var names: [][]const u8 = undefined;
     var names_num: ib_u32_t = 0;
@@ -3368,8 +3692,23 @@ test "config set get and list" {
 
     try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_cfg_var_get_type("unknown", &cfg_type));
     try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_cfg_set("unknown", @as(ib_ulint_t, 1)));
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_cfg_set("buffer_pool_size", @as(ib_ulint_t, 1)));
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_cfg_set("file_format", "Zebra"));
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_shutdown());
+}
+
+test "config readonly after startup" {
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_init());
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_startup(null));
+
+    try std.testing.expectEqual(
+        errors.DbErr.DB_READONLY,
+        ib_cfg_set("buffer_pool_size", @as(ib_ulint_t, 16 * 1024 * 1024)),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_READONLY, ib_cfg_set("adaptive_hash_index", compat.IB_FALSE));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_shutdown(.IB_SHUTDOWN_NORMAL));
 }
 
 test "exec sql stubs validate input" {
