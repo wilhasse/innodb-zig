@@ -171,6 +171,64 @@ pub const ib_i16_t = i16;
 pub const ib_i32_t = i32;
 pub const ib_i64_t = i64;
 
+const ib_status_type_t = enum(u8) {
+    IB_STATUS_IBOOL = 0,
+    IB_STATUS_I64 = 1,
+    IB_STATUS_ULINT = 2,
+};
+
+const StatusVar = struct {
+    name: []const u8,
+    status_type: ib_status_type_t,
+    value_ptr: *const anyopaque,
+};
+
+const ExportVars = struct {
+    innodb_data_pending_reads: ib_ulint_t,
+    innodb_data_pending_writes: ib_ulint_t,
+    innodb_data_pending_fsyncs: ib_ulint_t,
+    innodb_data_fsyncs: ib_ulint_t,
+    innodb_data_read: ib_ulint_t,
+    innodb_data_writes: ib_ulint_t,
+    innodb_data_written: ib_ulint_t,
+    innodb_data_reads: ib_ulint_t,
+    innodb_buffer_pool_pages_total: ib_ulint_t,
+    innodb_buffer_pool_pages_data: ib_ulint_t,
+    innodb_buffer_pool_pages_dirty: ib_ulint_t,
+    innodb_buffer_pool_pages_misc: ib_ulint_t,
+    innodb_buffer_pool_pages_free: ib_ulint_t,
+    innodb_buffer_pool_read_requests: ib_ulint_t,
+    innodb_buffer_pool_reads: ib_ulint_t,
+    innodb_buffer_pool_wait_free: ib_ulint_t,
+    innodb_buffer_pool_pages_flushed: ib_ulint_t,
+    innodb_buffer_pool_write_requests: ib_ulint_t,
+    innodb_buffer_pool_read_ahead: ib_ulint_t,
+    innodb_buffer_pool_read_ahead_evicted: ib_ulint_t,
+    innodb_dblwr_pages_written: ib_ulint_t,
+    innodb_dblwr_writes: ib_ulint_t,
+    innodb_have_atomic_builtins: ib_bool_t,
+    innodb_log_waits: ib_ulint_t,
+    innodb_log_write_requests: ib_ulint_t,
+    innodb_log_writes: ib_ulint_t,
+    innodb_os_log_written: ib_ulint_t,
+    innodb_os_log_fsyncs: ib_ulint_t,
+    innodb_os_log_pending_writes: ib_ulint_t,
+    innodb_os_log_pending_fsyncs: ib_ulint_t,
+    innodb_page_size: ib_ulint_t,
+    innodb_pages_created: ib_ulint_t,
+    innodb_pages_read: ib_ulint_t,
+    innodb_pages_written: ib_ulint_t,
+    innodb_row_lock_waits: ib_ulint_t,
+    innodb_row_lock_current_waits: ib_ulint_t,
+    innodb_row_lock_time: ib_i64_t,
+    innodb_row_lock_time_avg: ib_ulint_t,
+    innodb_row_lock_time_max: ib_ulint_t,
+    innodb_rows_read: ib_ulint_t,
+    innodb_rows_inserted: ib_ulint_t,
+    innodb_rows_updated: ib_ulint_t,
+    innodb_rows_deleted: ib_ulint_t,
+};
+
 pub const IB_SQL_NULL: ib_u32_t = 0xFFFF_FFFF;
 pub const IB_N_SYS_COLS: ib_u32_t = 3;
 pub const MAX_TEXT_LEN: ib_u32_t = 4096;
@@ -683,6 +741,58 @@ var cfg_initialized = false;
 var cfg_started = false;
 var cfg_mutex = std.Thread.Mutex{};
 var ses_rollback_on_timeout: ib_bool_t = compat.IB_FALSE;
+var export_vars = ExportVars{
+    .innodb_page_size = compat.UNIV_PAGE_SIZE,
+    .innodb_have_atomic_builtins = compat.IB_TRUE,
+};
+
+fn statusPtr(ptr: anytype) *const anyopaque {
+    return @as(*const anyopaque, @ptrCast(ptr));
+}
+
+const status_vars = [_]StatusVar{
+    .{ .name = "read_req_pending", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_pending_reads) },
+    .{ .name = "write_req_pending", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_pending_writes) },
+    .{ .name = "fsync_req_pending", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_pending_fsyncs) },
+    .{ .name = "write_req_done", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_writes) },
+    .{ .name = "read_req_done", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_reads) },
+    .{ .name = "fsync_req_done", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_fsyncs) },
+    .{ .name = "bytes_total_written", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_written) },
+    .{ .name = "bytes_total_read", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_data_read) },
+    .{ .name = "buffer_pool_current_size", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_pages_total) },
+    .{ .name = "buffer_pool_data_pages", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_pages_data) },
+    .{ .name = "buffer_pool_dirty_pages", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_pages_dirty) },
+    .{ .name = "buffer_pool_misc_pages", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_pages_misc) },
+    .{ .name = "buffer_pool_free_pages", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_pages_free) },
+    .{ .name = "buffer_pool_read_reqs", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_read_requests) },
+    .{ .name = "buffer_pool_reads", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_reads) },
+    .{ .name = "buffer_pool_waited_for_free", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_wait_free) },
+    .{ .name = "buffer_pool_pages_flushed", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_pages_flushed) },
+    .{ .name = "buffer_pool_write_reqs", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_buffer_pool_write_requests) },
+    .{ .name = "buffer_pool_total_pages", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_pages_created) },
+    .{ .name = "buffer_pool_pages_read", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_pages_read) },
+    .{ .name = "buffer_pool_pages_written", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_pages_written) },
+    .{ .name = "double_write_pages_written", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_dblwr_pages_written) },
+    .{ .name = "double_write_invoked", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_dblwr_writes) },
+    .{ .name = "log_buffer_slot_waits", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_log_waits) },
+    .{ .name = "log_write_reqs", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_log_write_requests) },
+    .{ .name = "log_write_flush_count", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_log_writes) },
+    .{ .name = "log_bytes_written", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_os_log_written) },
+    .{ .name = "log_fsync_req_done", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_os_log_fsyncs) },
+    .{ .name = "log_write_req_pending", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_os_log_pending_writes) },
+    .{ .name = "log_fsync_req_pending", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_os_log_pending_fsyncs) },
+    .{ .name = "lock_row_waits", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_row_lock_waits) },
+    .{ .name = "lock_row_waiting", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_row_lock_current_waits) },
+    .{ .name = "lock_total_wait_time_in_secs", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_row_lock_time) },
+    .{ .name = "lock_wait_time_avg_in_secs", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_row_lock_time_avg) },
+    .{ .name = "lock_max_wait_time_in_secs", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_row_lock_time_max) },
+    .{ .name = "row_total_read", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_rows_read) },
+    .{ .name = "row_total_inserted", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_rows_inserted) },
+    .{ .name = "row_total_updated", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_rows_updated) },
+    .{ .name = "row_total_deleted", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_rows_deleted) },
+    .{ .name = "page_size", .status_type = .IB_STATUS_ULINT, .value_ptr = statusPtr(&export_vars.innodb_page_size) },
+    .{ .name = "have_atomic_builtins", .status_type = .IB_STATUS_IBOOL, .value_ptr = statusPtr(&export_vars.innodb_have_atomic_builtins) },
+};
 
 pub fn ib_init() ib_err_t {
     return ib_cfg_init();
@@ -1072,35 +1182,43 @@ pub fn ib_cfg_shutdown() ib_err_t {
     return .DB_SUCCESS;
 }
 
+fn srv_export_innodb_status() void {
+    export_vars.innodb_page_size = compat.UNIV_PAGE_SIZE;
+    export_vars.innodb_have_atomic_builtins = compat.IB_TRUE;
+}
+
+fn statusLookup(name: []const u8) ?*const StatusVar {
+    for (status_vars) |*entry| {
+        if (schemaNameEq(name, entry.name)) {
+            return entry;
+        }
+    }
+    return null;
+}
+
 pub fn ib_status_get_i64(name: []const u8, dst: *ib_i64_t) ib_err_t {
     if (name.len == 0) {
         return .DB_NOT_FOUND;
     }
 
-    cfg_mutex.lock();
-    defer cfg_mutex.unlock();
+    const entry = statusLookup(name) orelse return .DB_NOT_FOUND;
 
-    if (!cfg_initialized) {
-        return .DB_NOT_FOUND;
-    }
+    srv_export_innodb_status();
 
-    const cfg_var = cfgFind(name) orelse return .DB_NOT_FOUND;
-    switch (cfg_var.cfg_type) {
-        .IB_CFG_IBOOL => {
-            dst.* = if (cfg_var.value.IB_CFG_IBOOL != 0) 1 else 0;
+    switch (entry.status_type) {
+        .IB_STATUS_ULINT => {
+            dst.* = @as(ib_i64_t, @intCast(@as(*const ib_ulint_t, @ptrCast(entry.value_ptr)).*));
             return .DB_SUCCESS;
         },
-        .IB_CFG_ULINT => {
-            dst.* = @as(ib_i64_t, @intCast(cfg_var.value.IB_CFG_ULINT));
+        .IB_STATUS_IBOOL => {
+            dst.* = if (@as(*const ib_bool_t, @ptrCast(entry.value_ptr)).* != 0) 1 else 0;
             return .DB_SUCCESS;
         },
-        .IB_CFG_ULONG => {
-            dst.* = @as(ib_i64_t, @intCast(cfg_var.value.IB_CFG_ULONG));
+        .IB_STATUS_I64 => {
+            dst.* = @as(*const ib_i64_t, @ptrCast(entry.value_ptr)).*;
             return .DB_SUCCESS;
         },
-        .IB_CFG_TEXT,
-        .IB_CFG_CB,
-        => return .DB_DATA_MISMATCH,
+        else => return .DB_DATA_MISMATCH,
     }
 }
 
@@ -4078,17 +4196,28 @@ test "database create and drop" {
     ib_table_schema_delete(tbl_sch);
 }
 
-test "status get i64 from config" {
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_init());
+test "status get i64" {
+    export_vars = ExportVars{
+        .innodb_page_size = 0,
+        .innodb_have_atomic_builtins = compat.IB_FALSE,
+    };
+    export_vars.innodb_data_pending_reads = 7;
+    export_vars.innodb_row_lock_time = 123;
 
     var val: ib_i64_t = 0;
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_status_get_i64("buffer_pool_size", &val));
-    try std.testing.expectEqual(@as(ib_i64_t, 8 * 1024 * 1024), val);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_status_get_i64("READ_REQ_PENDING", &val));
+    try std.testing.expectEqual(@as(ib_i64_t, 7), val);
 
-    try std.testing.expectEqual(errors.DbErr.DB_DATA_MISMATCH, ib_status_get_i64("data_home_dir", &val));
-    try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_status_get_i64("missing", &val));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_status_get_i64("lock_total_wait_time_in_secs", &val));
+    try std.testing.expectEqual(@as(ib_i64_t, 123), val);
 
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_shutdown());
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_status_get_i64("have_atomic_builtins", &val));
+    try std.testing.expectEqual(@as(ib_i64_t, 1), val);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_status_get_i64("page_size", &val));
+    try std.testing.expectEqual(@as(ib_i64_t, @intCast(compat.UNIV_PAGE_SIZE)), val);
+
+    try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_status_get_i64("missing_status", &val));
 }
 
 test "misc tempfile and error handling" {
