@@ -27,6 +27,7 @@ pub const ins = @import("ins.zig");
 pub const merge = @import("merge.zig");
 pub const prebuilt = @import("prebuilt.zig");
 pub const purge = @import("purge.zig");
+pub const format = @import("format.zig");
 
 pub const FETCH_CACHE_SIZE: ulint = 16;
 pub const ROW_PREBUILT_ALLOCATED: ulint = 78540783;
