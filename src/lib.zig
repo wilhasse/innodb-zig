@@ -10,6 +10,7 @@ pub const thr = @import("thr/mod.zig");
 pub const dyn = @import("dyn/mod.zig");
 pub const fil = @import("fil/mod.zig");
 pub const fsp = @import("fsp/mod.zig");
+pub const fut = @import("fut/mod.zig");
 pub const buf = @import("buf/mod.zig");
 pub const btr = @import("btr/mod.zig");
 pub const data = @import("data/mod.zig");
