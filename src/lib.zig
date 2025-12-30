@@ -44,6 +44,7 @@ comptime {
         _ = @import("tests/ib_mt_t2.zig");
         _ = @import("tests/ib_perf1.zig");
         _ = @import("tests/ib_recover.zig");
+        _ = @import("tests/ib_search.zig");
     }
 }
 
