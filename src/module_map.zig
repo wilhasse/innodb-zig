@@ -9,7 +9,7 @@ pub const Module = struct {
 
 pub const modules = [_]Module{
     .{ .name = "ut", .c_dir = "ut", .zig_path = "src/ut", .depends_on = &[_][]const u8{} },
-    .{ .name = "mach", .c_dir = "mach", .zig_path = "src/mach", .depends_on = &[_][]const u8{} },
+    .{ .name = "mach", .c_dir = "mach", .zig_path = "src/mach", .depends_on = &[_][]const u8{ "ut" } },
     .{ .name = "mem", .c_dir = "mem", .zig_path = "src/mem", .depends_on = &[_][]const u8{ "ut" } },
     .{ .name = "os", .c_dir = "os", .zig_path = "src/os", .depends_on = &[_][]const u8{ "ut", "mem", "mach" } },
     .{ .name = "sync", .c_dir = "sync", .zig_path = "src/sync", .depends_on = &[_][]const u8{ "os", "ut" } },
@@ -31,9 +31,9 @@ pub const modules = [_]Module{
     .{ .name = "trx", .c_dir = "trx", .zig_path = "src/trx", .depends_on = &[_][]const u8{ "log", "lock", "dict", "mem", "ut" } },
     .{ .name = "row", .c_dir = "row", .zig_path = "src/row", .depends_on = &[_][]const u8{ "btr", "rem", "dict", "trx", "mem", "ut" } },
     .{ .name = "read", .c_dir = "read", .zig_path = "src/read", .depends_on = &[_][]const u8{ "trx", "row", "mem", "ut" } },
-    .{ .name = "que", .c_dir = "que", .zig_path = "src/que", .depends_on = &[_][]const u8{ "row", "trx", "dict", "read", "mem", "ut" } },
-    .{ .name = "pars", .c_dir = "pars", .zig_path = "src/pars", .depends_on = &[_][]const u8{ "que", "mem", "ut" } },
-    .{ .name = "eval", .c_dir = "eval", .zig_path = "src/eval", .depends_on = &[_][]const u8{ "data", "row", "que", "mem", "ut" } },
+    .{ .name = "que", .c_dir = "que", .zig_path = "src/que", .depends_on = &[_][]const u8{ "data", "row", "trx", "dict", "read", "mem", "ut" } },
+    .{ .name = "pars", .c_dir = "pars", .zig_path = "src/pars", .depends_on = &[_][]const u8{ "que", "row", "mem", "ut" } },
+    .{ .name = "eval", .c_dir = "eval", .zig_path = "src/eval", .depends_on = &[_][]const u8{ "data", "mach", "pars", "row", "que", "mem", "ut" } },
     .{ .name = "ddl", .c_dir = "ddl", .zig_path = "src/ddl", .depends_on = &[_][]const u8{ "dict", "row", "trx", "que", "mem", "ut" } },
     .{ .name = "usr", .c_dir = "usr", .zig_path = "src/usr", .depends_on = &[_][]const u8{ "trx", "mem", "ut" } },
     .{ .name = "api", .c_dir = "api", .zig_path = "src/api", .depends_on = &[_][]const u8{ "srv", "trx", "dict", "mem", "ut" } },
