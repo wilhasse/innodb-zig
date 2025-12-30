@@ -1618,6 +1618,34 @@ fn columnCompare(a: *const Column, b: *const Column) i32 {
     return ib_client_compare(&a.meta, a_data.ptr, @intCast(a_data.len), b_data.ptr, @intCast(b_data.len));
 }
 
+fn columnPrefixEqual(a: *const Column, b: *const Column, prefix_len: ib_ulint_t) bool {
+    if (prefix_len == 0) {
+        return columnCompare(a, b) == 0;
+    }
+
+    const a_data = a.data orelse return b.data == null;
+    const b_data = b.data orelse return false;
+    const prefix: usize = @intCast(prefix_len);
+    const a_len = @min(prefix, a_data.len);
+    const b_len = @min(prefix, b_data.len);
+    if (a_len != b_len) {
+        return false;
+    }
+    return std.mem.eql(u8, a_data[0..a_len], b_data[0..b_len]);
+}
+
+fn indexKeyEqual(table: *const CatalogTable, index: *const CatalogIndex, a: *Tuple, b: *Tuple) bool {
+    for (index.columns.items) |icol| {
+        const col_idx = catalogFindColumnIndex(table, icol.name) orelse return false;
+        const col_a = tupleColumn(a, col_idx) orelse return false;
+        const col_b = tupleColumn(b, col_idx) orelse return false;
+        if (!columnPrefixEqual(col_a, col_b, icol.prefix_len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn tupleKeyCompare(a: *Tuple, b: *Tuple) i32 {
     const col_a = tupleColumn(a, 0) orelse return 0;
     const col_b = tupleColumn(b, 0) orelse return 0;
@@ -1685,6 +1713,23 @@ fn cursorFindRow(cursor: *Cursor, key: *Tuple, mode: ib_srch_mode_t) ?usize {
     }
 
     return null;
+}
+
+fn cursorHasDuplicateKey(cursor: *Cursor, tuple: *Tuple) bool {
+    const table = cursorCatalogTable(cursor) orelse return false;
+
+    for (table.indexes.items) |*idx| {
+        if (!idx.unique and !idx.clustered) {
+            continue;
+        }
+        for (cursor.rows.items) |row| {
+            if (indexKeyEqual(table, idx, row, tuple)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 fn catalogColumnMeta(col: CatalogColumn) ib_col_meta_t {
@@ -2412,6 +2457,10 @@ pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
         return .DB_DATA_MISMATCH;
     }
 
+    if (cursorHasDuplicateKey(cursor, tuple)) {
+        return .DB_DUPLICATE_KEY;
+    }
+
     const clone = tupleClone(cursor.allocator, tuple) catch return .DB_OUT_OF_MEMORY;
     const insert_idx = cursorInsertIndex(cursor, clone);
     cursor.rows.insert(insert_idx, clone) catch return .DB_OUT_OF_MEMORY;
@@ -2698,6 +2747,15 @@ fn tableSchemaFindColumn(schema: *const TableSchema, name: []const u8) bool {
     return false;
 }
 
+fn tableSchemaFindColumnPtr(schema: *const TableSchema, name: []const u8) ?*const SchemaColumn {
+    for (schema.columns.items) |*col| {
+        if (schemaNameEq(col.name, name)) {
+            return col;
+        }
+    }
+    return null;
+}
+
 fn tableSchemaFindIndex(schema: *const TableSchema, name: []const u8) ?*IndexSchema {
     for (schema.indexes.items) |idx| {
         if (schemaNameEq(idx.name, name)) {
@@ -2714,6 +2772,20 @@ fn indexSchemaHasColumn(index: *const IndexSchema, name: []const u8) bool {
         }
     }
     return false;
+}
+
+fn columnAllowsPrefix(col_type: ib_col_type_t) bool {
+    return switch (col_type) {
+        .IB_VARCHAR,
+        .IB_VARCHAR_ANYCHARSET,
+        .IB_CHAR,
+        .IB_CHAR_ANYCHARSET,
+        .IB_BINARY,
+        .IB_VARBINARY,
+        .IB_BLOB,
+        => true,
+        else => false,
+    };
 }
 
 fn indexSchemaDestroy(index: *IndexSchema) void {
@@ -2793,6 +2865,15 @@ fn catalogFindColumnByName(table: *CatalogTable, name: []const u8) ?*CatalogColu
     for (table.columns.items) |*col| {
         if (schemaNameEq(col.name, name)) {
             return col;
+        }
+    }
+    return null;
+}
+
+fn catalogFindColumnIndex(table: *const CatalogTable, name: []const u8) ?usize {
+    for (table.columns.items, 0..) |col, idx| {
+        if (schemaNameEq(col.name, name)) {
+            return idx;
         }
     }
     return null;
@@ -3170,9 +3251,20 @@ pub fn ib_index_schema_add_col(ib_idx_sch: ib_idx_sch_t, name: []const u8, prefi
     if (indexSchemaHasColumn(index, name)) {
         return .DB_COL_APPEARS_TWICE_IN_INDEX;
     }
+    var col_type: ?ib_col_type_t = null;
     if (index.schema_owner) |owner| {
-        if (!tableSchemaFindColumn(owner, name)) {
-            return .DB_NOT_FOUND;
+        const col = tableSchemaFindColumnPtr(owner, name) orelse return .DB_NOT_FOUND;
+        col_type = col.col_type;
+    } else if (prefix_len > 0) {
+        const table = catalogFindByName(index.table_name) orelse return .DB_TABLE_NOT_FOUND;
+        const col = catalogFindColumnByName(table, name) orelse return .DB_NOT_FOUND;
+        col_type = col.col_type;
+    }
+
+    if (prefix_len > 0) {
+        const col_kind = col_type orelse return .DB_SCHEMA_ERROR;
+        if (!columnAllowsPrefix(col_kind)) {
+            return .DB_SCHEMA_ERROR;
         }
     }
 
