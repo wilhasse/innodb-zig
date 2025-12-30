@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const types = @import("types.zig");
+const undo = @import("undo.zig");
 
 pub const module_name = "trx.rseg";
 
@@ -14,10 +15,6 @@ pub const TRX_SYS_N_RSEGS: ulint = 256;
 pub const TRX_RSEG_N_SLOTS: ulint = compat.UNIV_PAGE_SIZE / 16;
 pub const TRX_RSEG_MAX_N_TRXS: ulint = TRX_RSEG_N_SLOTS / 2;
 
-pub const trx_undo_t = struct {
-    id: ulint = 0,
-};
-
 pub const trx_rseg_t = struct {
     id: ulint = 0,
     space: ulint = 0,
@@ -25,10 +22,10 @@ pub const trx_rseg_t = struct {
     page_no: ulint = 0,
     max_size: ulint = 0,
     curr_size: ulint = 0,
-    update_undo_list: std.ArrayListUnmanaged(*trx_undo_t) = .{},
-    update_undo_cached: std.ArrayListUnmanaged(*trx_undo_t) = .{},
-    insert_undo_list: std.ArrayListUnmanaged(*trx_undo_t) = .{},
-    insert_undo_cached: std.ArrayListUnmanaged(*trx_undo_t) = .{},
+    update_undo_list: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
+    update_undo_cached: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
+    insert_undo_list: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
+    insert_undo_cached: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
     last_page_no: ulint = FIL_NULL,
     last_offset: ulint = 0,
     last_trx_no: trx_id_t = 0,
@@ -73,9 +70,6 @@ pub fn trx_sys_set_nth_rseg(id: ulint, rseg: ?*trx_rseg_t) void {
     trx_sys.rsegs[@as(usize, @intCast(id))] = rseg;
 }
 
-fn trx_undo_mem_free(undo: *trx_undo_t) void {
-    trx_sys.allocator.destroy(undo);
-}
 
 pub fn trx_rseg_get_on_id(id: ulint) ?*trx_rseg_t {
     for (trx_sys.rseg_list.items) |rseg| {
@@ -131,14 +125,14 @@ pub fn trx_rseg_mem_free(rseg: *trx_rseg_t) void {
     while (rseg.update_undo_cached.items.len > 0) {
         const undo = rseg.update_undo_cached.items[rseg.update_undo_cached.items.len - 1];
         rseg.update_undo_cached.items.len -= 1;
-        trx_undo_mem_free(undo);
+        undo.trx_undo_mem_free(undo);
     }
     rseg.update_undo_cached.deinit(trx_sys.allocator);
 
     while (rseg.insert_undo_cached.items.len > 0) {
         const undo = rseg.insert_undo_cached.items[rseg.insert_undo_cached.items.len - 1];
         rseg.insert_undo_cached.items.len -= 1;
-        trx_undo_mem_free(undo);
+        undo.trx_undo_mem_free(undo);
     }
     rseg.insert_undo_cached.deinit(trx_sys.allocator);
 

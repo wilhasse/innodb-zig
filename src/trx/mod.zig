@@ -19,3 +19,4 @@ pub const roll = @import("roll.zig");
 pub const rseg = @import("rseg.zig");
 pub const sys = @import("sys.zig");
 pub const core = @import("core.zig");
+pub const undo = @import("undo.zig");
