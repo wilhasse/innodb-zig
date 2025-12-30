@@ -4,6 +4,7 @@ const row = @import("../row/mod.zig");
 
 pub const module_name = "pars";
 pub const lexer = @import("lexer.zig");
+pub const parser = @import("parser.zig");
 
 pub const ulint = compat.ulint;
 pub const lint = compat.lint;
