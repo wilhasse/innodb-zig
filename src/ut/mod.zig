@@ -8,3 +8,4 @@ pub const c_tests = @import("c_tests.zig");
 pub const docs = @import("docs.zig");
 pub const list = @import("list.zig");
 pub const rnd = @import("rnd.zig");
+pub const mem = @import("mem.zig");
