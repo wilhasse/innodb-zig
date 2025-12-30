@@ -1652,6 +1652,16 @@ fn tupleKeyCompare(a: *Tuple, b: *Tuple) i32 {
     return columnCompare(col_a, col_b);
 }
 
+fn tupleCheckNotNull(tuple: *Tuple) bool {
+    const not_null_flag = @intFromEnum(ib_col_attr_t.IB_COL_NOT_NULL);
+    for (tuple.cols) |col| {
+        if ((@intFromEnum(col.meta.attr) & not_null_flag) != 0 and col.data == null) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn cursorCurrentRow(cursor: *Cursor) ?*Tuple {
     const pos = cursor.position orelse return null;
     if (pos >= cursor.rows.items.len) {
@@ -2477,6 +2487,9 @@ pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
     const tuple = ib_tpl orelse return .DB_ERROR;
     if (tuple.tuple_type != .TPL_ROW) {
+        return .DB_DATA_MISMATCH;
+    }
+    if (!tupleCheckNotNull(tuple)) {
         return .DB_DATA_MISMATCH;
     }
 
