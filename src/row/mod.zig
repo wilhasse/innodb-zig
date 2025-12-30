@@ -30,6 +30,7 @@ pub const purge = @import("purge.zig");
 pub const format = @import("format.zig");
 pub const sel = @import("sel.zig");
 pub const uins = @import("uins.zig");
+pub const umod = @import("umod.zig");
 
 pub const FETCH_CACHE_SIZE: ulint = 16;
 pub const ROW_PREBUILT_ALLOCATED: ulint = 78540783;
