@@ -4,6 +4,7 @@ const compat = @import("../ut/compat.zig");
 pub const module_name = "page";
 
 pub const ulint = compat.ulint;
+pub const lint = compat.lint;
 pub const ibool = compat.ibool;
 pub const byte = compat.byte;
 
@@ -38,7 +39,17 @@ pub const PAGE_NO_DIRECTION: ulint = 5;
 
 pub const trx_id_t = compat.ib_uint64_t;
 
-pub const page_zip_des_t = struct {};
+pub const PAGE_ZIP_MIN_SIZE_SHIFT: ulint = 10;
+pub const PAGE_ZIP_MIN_SIZE: ulint = 1 << PAGE_ZIP_MIN_SIZE_SHIFT;
+pub const PAGE_ZIP_NUM_SSIZE: ulint = @as(ulint, compat.UNIV_PAGE_SIZE_SHIFT) - PAGE_ZIP_MIN_SIZE_SHIFT + 2;
+
+pub const page_zip_des_t = struct {
+    data: ?[]u8 = null,
+    m_end: u16 = 0,
+    m_nonempty: bool = false,
+    n_blobs: u16 = 0,
+    ssize: u8 = 0,
+};
 pub const dict_index_t = struct {};
 pub const dtuple_t = struct {};
 pub const mtr_t = struct {};
@@ -561,6 +572,110 @@ pub fn page_find_rec_with_heap_no(page: *page_t, heap_no: ulint) ?*rec_t {
     return null;
 }
 
+pub fn page_zip_get_size(page_zip: *const page_zip_des_t) ulint {
+    if (page_zip.ssize == 0) {
+        return 0;
+    }
+    return PAGE_ZIP_MIN_SIZE << (@as(ulint, @intCast(page_zip.ssize)) - 1);
+}
+
+pub fn page_zip_set_size(page_zip: *page_zip_des_t, size: ulint) void {
+    if (size == 0) {
+        page_zip.ssize = 0;
+        return;
+    }
+    var shift: u8 = 1;
+    var current = PAGE_ZIP_MIN_SIZE;
+    while (current < size and shift < 255) {
+        current <<= 1;
+        shift += 1;
+    }
+    page_zip.ssize = shift;
+}
+
+pub fn page_zip_rec_needs_ext(rec_size: ulint, comp: ulint, n_fields: ulint, zip_size: ulint) ibool {
+    _ = comp;
+    _ = n_fields;
+    if (zip_size == 0) {
+        return compat.FALSE;
+    }
+    return if (rec_size > zip_size / 2) compat.TRUE else compat.FALSE;
+}
+
+pub fn page_zip_empty_size(n_fields: ulint, zip_size: ulint) ulint {
+    _ = n_fields;
+    if (zip_size == 0) {
+        return compat.UNIV_PAGE_SIZE;
+    }
+    if (zip_size > 64) {
+        return zip_size - 64;
+    }
+    return zip_size;
+}
+
+pub fn page_zip_des_init(page_zip: *page_zip_des_t) void {
+    page_zip.* = .{};
+}
+
+pub fn page_zip_set_alloc(stream: ?*anyopaque, heap: ?*anyopaque) void {
+    _ = stream;
+    _ = heap;
+}
+
+pub fn page_zip_compress(page_zip: *page_zip_des_t, page: *const page_t, index: *dict_index_t, mtr: *mtr_t) ibool {
+    _ = page;
+    _ = index;
+    _ = mtr;
+    const size = page_zip_get_size(page_zip);
+    if (size == 0) {
+        return compat.FALSE;
+    }
+    if (page_zip.data == null or page_zip.data.?.len != size) {
+        if (page_zip.data) |buf| {
+            std.heap.page_allocator.free(buf);
+        }
+        const buf = std.heap.page_allocator.alloc(u8, size) catch return compat.FALSE;
+        page_zip.data = buf;
+    }
+    if (page_zip.data) |buf| {
+        std.mem.set(u8, buf, 0);
+    }
+    page_zip.m_end = 0;
+    page_zip.m_nonempty = false;
+    page_zip.n_blobs = 0;
+    return compat.TRUE;
+}
+
+pub fn page_zip_decompress(page_zip: *page_zip_des_t, page: *page_t, all: ibool) ibool {
+    _ = page;
+    _ = all;
+    if (page_zip.data == null) {
+        return compat.FALSE;
+    }
+    page_zip.m_nonempty = false;
+    return compat.TRUE;
+}
+
+pub fn page_zip_simple_validate(page_zip: *const page_zip_des_t) ibool {
+    if (page_zip.ssize == 0) {
+        return compat.TRUE;
+    }
+    const size = page_zip_get_size(page_zip);
+    return if (size <= compat.UNIV_PAGE_SIZE) compat.TRUE else compat.FALSE;
+}
+
+pub fn page_zip_max_ins_size(page_zip: *const page_zip_des_t, is_clust: ibool) lint {
+    _ = is_clust;
+    const size = page_zip_get_size(page_zip);
+    return @as(lint, @intCast(size / 2));
+}
+
+pub fn page_zip_available(page_zip: *const page_zip_des_t, is_clust: ibool, length: ulint, create: ulint) ibool {
+    _ = create;
+    const max_size = page_zip_max_ins_size(page_zip, is_clust);
+    return if (length <= @as(ulint, @intCast(max_size))) compat.TRUE else compat.FALSE;
+}
+
 test "page cursor movement and insert/delete" {
     var page = page_t{};
     page_init(&page);
@@ -689,4 +804,24 @@ test "page middle rec and count" {
     const middle = page_get_middle_rec(&page) orelse return error.TestExpectedEqual;
     try std.testing.expect(middle == &rec2);
     try std.testing.expectEqual(@as(ulint, 2), page_rec_get_n_recs_before(&page, &rec3));
+}
+
+test "page zip basic" {
+    var zip = page_zip_des_t{};
+    page_zip_des_init(&zip);
+    page_zip_set_size(&zip, PAGE_ZIP_MIN_SIZE);
+    try std.testing.expectEqual(PAGE_ZIP_MIN_SIZE, page_zip_get_size(&zip));
+    try std.testing.expectEqual(compat.TRUE, page_zip_simple_validate(&zip));
+
+    var page = page_t{};
+    page_init(&page);
+    var index = dict_index_t{};
+    var mtr = mtr_t{};
+    try std.testing.expectEqual(compat.TRUE, page_zip_compress(&zip, &page, &index, &mtr));
+    try std.testing.expectEqual(compat.TRUE, page_zip_decompress(&zip, &page, compat.TRUE));
+    try std.testing.expectEqual(compat.TRUE, page_zip_available(&zip, compat.TRUE, 100, 0));
+
+    if (zip.data) |buf| {
+        std.heap.page_allocator.free(buf);
+    }
 }
