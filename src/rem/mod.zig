@@ -8,6 +8,7 @@ pub const module_name = "rem";
 pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
 pub const byte = compat.byte;
+pub const REC_MAX_INDEX_COL_LEN: ulint = 768;
 
 fn cmp_collate(code: ulint) ulint {
     return code;
