@@ -58,6 +58,15 @@ pub fn mach_read_from_3(b: [*]const byte) ulint {
     return (@as(ulint, b[0]) << 16) | (@as(ulint, b[1]) << 8) | @as(ulint, b[2]);
 }
 
+pub fn mach_write_to_8(b: [*]byte, n: dulint) void {
+    mach_write_to_4(b, n.high);
+    mach_write_to_4(b + 4, n.low);
+}
+
+pub fn mach_read_from_8(b: [*]const byte) dulint {
+    return .{ .high = mach_read_from_4(b), .low = mach_read_from_4(b + 4) };
+}
+
 pub fn mach_write_compressed(b: [*]byte, n: ulint) ulint {
     if (n < 0x80) {
         mach_write_to_1(b, n);
