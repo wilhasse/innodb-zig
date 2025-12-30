@@ -11,6 +11,7 @@ pub const QUE_NODE_SYMBOL: ulint = 16;
 pub const QUE_NODE_FUNC: ulint = 18;
 pub const QUE_NODE_ORDER: ulint = 19;
 pub const QUE_NODE_FORK: ulint = 8;
+pub const QUE_NODE_ROLLBACK: ulint = 12;
 pub const QUE_NODE_ASSIGNMENT: ulint = 23;
 pub const QUE_NODE_RETURN: ulint = 28;
 pub const QUE_NODE_EXIT: ulint = 32;
@@ -20,6 +21,12 @@ pub const QUE_NODE_PROC: ulint = 20 + QUE_NODE_CONTROL_STAT;
 pub const QUE_NODE_IF: ulint = 21 + QUE_NODE_CONTROL_STAT;
 pub const QUE_NODE_WHILE: ulint = 22 + QUE_NODE_CONTROL_STAT;
 pub const QUE_NODE_FOR: ulint = 27 + QUE_NODE_CONTROL_STAT;
+
+pub const QUE_FORK_ROLLBACK: ulint = 5;
+pub const QUE_FORK_RECOVERY: ulint = 11;
+
+pub const QUE_THR_RUNNING: ulint = 1;
+pub const QUE_THR_SIG_REPLY_WAIT: ulint = 6;
 
 pub const que_common_t = struct {
     type: ulint = 0,
@@ -38,6 +45,7 @@ pub const que_fork_t = struct {
     n_active_thrs: ulint = 0,
     thrs_head: ?*que_thr_t = null,
     last_sel_node: ?*row.sel_node_t = null,
+    trx: ?*anyopaque = null,
 };
 
 pub const que_t = que_fork_t;
@@ -45,8 +53,10 @@ pub const que_t = que_fork_t;
 pub const que_thr_t = struct {
     run_node: ?*que_node_t = null,
     prev_node: ?*que_node_t = null,
+    child: ?*que_node_t = null,
     parent: ?*que_fork_t = null,
     next: ?*que_thr_t = null,
+    state: ulint = QUE_THR_RUNNING,
 };
 
 pub const sess_t = struct {
@@ -137,6 +147,20 @@ pub fn que_thr_create(parent: *que_fork_t, allocator: std.mem.Allocator) *que_th
         cur.next = thr;
     }
     return thr;
+}
+
+pub fn que_fork_start_command(fork: *que_fork_t) ?*que_thr_t {
+    if (fork.thrs_head) |thr| {
+        if (thr.run_node == null and thr.child != null) {
+            thr.run_node = thr.child;
+        }
+        return thr;
+    }
+    return null;
+}
+
+pub fn que_run_threads(thr: *que_thr_t) void {
+    _ = thr;
 }
 
 pub fn que_graph_free_recursive(node: *que_node_t) void {
