@@ -7,9 +7,16 @@ pub const ulint = compat.ulint;
 pub const byte = compat.byte;
 pub const ibool = compat.ibool;
 pub const dulint = compat.Dulint;
+pub const ib_int64_t = compat.ib_int64_t;
+
+pub const BTR_EXTERN_FIELD_REF_SIZE: usize = 20;
 
 pub const BTR_PAGE_MAX_REC_SIZE: ulint = compat.UNIV_PAGE_SIZE / 2 - 200;
 pub const BTR_MAX_LEVELS: ulint = 100;
+pub const BTR_CUR_PAGE_REORGANIZE_LIMIT: ulint = compat.UNIV_PAGE_SIZE / 32;
+pub const BTR_BLOB_HDR_PART_LEN: ulint = 0;
+pub const BTR_BLOB_HDR_NEXT_PAGE_NO: ulint = 4;
+pub const BTR_BLOB_HDR_SIZE: ulint = 8;
 
 const RW_NO_LATCH: u32 = 0;
 const RW_S_LATCH: u32 = 1;
@@ -28,14 +35,16 @@ pub const btr_latch_mode = enum(u32) {
 pub const BTR_INSERT: ulint = 512;
 pub const BTR_ESTIMATE: ulint = 1024;
 pub const BTR_IGNORE_SEC_UNIQUE: ulint = 2048;
+pub const BTR_NO_UNDO_LOG_FLAG: ulint = 1;
+pub const BTR_NO_LOCKING_FLAG: ulint = 2;
+pub const BTR_KEEP_SYS_FLAG: ulint = 4;
 
-pub const dict_index_t = struct {};
-pub const mtr_t = struct {};
-pub const buf_block_t = struct {};
-pub const page_t = struct {};
-pub const btr_cur_t = struct {};
-pub const dtuple_t = struct {};
-pub const trx_t = struct {};
+pub var btr_cur_print_record_ops: ibool = compat.FALSE;
+pub var btr_cur_n_non_sea: ulint = 0;
+pub var btr_cur_n_sea: ulint = 0;
+pub var btr_cur_n_non_sea_old: ulint = 0;
+pub var btr_cur_n_sea_old: ulint = 0;
+pub const field_ref_zero = [_]byte{0} ** BTR_EXTERN_FIELD_REF_SIZE;
 
 pub const rec_t = struct {
     prev: ?*rec_t = null,
@@ -43,6 +52,30 @@ pub const rec_t = struct {
     is_infimum: bool = false,
     is_supremum: bool = false,
 };
+
+pub const dict_index_t = struct {};
+pub const mtr_t = struct {};
+pub const buf_block_t = struct {};
+pub const page_t = struct {};
+pub const page_zip_des_t = struct {};
+pub const upd_t = struct {};
+pub const que_thr_t = struct {};
+pub const big_rec_t = struct {};
+pub const mem_heap_t = struct {};
+pub const trx_t = struct {};
+pub const page_cur_t = struct {};
+pub const trx_rb_ctx = enum(u8) {
+    TRX_RB_NONE = 0,
+};
+
+pub const btr_cur_t = struct {
+    index: ?*dict_index_t = null,
+    rec: ?*rec_t = null,
+    block: ?*buf_block_t = null,
+    opened: bool = false,
+};
+
+pub const dtuple_t = struct {};
 
 pub fn btr_root_get(index: *dict_index_t, mtr: *mtr_t) ?*page_t {
     _ = index;
@@ -238,6 +271,393 @@ pub fn btr_validate_index(index: *dict_index_t, trx: ?*trx_t) ibool {
     return compat.TRUE;
 }
 
+pub fn btr_cur_var_init() void {
+    btr_cur_n_non_sea = 0;
+    btr_cur_n_sea = 0;
+    btr_cur_n_non_sea_old = 0;
+    btr_cur_n_sea_old = 0;
+}
+
+pub fn btr_cur_search_to_nth_level(
+    index: *dict_index_t,
+    level: ulint,
+    tuple: *const dtuple_t,
+    mode: ulint,
+    latch_mode: ulint,
+    cursor: *btr_cur_t,
+    has_search_latch: ulint,
+    file: []const u8,
+    line: ulint,
+    mtr: *mtr_t,
+) void {
+    _ = level;
+    _ = tuple;
+    _ = mode;
+    _ = latch_mode;
+    _ = has_search_latch;
+    _ = file;
+    _ = line;
+    _ = mtr;
+    cursor.index = index;
+    cursor.rec = null;
+    cursor.block = null;
+    cursor.opened = true;
+    btr_cur_n_non_sea += 1;
+}
+
+pub fn btr_cur_open_at_index_side_func(
+    from_left: ibool,
+    index: *dict_index_t,
+    latch_mode: ulint,
+    cursor: *btr_cur_t,
+    file: []const u8,
+    line: ulint,
+    mtr: *mtr_t,
+) void {
+    _ = from_left;
+    _ = latch_mode;
+    _ = file;
+    _ = line;
+    _ = mtr;
+    cursor.index = index;
+    cursor.rec = null;
+    cursor.block = null;
+    cursor.opened = true;
+}
+
+pub fn btr_cur_open_at_rnd_pos_func(
+    index: *dict_index_t,
+    latch_mode: ulint,
+    cursor: *btr_cur_t,
+    file: []const u8,
+    line: ulint,
+    mtr: *mtr_t,
+) void {
+    _ = latch_mode;
+    _ = file;
+    _ = line;
+    _ = mtr;
+    cursor.index = index;
+    cursor.rec = null;
+    cursor.block = null;
+    cursor.opened = true;
+}
+
+pub fn btr_cur_optimistic_insert(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    entry: *dtuple_t,
+    rec: *?*rec_t,
+    big_rec: *?*big_rec_t,
+    n_ext: ulint,
+    thr: ?*que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = entry;
+    _ = n_ext;
+    _ = thr;
+    _ = mtr;
+    rec.* = null;
+    big_rec.* = null;
+    return 0;
+}
+
+pub fn btr_cur_pessimistic_insert(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    entry: *dtuple_t,
+    rec: *?*rec_t,
+    big_rec: *?*big_rec_t,
+    n_ext: ulint,
+    thr: ?*que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = entry;
+    _ = n_ext;
+    _ = thr;
+    _ = mtr;
+    rec.* = null;
+    big_rec.* = null;
+    return 0;
+}
+
+pub fn btr_cur_parse_update_in_place(
+    ptr: [*]byte,
+    end_ptr: [*]byte,
+    page: ?*page_t,
+    page_zip: ?*page_zip_des_t,
+    index: *dict_index_t,
+) [*]byte {
+    _ = end_ptr;
+    _ = page;
+    _ = page_zip;
+    _ = index;
+    return ptr;
+}
+
+pub fn btr_cur_update_in_place(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    update: *const upd_t,
+    cmpl_info: ulint,
+    thr: *que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = update;
+    _ = cmpl_info;
+    _ = thr;
+    _ = mtr;
+    return 0;
+}
+
+pub fn btr_cur_optimistic_update(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    update: *const upd_t,
+    cmpl_info: ulint,
+    thr: *que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = update;
+    _ = cmpl_info;
+    _ = thr;
+    _ = mtr;
+    return 0;
+}
+
+pub fn btr_cur_pessimistic_update(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    heap: *?*mem_heap_t,
+    big_rec: *?*big_rec_t,
+    update: *const upd_t,
+    cmpl_info: ulint,
+    thr: *que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = heap;
+    _ = update;
+    _ = cmpl_info;
+    _ = thr;
+    _ = mtr;
+    big_rec.* = null;
+    return 0;
+}
+
+pub fn btr_cur_parse_del_mark_set_clust_rec(
+    ptr: [*]byte,
+    end_ptr: [*]byte,
+    page: ?*page_t,
+    page_zip: ?*page_zip_des_t,
+    index: *dict_index_t,
+) [*]byte {
+    _ = end_ptr;
+    _ = page;
+    _ = page_zip;
+    _ = index;
+    return ptr;
+}
+
+pub fn btr_cur_del_mark_set_clust_rec(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    val: ibool,
+    thr: *que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = val;
+    _ = thr;
+    _ = mtr;
+    return 0;
+}
+
+pub fn btr_cur_parse_del_mark_set_sec_rec(
+    ptr: [*]byte,
+    end_ptr: [*]byte,
+    page: ?*page_t,
+    page_zip: ?*page_zip_des_t,
+) [*]byte {
+    _ = end_ptr;
+    _ = page;
+    _ = page_zip;
+    return ptr;
+}
+
+pub fn btr_cur_del_mark_set_sec_rec(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    val: ibool,
+    thr: *que_thr_t,
+    mtr: *mtr_t,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = val;
+    _ = thr;
+    _ = mtr;
+    return 0;
+}
+
+pub fn btr_cur_del_unmark_for_ibuf(rec: *rec_t, page_zip: ?*page_zip_des_t, mtr: *mtr_t) void {
+    _ = rec;
+    _ = page_zip;
+    _ = mtr;
+}
+
+pub fn btr_cur_compress_if_useful(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
+    _ = cursor;
+    _ = mtr;
+    return compat.FALSE;
+}
+
+pub fn btr_cur_optimistic_delete(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
+    _ = cursor;
+    _ = mtr;
+    return compat.FALSE;
+}
+
+pub fn btr_cur_pessimistic_delete(err: *ulint, has_reserved_extents: ibool, cursor: *btr_cur_t, rb_ctx: trx_rb_ctx, mtr: *mtr_t) ibool {
+    _ = has_reserved_extents;
+    _ = cursor;
+    _ = rb_ctx;
+    _ = mtr;
+    err.* = 0;
+    return compat.FALSE;
+}
+
+pub fn btr_estimate_n_rows_in_range(
+    index: *dict_index_t,
+    tuple1: *const dtuple_t,
+    mode1: ulint,
+    tuple2: *const dtuple_t,
+    mode2: ulint,
+) ib_int64_t {
+    _ = index;
+    _ = tuple1;
+    _ = mode1;
+    _ = tuple2;
+    _ = mode2;
+    return 0;
+}
+
+pub fn btr_estimate_number_of_different_key_vals(index: *dict_index_t) void {
+    _ = index;
+}
+
+pub fn btr_cur_mark_extern_inherited_fields(
+    page_zip: ?*page_zip_des_t,
+    rec: *rec_t,
+    index: *dict_index_t,
+    offsets: *const ulint,
+    update: *const upd_t,
+    mtr: ?*mtr_t,
+) void {
+    _ = page_zip;
+    _ = rec;
+    _ = index;
+    _ = offsets;
+    _ = update;
+    _ = mtr;
+}
+
+pub fn btr_cur_mark_dtuple_inherited_extern(entry: *dtuple_t, update: *const upd_t) void {
+    _ = entry;
+    _ = update;
+}
+
+pub fn btr_cur_unmark_dtuple_extern_fields(entry: *dtuple_t) void {
+    _ = entry;
+}
+
+pub fn btr_push_update_extern_fields(tuple: *dtuple_t, update: *const upd_t, heap: *mem_heap_t) ulint {
+    _ = tuple;
+    _ = update;
+    _ = heap;
+    return 0;
+}
+
+pub fn btr_store_big_rec_extern_fields(
+    index: *dict_index_t,
+    rec_block: *buf_block_t,
+    rec: *rec_t,
+    offsets: *const ulint,
+    big_rec_vec: *big_rec_t,
+    local_mtr: ?*mtr_t,
+) ulint {
+    _ = index;
+    _ = rec_block;
+    _ = rec;
+    _ = offsets;
+    _ = big_rec_vec;
+    _ = local_mtr;
+    return 0;
+}
+
+pub fn btr_free_externally_stored_field(
+    index: *dict_index_t,
+    field_ref: [*]byte,
+    rec: ?*const rec_t,
+    offsets: ?*const ulint,
+    page_zip: ?*page_zip_des_t,
+    i: ulint,
+    rb_ctx: trx_rb_ctx,
+    local_mtr: ?*mtr_t,
+) void {
+    _ = index;
+    _ = field_ref;
+    _ = rec;
+    _ = offsets;
+    _ = page_zip;
+    _ = i;
+    _ = rb_ctx;
+    _ = local_mtr;
+}
+
+pub fn btr_copy_externally_stored_field_prefix(
+    buf: [*]byte,
+    len: ulint,
+    zip_size: ulint,
+    data: [*]const byte,
+    local_len: ulint,
+) ulint {
+    _ = zip_size;
+    const max = @min(len, local_len);
+    const count = @as(usize, @intCast(max));
+    if (count > 0) {
+        std.mem.copyForwards(byte, buf[0..count], data[0..count]);
+    }
+    return max;
+}
+
+pub fn btr_rec_copy_externally_stored_field(
+    rec: *const rec_t,
+    offsets: *const ulint,
+    zip_size: ulint,
+    no: ulint,
+    len: *ulint,
+    heap: *mem_heap_t,
+) ?[*]byte {
+    _ = rec;
+    _ = offsets;
+    _ = zip_size;
+    _ = no;
+    _ = heap;
+    len.* = 0;
+    return null;
+}
+
 test "btr prev and next user record stubs" {
     var a = rec_t{};
     var b = rec_t{};
@@ -269,4 +689,40 @@ test "btr split rec helpers default" {
     split = &rec;
     try std.testing.expect(btr_page_get_split_rec_to_right(&cursor, &split) == compat.FALSE);
     try std.testing.expect(split == null);
+}
+
+test "btr cursor open and search stubs" {
+    btr_cur_n_non_sea = 5;
+    btr_cur_n_sea = 3;
+    btr_cur_n_non_sea_old = 2;
+    btr_cur_n_sea_old = 1;
+    btr_cur_var_init();
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_non_sea);
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_sea);
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_non_sea_old);
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_sea_old);
+
+    var index = dict_index_t{};
+    var tuple = dtuple_t{};
+    var mtr = mtr_t{};
+    var cursor = btr_cur_t{};
+
+    btr_cur_search_to_nth_level(&index, 0, &tuple, 0, 0, &cursor, 0, "file", 1, &mtr);
+    try std.testing.expect(cursor.index == &index);
+    try std.testing.expect(cursor.opened);
+    try std.testing.expectEqual(@as(ulint, 1), btr_cur_n_non_sea);
+
+    var cursor2 = btr_cur_t{};
+    btr_cur_open_at_index_side_func(compat.TRUE, &index, 0, &cursor2, "file", 2, &mtr);
+    try std.testing.expect(cursor2.index == &index);
+    try std.testing.expect(cursor2.opened);
+}
+
+test "btr external field prefix copy" {
+    var buf = [_]byte{0} ** 5;
+    const data = [_]byte{ 'a', 'b', 'c', 'd' };
+
+    const copied = btr_copy_externally_stored_field_prefix(buf[0..].ptr, 5, 0, data[0..].ptr, 3);
+    try std.testing.expectEqual(@as(ulint, 3), copied);
+    try std.testing.expectEqualStrings("abc", buf[0..3]);
 }
