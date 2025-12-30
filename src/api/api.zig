@@ -18,6 +18,7 @@ pub const ib_u16_t = u16;
 pub const ib_byte_t = u8;
 pub const ib_opaque_t = ?*anyopaque;
 pub const ib_charset_t = ib_opaque_t;
+pub const ib_cb_t = *const fn () callconv(.C) void;
 
 pub const ib_logger_t = log.LoggerFn;
 pub const ib_stream_t = log.Stream;
@@ -148,6 +149,13 @@ pub const ib_tbl_sch_t = ?*TableSchema;
 pub const ib_idx_sch_t = ?*IndexSchema;
 
 pub const ib_id_t = ib_u64_t;
+pub const ib_cfg_type_t = enum(u32) {
+    IB_CFG_IBOOL = 0,
+    IB_CFG_ULINT = 1,
+    IB_CFG_ULONG = 2,
+    IB_CFG_TEXT = 3,
+    IB_CFG_CB = 4,
+};
 
 pub const ib_i8_t = i8;
 pub const ib_u8_t = u8;
@@ -354,9 +362,114 @@ var db_format: DbFormat = .{ .id = 0, .name = null };
 var next_table_id: ib_id_t = 1;
 var next_index_id: ib_id_t = 1;
 var table_registry = std.ArrayList(*CatalogTable).init(std.heap.page_allocator);
+const CfgValue = union(ib_cfg_type_t) {
+    IB_CFG_IBOOL: ib_bool_t,
+    IB_CFG_ULINT: ib_ulint_t,
+    IB_CFG_ULONG: ib_ulint_t,
+    IB_CFG_TEXT: []const u8,
+    IB_CFG_CB: ib_cb_t,
+};
+
+const CfgVar = struct {
+    name: []const u8,
+    cfg_type: ib_cfg_type_t,
+    value: CfgValue,
+};
+
+const cfg_vars_defaults = [_]CfgVar{
+    .{
+        .name = "additional_mem_pool_size",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 4 * 1024 * 1024) },
+    },
+    .{
+        .name = "buffer_pool_size",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 8 * 1024 * 1024) },
+    },
+    .{
+        .name = "data_file_path",
+        .cfg_type = .IB_CFG_TEXT,
+        .value = .{ .IB_CFG_TEXT = "ibdata1:32M:autoextend" },
+    },
+    .{
+        .name = "data_home_dir",
+        .cfg_type = .IB_CFG_TEXT,
+        .value = .{ .IB_CFG_TEXT = "./" },
+    },
+    .{
+        .name = "file_io_threads",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = 4 },
+    },
+    .{
+        .name = "file_per_table",
+        .cfg_type = .IB_CFG_IBOOL,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
+        .name = "flush_method",
+        .cfg_type = .IB_CFG_TEXT,
+        .value = .{ .IB_CFG_TEXT = "fsync" },
+    },
+    .{
+        .name = "lock_wait_timeout",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = 60 },
+    },
+    .{
+        .name = "log_buffer_size",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 384 * 1024) },
+    },
+    .{
+        .name = "log_file_size",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 16 * 1024 * 1024) },
+    },
+    .{
+        .name = "log_files_in_group",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = 2 },
+    },
+    .{
+        .name = "log_group_home_dir",
+        .cfg_type = .IB_CFG_TEXT,
+        .value = .{ .IB_CFG_TEXT = "." },
+    },
+    .{
+        .name = "lru_old_blocks_pct",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 3 * 100 / 8) },
+    },
+    .{
+        .name = "lru_block_access_recency",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = 0 },
+    },
+    .{
+        .name = "rollback_on_timeout",
+        .cfg_type = .IB_CFG_IBOOL,
+        .value = .{ .IB_CFG_IBOOL = compat.IB_TRUE },
+    },
+    .{
+        .name = "read_io_threads",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = 4 },
+    },
+    .{
+        .name = "write_io_threads",
+        .cfg_type = .IB_CFG_ULINT,
+        .value = .{ .IB_CFG_ULINT = 4 },
+    },
+};
+
+var cfg_vars = cfg_vars_defaults;
+var cfg_initialized = false;
+var cfg_mutex = std.Thread.Mutex{};
 
 pub fn ib_init() ib_err_t {
-    return .DB_SUCCESS;
+    return ib_cfg_init();
 }
 
 pub fn ib_startup(format: ?[]const u8) ib_err_t {
@@ -382,12 +495,277 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
 
 pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
+    _ = ib_cfg_shutdown();
     db_format.id = 0;
     db_format.name = null;
     catalogClear();
     next_table_id = 1;
     next_index_id = 1;
     return .DB_SUCCESS;
+}
+
+fn cfgFind(name: []const u8) ?*CfgVar {
+    for (&cfg_vars) |*cfg_var| {
+        if (std.ascii.eqlIgnoreCase(name, cfg_var.name)) {
+            return cfg_var;
+        }
+    }
+    return null;
+}
+
+fn cfgBoolFromAny(value: anytype) ?ib_bool_t {
+    const T = @TypeOf(value);
+    if (T == bool) {
+        return if (value) compat.IB_TRUE else compat.IB_FALSE;
+    }
+    switch (@typeInfo(T)) {
+        .comptime_int => {
+            if (value != 0 and value != 1) {
+                return null;
+            }
+            return @intCast(value);
+        },
+        .int => |_| {
+            if (T == ib_bool_t) {
+                return value;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn cfgUlintFromAny(value: anytype) ?ib_ulint_t {
+    const T = @TypeOf(value);
+    if (T == ib_ulint_t) {
+        return value;
+    }
+    switch (@typeInfo(T)) {
+        .comptime_int => {
+            if (value < 0) {
+                return null;
+            }
+            return @intCast(value);
+        },
+        else => return null,
+    }
+}
+
+fn cfgTextFromAny(value: anytype) ?[]const u8 {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) {
+                return value[0..];
+            }
+            if (ptr.size == .one) {
+                const child_info = @typeInfo(ptr.child);
+                if (child_info == .array and child_info.array.child == u8) {
+                    if (child_info.array.sentinel != null) {
+                        const c_ptr: [*:0]const u8 = @ptrCast(value);
+                        return std.mem.span(c_ptr);
+                    }
+                    return value.*[0..child_info.array.len];
+                }
+            }
+        },
+        .array => |arr| {
+            if (arr.child == u8) {
+                return value[0..];
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn cfgSetValue(cfg_var: *CfgVar, value: anytype) ib_err_t {
+    switch (cfg_var.cfg_type) {
+        .IB_CFG_IBOOL => {
+            const val = cfgBoolFromAny(value) orelse return .DB_INVALID_INPUT;
+            cfg_var.value = .{ .IB_CFG_IBOOL = val };
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_ULINT => {
+            const val = cfgUlintFromAny(value) orelse return .DB_INVALID_INPUT;
+            cfg_var.value = .{ .IB_CFG_ULINT = val };
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_ULONG => {
+            const val = cfgUlintFromAny(value) orelse return .DB_INVALID_INPUT;
+            cfg_var.value = .{ .IB_CFG_ULONG = val };
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_TEXT => {
+            const val = cfgTextFromAny(value) orelse return .DB_INVALID_INPUT;
+            cfg_var.value = .{ .IB_CFG_TEXT = val };
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_CB => {
+            if (@TypeOf(value) != ib_cb_t) {
+                return .DB_INVALID_INPUT;
+            }
+            cfg_var.value = .{ .IB_CFG_CB = value };
+            return .DB_SUCCESS;
+        },
+    }
+}
+
+fn cfgGetValue(cfg_var: *const CfgVar, out: anytype) ib_err_t {
+    const OutType = @TypeOf(out);
+    const out_info = @typeInfo(OutType);
+    if (out_info != .pointer) {
+        return .DB_INVALID_INPUT;
+    }
+    const Child = out_info.pointer.child;
+
+    switch (cfg_var.cfg_type) {
+        .IB_CFG_IBOOL => {
+            if (Child == ib_bool_t) {
+                out.* = cfg_var.value.IB_CFG_IBOOL;
+                return .DB_SUCCESS;
+            }
+            if (Child == bool) {
+                out.* = cfg_var.value.IB_CFG_IBOOL != 0;
+                return .DB_SUCCESS;
+            }
+            return .DB_INVALID_INPUT;
+        },
+        .IB_CFG_ULINT => {
+            if (Child == ib_ulint_t) {
+                out.* = cfg_var.value.IB_CFG_ULINT;
+                return .DB_SUCCESS;
+            }
+            return .DB_INVALID_INPUT;
+        },
+        .IB_CFG_ULONG => {
+            if (Child == ib_ulint_t) {
+                out.* = cfg_var.value.IB_CFG_ULONG;
+                return .DB_SUCCESS;
+            }
+            return .DB_INVALID_INPUT;
+        },
+        .IB_CFG_TEXT => {
+            if (Child == []const u8) {
+                out.* = cfg_var.value.IB_CFG_TEXT;
+                return .DB_SUCCESS;
+            }
+            return .DB_INVALID_INPUT;
+        },
+        .IB_CFG_CB => {
+            if (Child == ib_cb_t) {
+                out.* = cfg_var.value.IB_CFG_CB;
+                return .DB_SUCCESS;
+            }
+            return .DB_INVALID_INPUT;
+        },
+    }
+}
+
+pub fn ib_cfg_var_get_type(name: []const u8, cfg_type: *ib_cfg_type_t) ib_err_t {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+
+    if (!cfg_initialized) {
+        return .DB_ERROR;
+    }
+
+    const cfg_var = cfgFind(name) orelse return .DB_NOT_FOUND;
+    cfg_type.* = cfg_var.cfg_type;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_cfg_set(name: []const u8, value: anytype) ib_err_t {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+
+    if (!cfg_initialized) {
+        return .DB_ERROR;
+    }
+
+    const cfg_var = cfgFind(name) orelse return .DB_NOT_FOUND;
+    return cfgSetValue(cfg_var, value);
+}
+
+pub fn ib_cfg_get(name: []const u8, out: anytype) ib_err_t {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+
+    if (!cfg_initialized) {
+        return .DB_ERROR;
+    }
+
+    const cfg_var = cfgFind(name) orelse return .DB_NOT_FOUND;
+    return cfgGetValue(cfg_var, out);
+}
+
+pub fn ib_cfg_get_all(names: *[][]const u8, names_num: *ib_u32_t) ib_err_t {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+
+    if (!cfg_initialized) {
+        return .DB_ERROR;
+    }
+
+    const out = std.heap.page_allocator.alloc([]const u8, cfg_vars.len) catch {
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    for (cfg_vars, 0..) |cfg_var, idx| {
+        out[idx] = cfg_var.name;
+    }
+
+    names.* = out;
+    names_num.* = @intCast(cfg_vars.len);
+    return .DB_SUCCESS;
+}
+
+pub fn ib_cfg_init() ib_err_t {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+    cfg_vars = cfg_vars_defaults;
+    cfg_initialized = true;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_cfg_shutdown() ib_err_t {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+    cfg_vars = cfg_vars_defaults;
+    cfg_initialized = false;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_exec_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
+    _ = n_args;
+    if (sql.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED) orelse return .DB_OUT_OF_MEMORY;
+    return ib_trx_commit(trx);
+}
+
+pub fn ib_exec_ddl_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
+    _ = n_args;
+    if (sql.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED) orelse return .DB_OUT_OF_MEMORY;
+    const lock_err = ib_schema_lock_exclusive(trx);
+    if (lock_err != .DB_SUCCESS) {
+        _ = ib_trx_rollback(trx);
+        return lock_err;
+    }
+
+    const unlock_err = ib_schema_unlock(trx);
+    if (unlock_err != .DB_SUCCESS) {
+        _ = ib_trx_rollback(trx);
+        return unlock_err;
+    }
+
+    return ib_trx_commit(trx);
 }
 
 fn parseFileFormat(format: []const u8) ?u32 {
@@ -2633,4 +3011,57 @@ test "schema tables iterate" {
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/iter1"));
     ib_table_schema_delete(tbl_sch);
+}
+
+test "config set get and list" {
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_init());
+
+    var cfg_type: ib_cfg_type_t = undefined;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_var_get_type("buffer_pool_size", &cfg_type));
+    try std.testing.expectEqual(ib_cfg_type_t.IB_CFG_ULINT, cfg_type);
+
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_cfg_set("buffer_pool_size", @as(ib_ulint_t, 16 * 1024 * 1024)),
+    );
+    var pool_size: ib_ulint_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_get("buffer_pool_size", &pool_size));
+    try std.testing.expectEqual(@as(ib_ulint_t, 16 * 1024 * 1024), pool_size);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_set("rollback_on_timeout", compat.IB_FALSE));
+    var rollback: ib_bool_t = compat.IB_TRUE;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_get("rollback_on_timeout", &rollback));
+    try std.testing.expectEqual(compat.IB_FALSE, rollback);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_set("data_home_dir", "data/"));
+    var data_home: []const u8 = "";
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_get("data_home_dir", &data_home));
+    try std.testing.expect(std.mem.eql(u8, data_home, "data/"));
+
+    var names: [][]const u8 = undefined;
+    var names_num: ib_u32_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_get_all(&names, &names_num));
+    defer std.heap.page_allocator.free(names);
+    try std.testing.expect(names_num > 0);
+    var found = false;
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(name, "buffer_pool_size")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+
+    try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_cfg_var_get_type("unknown", &cfg_type));
+    try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_cfg_set("unknown", @as(ib_ulint_t, 1)));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_shutdown());
+}
+
+test "exec sql stubs validate input" {
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_sql("", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_sql("select 1", 0));
+
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql("create table t(a int)", 0));
 }
