@@ -14,7 +14,7 @@ fn defaultLogger(stream: Stream, message: []const u8) void {
         const file = @as(*std.fs.File, @ptrCast(@alignCast(ptr)));
         _ = file.writeAll(message) catch {};
     } else {
-        var stderr = std.io.getStdErr();
+        var stderr = std.fs.File.stderr();
         _ = stderr.writeAll(message) catch {};
     }
 }

@@ -129,9 +129,7 @@ pub fn os_sync_free() void {
 
 pub fn os_event_create(name: ?[]const u8) os_event_t {
     _ = name;
-    const event = std.heap.page_allocator.create(OsEvent) catch {
-        return @as(os_event_t, @ptrFromInt(0));
-    };
+    const event = std.heap.page_allocator.create(OsEvent) catch @panic("os_event_create");
     event.* = .{};
     addEvent(event);
     return event;
@@ -198,9 +196,7 @@ pub fn os_event_wait_time(event: os_event_t, time: ulint) ulint {
 
 pub fn os_mutex_create(name: ?[]const u8) os_mutex_t {
     _ = name;
-    const mutex = std.heap.page_allocator.create(OsMutex) catch {
-        return @as(os_mutex_t, @ptrFromInt(0));
-    };
+    const mutex = std.heap.page_allocator.create(OsMutex) catch @panic("os_mutex_create");
     mutex.* = .{};
     addMutex(mutex);
     return mutex;
@@ -268,7 +264,7 @@ test "os sync event wait" {
 
     const worker = struct {
         fn run(ev: os_event_t) void {
-            std.time.sleep(50 * std.time.ns_per_ms);
+            std.Thread.sleep(50 * std.time.ns_per_ms);
             os_event_set(ev);
         }
     };

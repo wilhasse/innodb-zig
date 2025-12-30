@@ -9,7 +9,7 @@ pub const ibool = compat.ibool;
 pub const ThreadId = std.Thread.Id;
 pub const os_thread_id_t = ThreadId;
 pub const os_thread_t = ThreadId;
-pub const os_posix_f_t = *const fn (?*anyopaque) callconv(.C) ?*anyopaque;
+pub const os_posix_f_t = *const fn (?*anyopaque) callconv(.c) ?*anyopaque;
 
 pub const Thread = struct {
     handle: std.Thread,
@@ -32,7 +32,7 @@ pub fn yield() void {
 }
 
 pub fn sleepMicros(us: u64) void {
-    std.time.sleep(us * std.time.ns_per_us);
+    std.Thread.sleep(us * std.time.ns_per_us);
 }
 
 pub fn os_thread_eq(a: os_thread_id_t, b: os_thread_id_t) ibool {
@@ -51,13 +51,13 @@ pub fn os_thread_get_curr() os_thread_t {
     return os_thread_get_curr_id();
 }
 
-pub fn os_thread_create(comptime start_f: anytype, arg: anytype, thread_id: ?*os_thread_id_t) os_thread_t {
+pub fn os_thread_create(start_f: os_posix_f_t, arg: ?*anyopaque, thread_id: ?*os_thread_id_t) os_thread_t {
     var id_store = std.atomic.Value(os_thread_id_t).init(0);
     var ready = std.Thread.ResetEvent{};
 
     const Context = struct {
-        start: @TypeOf(start_f),
-        arg: @TypeOf(arg),
+        start: os_posix_f_t,
+        arg: ?*anyopaque,
         id_store: *std.atomic.Value(os_thread_id_t),
         ready: *std.Thread.ResetEvent,
     };
@@ -112,7 +112,11 @@ pub fn os_thread_exit(exit_value: ?*anyopaque) noreturn {
         std.os.windows.kernel32.ExitThread(code);
         unreachable;
     }
-    std.c.pthread_exit(exit_value);
+    if (builtin.os.tag == .linux) {
+        const code: i32 = if (exit_value) |ptr| @as(i32, @intCast(@intFromPtr(ptr) & 0xff)) else 0;
+        std.os.linux.exit(code);
+    }
+    @panic("os_thread_exit unsupported on this OS");
 }
 
 pub fn os_thread_yield() void {
@@ -120,7 +124,7 @@ pub fn os_thread_yield() void {
 }
 
 pub fn os_thread_sleep(tm: ulint) void {
-    std.time.sleep(@as(u64, tm) * std.time.ns_per_us);
+    std.Thread.sleep(@as(u64, tm) * std.time.ns_per_us);
 }
 
 pub fn os_thread_set_priority(handle: os_thread_t, pri: ulint) void {
@@ -162,15 +166,17 @@ test "os thread create sets id and runs" {
     };
 
     const worker = struct {
-        fn run(ctx: *Context) void {
+        fn run(arg: ?*anyopaque) callconv(.c) ?*anyopaque {
+            const ctx = @as(*Context, @ptrCast(@alignCast(arg.?)));
             ctx.flag.store(1, .seq_cst);
             ctx.done.set();
+            return null;
         }
     };
 
     var ctx = Context{ .flag = &flag, .done = &done };
     var tid: os_thread_id_t = 0;
-    _ = os_thread_create(worker.run, &ctx, &tid);
+    _ = os_thread_create(worker.run, @ptrCast(&ctx), &tid);
 
     done.wait();
     try std.testing.expectEqual(@as(u32, 1), flag.load(.seq_cst));

@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayList = std.array_list.Managed;
 const compat = @import("../ut/compat.zig");
 const errors = @import("../ut/errors.zig");
 const log = @import("../ut/log.zig");
@@ -18,7 +19,7 @@ pub const ib_u16_t = u16;
 pub const ib_byte_t = u8;
 pub const ib_opaque_t = ?*anyopaque;
 pub const ib_charset_t = ib_opaque_t;
-pub const ib_cb_t = *const fn () callconv(.C) void;
+pub const ib_cb_t = *const fn () callconv(.c) void;
 
 const charset_t = opaque {};
 
@@ -52,7 +53,7 @@ pub const Trx = struct {
     isolation_level: ib_trx_level_t,
     client_thread_id: os_thread.ThreadId,
     schema_lock: SchemaLock,
-    savepoints: std.ArrayList(Savepoint),
+    savepoints: ArrayList(Savepoint),
 };
 pub const Cursor = struct {
     allocator: std.mem.Allocator,
@@ -98,8 +99,8 @@ pub const TableSchema = struct {
     name: []u8,
     format: ib_tbl_fmt_t,
     page_size: ib_ulint_t,
-    columns: std.ArrayList(SchemaColumn),
-    indexes: std.ArrayList(*IndexSchema),
+    columns: ArrayList(SchemaColumn),
+    indexes: ArrayList(*IndexSchema),
     table_id: ?ib_id_t,
 };
 
@@ -107,7 +108,7 @@ pub const IndexSchema = struct {
     allocator: std.mem.Allocator,
     name: []u8,
     table_name: []u8,
-    columns: std.ArrayList(IndexColumn),
+    columns: ArrayList(IndexColumn),
     clustered: bool,
     unique: bool,
     schema_owner: ?*TableSchema,
@@ -131,7 +132,7 @@ const CatalogIndex = struct {
     clustered: bool,
     unique: bool,
     id: ib_id_t,
-    columns: std.ArrayList(CatalogIndexColumn),
+    columns: ArrayList(CatalogIndexColumn),
 };
 
 const CatalogTable = struct {
@@ -143,8 +144,8 @@ const CatalogTable = struct {
     stat_modified_counter: ib_ulint_t,
     stat_n_rows: ib_ulint_t,
     stats_updated: bool,
-    columns: std.ArrayList(CatalogColumn),
-    indexes: std.ArrayList(CatalogIndex),
+    columns: ArrayList(CatalogColumn),
+    indexes: ArrayList(CatalogIndex),
 };
 
 pub const ib_trx_t = ?*Trx;
@@ -186,49 +187,49 @@ const StatusVar = struct {
 };
 
 const ExportVars = struct {
-    innodb_data_pending_reads: ib_ulint_t,
-    innodb_data_pending_writes: ib_ulint_t,
-    innodb_data_pending_fsyncs: ib_ulint_t,
-    innodb_data_fsyncs: ib_ulint_t,
-    innodb_data_read: ib_ulint_t,
-    innodb_data_writes: ib_ulint_t,
-    innodb_data_written: ib_ulint_t,
-    innodb_data_reads: ib_ulint_t,
-    innodb_buffer_pool_pages_total: ib_ulint_t,
-    innodb_buffer_pool_pages_data: ib_ulint_t,
-    innodb_buffer_pool_pages_dirty: ib_ulint_t,
-    innodb_buffer_pool_pages_misc: ib_ulint_t,
-    innodb_buffer_pool_pages_free: ib_ulint_t,
-    innodb_buffer_pool_read_requests: ib_ulint_t,
-    innodb_buffer_pool_reads: ib_ulint_t,
-    innodb_buffer_pool_wait_free: ib_ulint_t,
-    innodb_buffer_pool_pages_flushed: ib_ulint_t,
-    innodb_buffer_pool_write_requests: ib_ulint_t,
-    innodb_buffer_pool_read_ahead: ib_ulint_t,
-    innodb_buffer_pool_read_ahead_evicted: ib_ulint_t,
-    innodb_dblwr_pages_written: ib_ulint_t,
-    innodb_dblwr_writes: ib_ulint_t,
-    innodb_have_atomic_builtins: ib_bool_t,
-    innodb_log_waits: ib_ulint_t,
-    innodb_log_write_requests: ib_ulint_t,
-    innodb_log_writes: ib_ulint_t,
-    innodb_os_log_written: ib_ulint_t,
-    innodb_os_log_fsyncs: ib_ulint_t,
-    innodb_os_log_pending_writes: ib_ulint_t,
-    innodb_os_log_pending_fsyncs: ib_ulint_t,
-    innodb_page_size: ib_ulint_t,
-    innodb_pages_created: ib_ulint_t,
-    innodb_pages_read: ib_ulint_t,
-    innodb_pages_written: ib_ulint_t,
-    innodb_row_lock_waits: ib_ulint_t,
-    innodb_row_lock_current_waits: ib_ulint_t,
-    innodb_row_lock_time: ib_i64_t,
-    innodb_row_lock_time_avg: ib_ulint_t,
-    innodb_row_lock_time_max: ib_ulint_t,
-    innodb_rows_read: ib_ulint_t,
-    innodb_rows_inserted: ib_ulint_t,
-    innodb_rows_updated: ib_ulint_t,
-    innodb_rows_deleted: ib_ulint_t,
+    innodb_data_pending_reads: ib_ulint_t = 0,
+    innodb_data_pending_writes: ib_ulint_t = 0,
+    innodb_data_pending_fsyncs: ib_ulint_t = 0,
+    innodb_data_fsyncs: ib_ulint_t = 0,
+    innodb_data_read: ib_ulint_t = 0,
+    innodb_data_writes: ib_ulint_t = 0,
+    innodb_data_written: ib_ulint_t = 0,
+    innodb_data_reads: ib_ulint_t = 0,
+    innodb_buffer_pool_pages_total: ib_ulint_t = 0,
+    innodb_buffer_pool_pages_data: ib_ulint_t = 0,
+    innodb_buffer_pool_pages_dirty: ib_ulint_t = 0,
+    innodb_buffer_pool_pages_misc: ib_ulint_t = 0,
+    innodb_buffer_pool_pages_free: ib_ulint_t = 0,
+    innodb_buffer_pool_read_requests: ib_ulint_t = 0,
+    innodb_buffer_pool_reads: ib_ulint_t = 0,
+    innodb_buffer_pool_wait_free: ib_ulint_t = 0,
+    innodb_buffer_pool_pages_flushed: ib_ulint_t = 0,
+    innodb_buffer_pool_write_requests: ib_ulint_t = 0,
+    innodb_buffer_pool_read_ahead: ib_ulint_t = 0,
+    innodb_buffer_pool_read_ahead_evicted: ib_ulint_t = 0,
+    innodb_dblwr_pages_written: ib_ulint_t = 0,
+    innodb_dblwr_writes: ib_ulint_t = 0,
+    innodb_have_atomic_builtins: ib_bool_t = 0,
+    innodb_log_waits: ib_ulint_t = 0,
+    innodb_log_write_requests: ib_ulint_t = 0,
+    innodb_log_writes: ib_ulint_t = 0,
+    innodb_os_log_written: ib_ulint_t = 0,
+    innodb_os_log_fsyncs: ib_ulint_t = 0,
+    innodb_os_log_pending_writes: ib_ulint_t = 0,
+    innodb_os_log_pending_fsyncs: ib_ulint_t = 0,
+    innodb_page_size: ib_ulint_t = 0,
+    innodb_pages_created: ib_ulint_t = 0,
+    innodb_pages_read: ib_ulint_t = 0,
+    innodb_pages_written: ib_ulint_t = 0,
+    innodb_row_lock_waits: ib_ulint_t = 0,
+    innodb_row_lock_current_waits: ib_ulint_t = 0,
+    innodb_row_lock_time: ib_i64_t = 0,
+    innodb_row_lock_time_avg: ib_ulint_t = 0,
+    innodb_row_lock_time_max: ib_ulint_t = 0,
+    innodb_rows_read: ib_ulint_t = 0,
+    innodb_rows_inserted: ib_ulint_t = 0,
+    innodb_rows_updated: ib_ulint_t = 0,
+    innodb_rows_deleted: ib_ulint_t = 0,
 };
 
 pub const IB_SQL_NULL: ib_u32_t = 0xFFFF_FFFF;
@@ -248,7 +249,7 @@ pub const ib_schema_visitor_table_all_t = *const fn (
     arg: ib_opaque_t,
     name: [*]const u8,
     name_len: i32,
-) callconv(.C) i32;
+) callconv(.c) i32;
 
 pub const ib_schema_visitor_table_t = *const fn (
     arg: ib_opaque_t,
@@ -257,7 +258,7 @@ pub const ib_schema_visitor_table_t = *const fn (
     page_size: ib_ulint_t,
     n_cols: i32,
     n_indexes: i32,
-) callconv(.C) i32;
+) callconv(.c) i32;
 
 pub const ib_schema_visitor_table_col_t = *const fn (
     arg: ib_opaque_t,
@@ -265,7 +266,7 @@ pub const ib_schema_visitor_table_col_t = *const fn (
     col_type: ib_col_type_t,
     len: ib_ulint_t,
     attr: ib_col_attr_t,
-) callconv(.C) i32;
+) callconv(.c) i32;
 
 pub const ib_schema_visitor_index_t = *const fn (
     arg: ib_opaque_t,
@@ -273,13 +274,13 @@ pub const ib_schema_visitor_index_t = *const fn (
     clustered: ib_bool_t,
     unique: ib_bool_t,
     n_cols: i32,
-) callconv(.C) i32;
+) callconv(.c) i32;
 
 pub const ib_schema_visitor_index_col_t = *const fn (
     arg: ib_opaque_t,
     name: [*]const u8,
     prefix_len: ib_ulint_t,
-) callconv(.C) i32;
+) callconv(.c) i32;
 
 pub const ib_schema_visitor_t = struct {
     version: ib_schema_visitor_version_t,
@@ -341,8 +342,8 @@ pub const ib_lck_mode_t = enum(u32) {
     IB_LOCK_X = 3,
     IB_LOCK_NOT_USED = 4,
     IB_LOCK_NONE = 5,
-    IB_LOCK_NUM = 5,
 };
+pub const IB_LOCK_NUM: u32 = @intFromEnum(ib_lck_mode_t.IB_LOCK_NONE);
 
 pub const ib_srch_mode_t = enum(u32) {
     IB_CUR_G = 1,
@@ -503,7 +504,7 @@ const DbFormat = struct {
 var db_format: DbFormat = .{ .id = 0, .name = null };
 var next_table_id: ib_id_t = 1;
 var next_index_id: ib_id_t = 1;
-var table_registry = std.ArrayList(*CatalogTable).init(std.heap.page_allocator);
+var table_registry = ArrayList(*CatalogTable).init(std.heap.page_allocator);
 const CfgValue = union(ib_cfg_type_t) {
     IB_CFG_IBOOL: ib_bool_t,
     IB_CFG_ULINT: ib_ulint_t,
@@ -961,7 +962,7 @@ fn cfgTextFromAny(value: anytype) ?[]const u8 {
             if (ptr.size == .slice and ptr.child == u8) {
                 return value[0..];
             }
-            if ((ptr.size == .many or ptr.size == .c) and ptr.sentinel != null) {
+            if ((ptr.size == .many or ptr.size == .c) and ptr.sentinel_ptr != null) {
                 if (ptr.child == u8) {
                     const c_ptr: [*:0]const u8 = @ptrCast(value);
                     return std.mem.span(c_ptr);
@@ -970,7 +971,7 @@ fn cfgTextFromAny(value: anytype) ?[]const u8 {
             if (ptr.size == .one) {
                 const child_info = @typeInfo(ptr.child);
                 if (child_info == .array and child_info.array.child == u8) {
-                    if (child_info.array.sentinel != null) {
+                    if (child_info.array.sentinel_ptr != null) {
                         const c_ptr: [*:0]const u8 = @ptrCast(value);
                         return std.mem.span(c_ptr);
                     }
@@ -1264,7 +1265,7 @@ fn srv_export_innodb_status() void {
 }
 
 fn statusLookup(name: []const u8) ?*const StatusVar {
-    for (status_vars) |*entry| {
+    for (status_vars[0..]) |*entry| {
         if (schemaNameEq(name, entry.name)) {
             return entry;
         }
@@ -1283,18 +1284,20 @@ pub fn ib_status_get_i64(name: []const u8, dst: *ib_i64_t) ib_err_t {
 
     switch (entry.status_type) {
         .IB_STATUS_ULINT => {
-            dst.* = @as(ib_i64_t, @intCast(@as(*const ib_ulint_t, @ptrCast(entry.value_ptr)).*));
+            const ptr = @as(*const ib_ulint_t, @ptrCast(@alignCast(entry.value_ptr)));
+            dst.* = @as(ib_i64_t, @intCast(ptr.*));
             return .DB_SUCCESS;
         },
         .IB_STATUS_IBOOL => {
-            dst.* = if (@as(*const ib_bool_t, @ptrCast(entry.value_ptr)).* != 0) 1 else 0;
+            const ptr = @as(*const ib_bool_t, @ptrCast(@alignCast(entry.value_ptr)));
+            dst.* = if (ptr.* != 0) 1 else 0;
             return .DB_SUCCESS;
         },
         .IB_STATUS_I64 => {
-            dst.* = @as(*const ib_i64_t, @ptrCast(entry.value_ptr)).*;
+            const ptr = @as(*const ib_i64_t, @ptrCast(@alignCast(entry.value_ptr)));
+            dst.* = ptr.*;
             return .DB_SUCCESS;
         },
-        else => return .DB_DATA_MISMATCH,
     }
 }
 
@@ -1349,7 +1352,9 @@ pub fn ib_update_statistics_if_needed(table: *CatalogTable) void {
     const counter = table.stat_modified_counter;
     table.stat_modified_counter += 1;
 
-    if (counter > 2_000_000_000 or @as(i64, @intCast(counter)) > 16 + @as(i64, @intCast(table.stat_n_rows)) / 16) {
+    const counter_i64 = @as(i64, @intCast(counter));
+    const rows_i64 = @as(i64, @intCast(table.stat_n_rows));
+    if (counter > 2_000_000_000 or counter_i64 > 16 + @divTrunc(rows_i64, 16)) {
         table.stats_updated = true;
     }
 }
@@ -2034,7 +2039,7 @@ pub fn ib_trx_begin(ib_trx_level: ib_trx_level_t) ib_trx_t {
         .isolation_level = ib_trx_level,
         .client_thread_id = os_thread.currentId(),
         .schema_lock = .none,
-        .savepoints = std.ArrayList(Savepoint).init(std.heap.page_allocator),
+        .savepoints = ArrayList(Savepoint).init(std.heap.page_allocator),
     };
 
     if (ib_trx_start(trx, ib_trx_level) != .DB_SUCCESS) {
@@ -2152,7 +2157,7 @@ fn cursorCatalogIndex(cursor: *Cursor) ?*CatalogIndex {
 }
 
 fn cursorLockModeValid(mode: ib_lck_mode_t) bool {
-    return @intFromEnum(mode) <= @intFromEnum(ib_lck_mode_t.IB_LOCK_NUM);
+    return @intFromEnum(mode) <= IB_LOCK_NUM;
 }
 
 fn tableLockModeValid(mode: ib_lck_mode_t) bool {
@@ -2678,8 +2683,8 @@ fn catalogCreateFromSchema(schema: *const TableSchema, id: ib_id_t) !*CatalogTab
         .stat_modified_counter = 0,
         .stat_n_rows = 0,
         .stats_updated = false,
-        .columns = std.ArrayList(CatalogColumn).init(allocator),
-        .indexes = std.ArrayList(CatalogIndex).init(allocator),
+        .columns = ArrayList(CatalogColumn).init(allocator),
+        .indexes = ArrayList(CatalogIndex).init(allocator),
     };
 
     errdefer catalogDestroy(table);
@@ -2703,7 +2708,7 @@ fn catalogCreateFromSchema(schema: *const TableSchema, id: ib_id_t) !*CatalogTab
             .clustered = idx.clustered,
             .unique = idx.unique,
             .id = 0,
-            .columns = std.ArrayList(CatalogIndexColumn).init(allocator),
+            .columns = ArrayList(CatalogIndexColumn).init(allocator),
         };
 
         var appended = false;
@@ -2738,7 +2743,7 @@ fn catalogAppendIndex(table: *CatalogTable, index: *const IndexSchema, id: ib_id
         .clustered = index.clustered,
         .unique = index.unique,
         .id = id,
-        .columns = std.ArrayList(CatalogIndexColumn).init(allocator),
+        .columns = ArrayList(CatalogIndexColumn).init(allocator),
     };
 
     var appended = false;
@@ -2841,8 +2846,8 @@ pub fn ib_table_schema_create(
         .name = name_copy,
         .format = ib_tbl_fmt,
         .page_size = final_page_size,
-        .columns = std.ArrayList(SchemaColumn).init(allocator),
-        .indexes = std.ArrayList(*IndexSchema).init(allocator),
+        .columns = ArrayList(SchemaColumn).init(allocator),
+        .indexes = ArrayList(*IndexSchema).init(allocator),
         .table_id = null,
     };
 
@@ -2925,7 +2930,7 @@ pub fn ib_table_schema_add_index(
         .allocator = allocator,
         .name = name_copy,
         .table_name = table_name_copy,
-        .columns = std.ArrayList(IndexColumn).init(allocator),
+        .columns = ArrayList(IndexColumn).init(allocator),
         .clustered = false,
         .unique = false,
         .schema_owner = schema,
@@ -3018,7 +3023,7 @@ pub fn ib_index_schema_create(
         .allocator = allocator,
         .name = name_copy,
         .table_name = table_name_copy,
-        .columns = std.ArrayList(IndexColumn).init(allocator),
+        .columns = ArrayList(IndexColumn).init(allocator),
         .clustered = false,
         .unique = false,
         .schema_owner = null,
@@ -3861,7 +3866,7 @@ test "schema visitor callbacks" {
             _: ib_ulint_t,
             n_cols: i32,
             n_indexes: i32,
-        ) callconv(.C) i32 {
+        ) callconv(.c) i32 {
             const ctx_ptr = arg orelse return 1;
             const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
             ctx.table_calls += 1;
@@ -3876,7 +3881,7 @@ test "schema visitor callbacks" {
             _: ib_col_type_t,
             _: ib_ulint_t,
             _: ib_col_attr_t,
-        ) callconv(.C) i32 {
+        ) callconv(.c) i32 {
             const ctx_ptr = arg orelse return 1;
             const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
             ctx.col_calls += 1;
@@ -3889,7 +3894,7 @@ test "schema visitor callbacks" {
             _: ib_bool_t,
             _: ib_bool_t,
             _: i32,
-        ) callconv(.C) i32 {
+        ) callconv(.c) i32 {
             const ctx_ptr = arg orelse return 1;
             const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
             ctx.index_calls += 1;
@@ -3900,7 +3905,7 @@ test "schema visitor callbacks" {
             arg: ib_opaque_t,
             _: [*]const u8,
             _: ib_ulint_t,
-        ) callconv(.C) i32 {
+        ) callconv(.c) i32 {
             const ctx_ptr = arg orelse return 1;
             const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
             ctx.index_col_calls += 1;
@@ -3965,7 +3970,7 @@ test "schema tables iterate" {
     };
 
     const Iterator = struct {
-        fn table(arg: ib_opaque_t, name: [*]const u8, name_len: i32) callconv(.C) i32 {
+        fn table(arg: ib_opaque_t, name: [*]const u8, name_len: i32) callconv(.c) i32 {
             const ctx_ptr = arg orelse return 1;
             const ctx = @as(*IterCtx, @ptrCast(@alignCast(ctx_ptr)));
             ctx.calls += 1;
@@ -4138,12 +4143,12 @@ test "tuple create helpers and cluster key" {
     try std.testing.expectEqual(ib_tuple_type_t.TPL_ROW, clust_row.?.tuple_type);
     try std.testing.expectEqual(@as(ib_ulint_t, 2), ib_tuple_get_n_cols(clust_row));
 
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(sec_key, 0, 42));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_u32(sec_key, 0, 42));
     var dst_key: ib_tpl_t = null;
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_get_cluster_key(index_crsr, &dst_key, sec_key));
-    var out: ib_i32_t = 0;
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(dst_key, 0, &out));
-    try std.testing.expectEqual(@as(ib_i32_t, 42), out);
+    var out: ib_u32_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_u32(dst_key, 0, &out));
+    try std.testing.expectEqual(@as(ib_u32_t, 42), out);
 
     ib_tuple_delete(sec_key);
     ib_tuple_delete(sec_row);
@@ -4336,7 +4341,7 @@ test "misc tempfile and error handling" {
     const fd = ib_create_tempfile("ibtmp_");
     try std.testing.expect(fd >= 0);
     if (fd >= 0) {
-        std.posix.close(@as(std.posix.fd_t, @intCast(fd))) catch {};
+        std.posix.close(@as(std.posix.fd_t, @intCast(fd)));
     }
 
     try std.testing.expectEqual(compat.IB_FALSE, trx_is_interrupted(null));
