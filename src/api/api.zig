@@ -1,5 +1,6 @@
 const std = @import("std");
 const ArrayList = std.array_list.Managed;
+const build_options = @import("build_options");
 const compat = @import("../ut/compat.zig");
 const errors = @import("../ut/errors.zig");
 const log = @import("../ut/log.zig");
@@ -33,6 +34,7 @@ pub const IB_API_VERSION_REVISION: u64 = 0;
 pub const IB_API_VERSION_AGE: u64 = 0;
 
 const dict_tf_format_max: u32 = 1;
+const dict_tf_format_zip: u32 = 1;
 const file_format_names = [_][]const u8{
     "Antelope",
     "Barracuda",
@@ -2807,6 +2809,45 @@ pub fn ib_schema_unlock(ib_trx: ib_trx_t) ib_err_t {
     return .DB_SUCCESS;
 }
 
+fn cfgFilePerTableEnabled() bool {
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+
+    if (cfgFind("file_per_table")) |cfg_var| {
+        return cfg_var.value.IB_CFG_IBOOL != 0;
+    }
+    return true;
+}
+
+fn ibTableSchemaCheck(ib_tbl_fmt: ib_tbl_fmt_t, page_size: *ib_ulint_t) ib_err_t {
+    if (!build_options.enable_compression and ib_tbl_fmt == .IB_TBL_COMPRESSED) {
+        return .DB_UNSUPPORTED;
+    }
+
+    if (ib_tbl_fmt != .IB_TBL_COMPRESSED) {
+        page_size.* = 0;
+        return .DB_SUCCESS;
+    }
+
+    if (page_size.* == 0) {
+        page_size.* = 8;
+    }
+
+    switch (page_size.*) {
+        1, 2, 4, 8, 16 => {},
+        else => return .DB_UNSUPPORTED,
+    }
+
+    if (!cfgFilePerTableEnabled()) {
+        return .DB_UNSUPPORTED;
+    }
+    if (db_format.id < dict_tf_format_zip) {
+        return .DB_UNSUPPORTED;
+    }
+
+    return .DB_SUCCESS;
+}
+
 pub fn ib_table_schema_create(
     name: []const u8,
     ib_tbl_sch: *ib_tbl_sch_t,
@@ -2823,10 +2864,10 @@ pub fn ib_table_schema_create(
     }
 
     var final_page_size = page_size;
-    if (ib_tbl_fmt != .IB_TBL_COMPRESSED) {
-        final_page_size = 0;
-    } else if (final_page_size == 0) {
-        final_page_size = 8;
+    const schema_err = ibTableSchemaCheck(ib_tbl_fmt, &final_page_size);
+    if (schema_err != .DB_SUCCESS) {
+        ib_tbl_sch.* = null;
+        return schema_err;
     }
 
     const allocator = std.heap.page_allocator;
