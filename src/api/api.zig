@@ -138,6 +138,9 @@ const CatalogTable = struct {
     format: ib_tbl_fmt_t,
     page_size: ib_ulint_t,
     id: ib_id_t,
+    stat_modified_counter: ib_ulint_t,
+    stat_n_rows: ib_ulint_t,
+    stats_updated: bool,
     columns: std.ArrayList(CatalogColumn),
     indexes: std.ArrayList(CatalogIndex),
 };
@@ -679,6 +682,7 @@ var cfg_vars = cfg_vars_defaults;
 var cfg_initialized = false;
 var cfg_started = false;
 var cfg_mutex = std.Thread.Mutex{};
+var ses_rollback_on_timeout: ib_bool_t = compat.IB_FALSE;
 
 pub fn ib_init() ib_err_t {
     return ib_cfg_init();
@@ -877,6 +881,9 @@ fn cfgSetValue(cfg_var: *CfgVar, value: anytype) ib_err_t {
         .IB_CFG_IBOOL => {
             const val = cfgBoolFromAny(value) orelse return .DB_INVALID_INPUT;
             cfg_var.value = .{ .IB_CFG_IBOOL = val };
+            if (schemaNameEq(cfg_var.name, "rollback_on_timeout")) {
+                ses_rollback_on_timeout = val;
+            }
             return .DB_SUCCESS;
         },
         .IB_CFG_ULINT => {
@@ -1047,6 +1054,11 @@ pub fn ib_cfg_init() ib_err_t {
     cfg_vars = cfg_vars_defaults;
     cfg_initialized = true;
     cfg_started = false;
+    if (cfgFind("rollback_on_timeout")) |cfg_var| {
+        ses_rollback_on_timeout = cfg_var.value.IB_CFG_IBOOL;
+    } else {
+        ses_rollback_on_timeout = compat.IB_FALSE;
+    }
     return .DB_SUCCESS;
 }
 
@@ -1056,6 +1068,7 @@ pub fn ib_cfg_shutdown() ib_err_t {
     cfg_vars = cfg_vars_defaults;
     cfg_initialized = false;
     cfg_started = false;
+    ses_rollback_on_timeout = compat.IB_FALSE;
     return .DB_SUCCESS;
 }
 
@@ -1088,6 +1101,62 @@ pub fn ib_status_get_i64(name: []const u8, dst: *ib_i64_t) ib_err_t {
         .IB_CFG_TEXT,
         .IB_CFG_CB,
         => return .DB_DATA_MISMATCH,
+    }
+}
+
+pub fn ib_create_tempfile(prefix: []const u8) i32 {
+    const allocator = std.heap.page_allocator;
+    const stamp = std.time.nanoTimestamp();
+    const name = std.fmt.allocPrint(allocator, "{s}{d}", .{ prefix, stamp }) catch return -1;
+    defer allocator.free(name);
+
+    const file = std.fs.cwd().createFile(name, .{ .read = true, .truncate = true, .exclusive = true }) catch return -1;
+    _ = std.fs.cwd().deleteFile(name) catch {};
+    return @intCast(file.handle);
+}
+
+pub fn trx_is_interrupted(trx: ib_trx_t) ib_bool_t {
+    _ = trx;
+    return compat.IB_FALSE;
+}
+
+pub fn ib_handle_errors(
+    new_err: *ib_err_t,
+    ib_trx: ib_trx_t,
+    ib_thr: ?*anyopaque,
+    ib_savept: ?*anyopaque,
+) ib_bool_t {
+    _ = ib_thr;
+    _ = ib_savept;
+
+    if (new_err.* == .DB_LOCK_WAIT) {
+        return compat.IB_TRUE;
+    }
+    if (new_err.* == .DB_LOCK_WAIT_TIMEOUT and ses_rollback_on_timeout == compat.IB_TRUE) {
+        if (ib_trx != null) {
+            _ = ib_trx_rollback(ib_trx);
+        }
+    }
+    return compat.IB_FALSE;
+}
+
+pub fn ib_trx_lock_table_with_retry(ib_trx: ib_trx_t, table: *CatalogTable, mode: ib_lck_mode_t) ib_err_t {
+    _ = ib_trx orelse return .DB_ERROR;
+    if (mode != .IB_LOCK_S and mode != .IB_LOCK_X) {
+        return .DB_ERROR;
+    }
+    if (table.id == 0) {
+        return .DB_TABLE_NOT_FOUND;
+    }
+    return .DB_SUCCESS;
+}
+
+pub fn ib_update_statistics_if_needed(table: *CatalogTable) void {
+    const counter = table.stat_modified_counter;
+    table.stat_modified_counter += 1;
+
+    if (counter > 2_000_000_000 or @as(i64, @intCast(counter)) > 16 + @as(i64, @intCast(table.stat_n_rows)) / 16) {
+        table.stats_updated = true;
     }
 }
 
@@ -2340,6 +2409,9 @@ fn catalogCreateFromSchema(schema: *const TableSchema, id: ib_id_t) !*CatalogTab
         .format = schema.format,
         .page_size = schema.page_size,
         .id = id,
+        .stat_modified_counter = 0,
+        .stat_n_rows = 0,
+        .stats_updated = false,
         .columns = std.ArrayList(CatalogColumn).init(allocator),
         .indexes = std.ArrayList(CatalogIndex).init(allocator),
     };
@@ -3931,4 +4003,50 @@ test "status get i64 from config" {
     try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_status_get_i64("missing", &val));
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_shutdown());
+}
+
+test "misc tempfile and error handling" {
+    const fd = ib_create_tempfile("ibtmp_");
+    try std.testing.expect(fd >= 0);
+    if (fd >= 0) {
+        std.posix.close(@as(std.posix.fd_t, @intCast(fd))) catch {};
+    }
+
+    try std.testing.expectEqual(compat.IB_FALSE, trx_is_interrupted(null));
+
+    var err: ib_err_t = .DB_LOCK_WAIT;
+    try std.testing.expectEqual(compat.IB_TRUE, ib_handle_errors(&err, null, null, null));
+    err = .DB_DUPLICATE_KEY;
+    try std.testing.expectEqual(compat.IB_FALSE, ib_handle_errors(&err, null, null, null));
+}
+
+test "misc lock and stats stubs" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/misc1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    const table = catalogFindByName("db/misc1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_trx_lock_table_with_retry(trx, table, .IB_LOCK_S));
+
+    table.stat_modified_counter = 2_000_000_001;
+    table.stat_n_rows = 0;
+    table.stats_updated = false;
+    ib_update_statistics_if_needed(table);
+    try std.testing.expect(table.stats_updated);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/misc1"));
+    ib_table_schema_delete(tbl_sch);
 }
