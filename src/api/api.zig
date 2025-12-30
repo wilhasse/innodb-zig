@@ -736,6 +736,38 @@ pub fn ib_cfg_shutdown() ib_err_t {
     return .DB_SUCCESS;
 }
 
+pub fn ib_status_get_i64(name: []const u8, dst: *ib_i64_t) ib_err_t {
+    if (name.len == 0) {
+        return .DB_NOT_FOUND;
+    }
+
+    cfg_mutex.lock();
+    defer cfg_mutex.unlock();
+
+    if (!cfg_initialized) {
+        return .DB_NOT_FOUND;
+    }
+
+    const cfg_var = cfgFind(name) orelse return .DB_NOT_FOUND;
+    switch (cfg_var.cfg_type) {
+        .IB_CFG_IBOOL => {
+            dst.* = if (cfg_var.value.IB_CFG_IBOOL != 0) 1 else 0;
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_ULINT => {
+            dst.* = @as(ib_i64_t, @intCast(cfg_var.value.IB_CFG_ULINT));
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_ULONG => {
+            dst.* = @as(ib_i64_t, @intCast(cfg_var.value.IB_CFG_ULONG));
+            return .DB_SUCCESS;
+        },
+        .IB_CFG_TEXT,
+        .IB_CFG_CB,
+        => return .DB_DATA_MISMATCH,
+    }
+}
+
 pub fn ib_exec_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
     _ = n_args;
     if (sql.len == 0) {
@@ -852,6 +884,60 @@ fn tupleColumn(tuple: *Tuple, col_no: ib_ulint_t) ?*Column {
         return null;
     }
     return &tuple.cols[@intCast(col_no)];
+}
+
+fn catalogColumnMeta(col: CatalogColumn) ib_col_meta_t {
+    return .{
+        .type = col.col_type,
+        .attr = col.attr,
+        .type_len = @intCast(col.len),
+        .client_type = 0,
+        .charset = null,
+    };
+}
+
+fn tupleCreateFromCatalogColumns(table: *CatalogTable, tuple_type: ib_tuple_type_t) ?*Tuple {
+    const allocator = std.heap.page_allocator;
+    if (table.columns.items.len == 0) {
+        return null;
+    }
+    const metas = allocator.alloc(ib_col_meta_t, table.columns.items.len) catch return null;
+    defer allocator.free(metas);
+
+    for (table.columns.items, 0..) |col, idx| {
+        metas[idx] = catalogColumnMeta(col);
+    }
+
+    return tupleCreate(allocator, tuple_type, metas) catch null;
+}
+
+fn tupleCreateFromCatalogIndex(
+    table: *CatalogTable,
+    index: *CatalogIndex,
+    tuple_type: ib_tuple_type_t,
+) ?*Tuple {
+    const allocator = std.heap.page_allocator;
+    if (index.columns.items.len == 0) {
+        return null;
+    }
+    const metas = allocator.alloc(ib_col_meta_t, index.columns.items.len) catch return null;
+    defer allocator.free(metas);
+
+    for (index.columns.items, 0..) |icol, idx| {
+        if (catalogFindColumnByName(table, icol.name)) |col| {
+            metas[idx] = catalogColumnMeta(col.*);
+        } else {
+            metas[idx] = .{
+                .type = .IB_INT,
+                .attr = .IB_COL_NONE,
+                .type_len = 0,
+                .client_type = 0,
+                .charset = null,
+            };
+        }
+    }
+
+    return tupleCreate(allocator, tuple_type, metas) catch null;
 }
 
 pub fn ib_col_set_value(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, src: ?*const anyopaque, len: ib_ulint_t) ib_err_t {
@@ -1124,6 +1210,32 @@ pub fn ib_tuple_clear(ib_tpl: ib_tpl_t) ib_tpl_t {
     return tuple;
 }
 
+pub fn ib_tuple_get_cluster_key(ib_crsr: ib_crsr_t, ib_dst_tpl: *ib_tpl_t, ib_src_tpl: ib_tpl_t) ib_err_t {
+    const cursor = ib_crsr orelse return .DB_ERROR;
+    const src = ib_src_tpl orelse return .DB_ERROR;
+    if (src.tuple_type != .TPL_KEY) {
+        return .DB_ERROR;
+    }
+
+    const dst_tuple = ib_clust_search_tuple_create(cursor) orelse return .DB_OUT_OF_MEMORY;
+    ib_dst_tpl.* = dst_tuple;
+
+    const dst = dst_tuple;
+    const n = @min(src.cols.len, dst.cols.len);
+    for (src.cols[0..n], 0..) |src_col, idx| {
+        const dst_col = &dst.cols[idx];
+        if (src_col.data) |data| {
+            const buf = dst.allocator.alloc(u8, data.len) catch return .DB_OUT_OF_MEMORY;
+            std.mem.copyForwards(u8, buf, data);
+            dst_col.data = buf;
+        } else {
+            dst_col.data = null;
+        }
+    }
+
+    return .DB_SUCCESS;
+}
+
 pub fn ib_tuple_copy(ib_dst_tpl: ib_tpl_t, ib_src_tpl: ib_tpl_t) ib_err_t {
     const src = ib_src_tpl orelse return .DB_ERROR;
     const dst = ib_dst_tpl orelse return .DB_ERROR;
@@ -1157,6 +1269,44 @@ pub fn ib_tuple_copy(ib_dst_tpl: ib_tpl_t, ib_src_tpl: ib_tpl_t) ib_err_t {
     }
 
     return .DB_SUCCESS;
+}
+
+pub fn ib_sec_search_tuple_create(ib_crsr: ib_crsr_t) ib_tpl_t {
+    const cursor = ib_crsr orelse return null;
+    const table = cursorCatalogTable(cursor) orelse return null;
+    if (cursorCatalogIndex(cursor)) |index| {
+        return tupleCreateFromCatalogIndex(table, index, .TPL_KEY);
+    }
+    return tupleCreateFromCatalogColumns(table, .TPL_KEY);
+}
+
+pub fn ib_sec_read_tuple_create(ib_crsr: ib_crsr_t) ib_tpl_t {
+    const cursor = ib_crsr orelse return null;
+    const table = cursorCatalogTable(cursor) orelse return null;
+    if (cursorCatalogIndex(cursor)) |index| {
+        return tupleCreateFromCatalogIndex(table, index, .TPL_ROW);
+    }
+    return tupleCreateFromCatalogColumns(table, .TPL_ROW);
+}
+
+pub fn ib_clust_search_tuple_create(ib_crsr: ib_crsr_t) ib_tpl_t {
+    const cursor = ib_crsr orelse return null;
+    const table = cursorCatalogTable(cursor) orelse return null;
+    const clustered = catalogFindIndexByName(table, "PRIMARY") orelse {
+        for (table.indexes.items) |*idx| {
+            if (idx.clustered) {
+                return tupleCreateFromCatalogIndex(table, idx, .TPL_KEY);
+            }
+        }
+        return tupleCreateFromCatalogColumns(table, .TPL_KEY);
+    };
+    return tupleCreateFromCatalogIndex(table, clustered, .TPL_KEY);
+}
+
+pub fn ib_clust_read_tuple_create(ib_crsr: ib_crsr_t) ib_tpl_t {
+    const cursor = ib_crsr orelse return null;
+    const table = cursorCatalogTable(cursor) orelse return null;
+    return tupleCreateFromCatalogColumns(table, .TPL_ROW);
 }
 
 pub fn ib_tuple_delete(ib_tpl: ib_tpl_t) void {
@@ -1320,6 +1470,27 @@ fn cursorDestroy(cursor: *Cursor) void {
         tupleDestroy(row);
     }
     cursor.allocator.destroy(cursor);
+}
+
+fn cursorCatalogTable(cursor: *Cursor) ?*CatalogTable {
+    if (cursor.table_id) |tid| {
+        return catalogFindById(tid);
+    }
+    if (cursor.table_name) |name| {
+        return catalogFindByName(name);
+    }
+    return null;
+}
+
+fn cursorCatalogIndex(cursor: *Cursor) ?*CatalogIndex {
+    const table = cursorCatalogTable(cursor) orelse return null;
+    if (cursor.index_id) |iid| {
+        return catalogFindIndexById(table, iid);
+    }
+    if (cursor.index_name) |name| {
+        return catalogFindIndexByName(table, name);
+    }
+    return null;
 }
 
 fn cursorLockModeValid(mode: ib_lck_mode_t) bool {
@@ -1585,6 +1756,25 @@ pub fn ib_cursor_stmt_begin(ib_crsr: ib_crsr_t) void {
     cursor.sql_stat_start = true;
 }
 
+pub fn ib_cursor_truncate(ib_crsr: *ib_crsr_t, table_id: *ib_id_t) ib_err_t {
+    table_id.* = 0;
+    const cursor = ib_crsr.* orelse return .DB_ERROR;
+    if (ib_schema_lock_is_exclusive(cursor.trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+
+    const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
+    const lock_err = ib_cursor_lock(cursor, .IB_LOCK_X);
+    if (lock_err != .DB_SUCCESS) {
+        return lock_err;
+    }
+
+    table_id.* = catalogTruncateTable(table);
+    _ = ib_cursor_close(cursor);
+    ib_crsr.* = null;
+    return .DB_SUCCESS;
+}
+
 pub fn ib_table_lock(ib_trx: ib_trx_t, table_id: ib_id_t, ib_lck_mode: ib_lck_mode_t) ib_err_t {
     _ = ib_trx orelse return .DB_ERROR;
     if (!tableLockModeValid(ib_lck_mode)) {
@@ -1656,6 +1846,13 @@ pub fn ib_savepoint_rollback(ib_trx: ib_trx_t, name: ?*const anyopaque, name_len
 
 fn schemaNameEq(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn schemaNameHasPrefix(name: []const u8, prefix: []const u8) bool {
+    if (name.len < prefix.len) {
+        return false;
+    }
+    return std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix);
 }
 
 fn tableSchemaFindColumn(schema: *const TableSchema, name: []const u8) bool {
@@ -1747,6 +1944,55 @@ fn catalogFindByName(name: []const u8) ?*CatalogTable {
         }
     }
     return null;
+}
+
+fn catalogFindById(id: ib_id_t) ?*CatalogTable {
+    for (table_registry.items) |table| {
+        if (table.id == id) {
+            return table;
+        }
+    }
+    return null;
+}
+
+fn catalogFindColumnByName(table: *CatalogTable, name: []const u8) ?*CatalogColumn {
+    for (table.columns.items) |*col| {
+        if (schemaNameEq(col.name, name)) {
+            return col;
+        }
+    }
+    return null;
+}
+
+fn catalogFindIndexByName(table: *CatalogTable, name: []const u8) ?*CatalogIndex {
+    for (table.indexes.items) |*idx| {
+        if (schemaNameEq(idx.name, name)) {
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn catalogFindIndexById(table: *CatalogTable, id: ib_id_t) ?*CatalogIndex {
+    for (table.indexes.items) |*idx| {
+        if (idx.id == id) {
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn catalogTruncateTable(table: *CatalogTable) ib_id_t {
+    const new_id = next_table_id;
+    next_table_id += 1;
+    table.id = new_id;
+
+    for (table.indexes.items) |*idx| {
+        const low = idx.id & 0xFFFF_FFFF;
+        idx.id = (new_id << 32) | low;
+    }
+
+    return new_id;
 }
 
 fn catalogRemoveByName(name: []const u8) bool {
@@ -2266,6 +2512,74 @@ pub fn ib_index_drop(ib_trx: ib_trx_t, index_id: ib_id_t) ib_err_t {
         }
     }
     return .DB_TABLE_NOT_FOUND;
+}
+
+pub fn ib_table_truncate(name: []const u8, table_id: *ib_id_t) ib_err_t {
+    table_id.* = 0;
+    if (name.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+    const table = catalogFindByName(name) orelse return .DB_TABLE_NOT_FOUND;
+    table_id.* = catalogTruncateTable(table);
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_get_id(name: []const u8, table_id: *ib_id_t) ib_err_t {
+    table_id.* = 0;
+    const table = catalogFindByName(name) orelse return .DB_TABLE_NOT_FOUND;
+    table_id.* = table.id;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_get_id(table_name: []const u8, index_name: []const u8, index_id: *ib_id_t) ib_err_t {
+    index_id.* = 0;
+    const table = catalogFindByName(table_name) orelse return .DB_TABLE_NOT_FOUND;
+    const index = catalogFindIndexByName(table, index_name) orelse return .DB_TABLE_NOT_FOUND;
+    index_id.* = index.id;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_database_create(dbname: []const u8) ib_bool_t {
+    if (dbname.len == 0) {
+        return compat.IB_FALSE;
+    }
+    for (dbname) |ch| {
+        if (ch == '/' or ch == '\\') {
+            return compat.IB_FALSE;
+        }
+    }
+    return compat.IB_TRUE;
+}
+
+pub fn ib_database_drop(dbname: []const u8) ib_err_t {
+    if (dbname.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+
+    const allocator = std.heap.page_allocator;
+    var prefix = dbname;
+    var buf: ?[]u8 = null;
+    if (prefix[prefix.len - 1] != '/') {
+        const tmp = allocator.alloc(u8, prefix.len + 1) catch return .DB_OUT_OF_MEMORY;
+        std.mem.copyForwards(u8, tmp[0..prefix.len], prefix);
+        tmp[prefix.len] = '/';
+        prefix = tmp;
+        buf = tmp;
+    }
+    defer if (buf) |tmp| allocator.free(tmp);
+
+    var idx: usize = 0;
+    while (idx < table_registry.items.len) {
+        const table = table_registry.items[idx];
+        if (schemaNameHasPrefix(table.name, prefix)) {
+            catalogDestroy(table);
+            _ = table_registry.orderedRemove(idx);
+            continue;
+        }
+        idx += 1;
+    }
+
+    return .DB_SUCCESS;
 }
 
 pub fn ib_table_schema_visit(
@@ -3064,4 +3378,218 @@ test "exec sql stubs validate input" {
 
     try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("", 0));
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql("create table t(a int)", 0));
+}
+
+test "tuple create helpers and cluster key" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/tpl1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "name", .IB_VARCHAR, .IB_COL_NONE, 0, 10),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    var primary_idx: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_index_schema_create(trx, "PRIMARY", "db/tpl1", &primary_idx),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(primary_idx, "id", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_set_clustered(primary_idx));
+    var primary_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_create(primary_idx, &primary_id));
+
+    var sec_idx: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_index_schema_create(trx, "idx_id", "db/tpl1", &sec_idx),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(sec_idx, "id", 0));
+    var sec_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_create(sec_idx, &sec_id));
+
+    var table_crsr: ib_crsr_t = null;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_open_table("db/tpl1", null, &table_crsr));
+    var index_crsr: ib_crsr_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_cursor_open_index_using_name(table_crsr, "idx_id", &index_crsr),
+    );
+
+    const sec_key = ib_sec_search_tuple_create(index_crsr);
+    try std.testing.expect(sec_key != null);
+    try std.testing.expectEqual(ib_tuple_type_t.TPL_KEY, sec_key.?.tuple_type);
+    try std.testing.expectEqual(@as(ib_ulint_t, 1), ib_tuple_get_n_cols(sec_key));
+
+    const sec_row = ib_sec_read_tuple_create(index_crsr);
+    try std.testing.expect(sec_row != null);
+    try std.testing.expectEqual(ib_tuple_type_t.TPL_ROW, sec_row.?.tuple_type);
+
+    const clust_key = ib_clust_search_tuple_create(table_crsr);
+    try std.testing.expect(clust_key != null);
+    try std.testing.expectEqual(ib_tuple_type_t.TPL_KEY, clust_key.?.tuple_type);
+
+    const clust_row = ib_clust_read_tuple_create(table_crsr);
+    try std.testing.expect(clust_row != null);
+    try std.testing.expectEqual(ib_tuple_type_t.TPL_ROW, clust_row.?.tuple_type);
+    try std.testing.expectEqual(@as(ib_ulint_t, 2), ib_tuple_get_n_cols(clust_row));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(sec_key, 0, 42));
+    var dst_key: ib_tpl_t = null;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_get_cluster_key(index_crsr, &dst_key, sec_key));
+    var out: ib_i32_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(dst_key, 0, &out));
+    try std.testing.expectEqual(@as(ib_i32_t, 42), out);
+
+    ib_tuple_delete(sec_key);
+    ib_tuple_delete(sec_row);
+    ib_tuple_delete(clust_key);
+    ib_tuple_delete(clust_row);
+    ib_tuple_delete(dst_key);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_close(index_crsr));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_close(table_crsr));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/tpl1"));
+    ib_table_schema_delete(tbl_sch);
+    ib_index_schema_delete(primary_idx);
+    ib_index_schema_delete(sec_idx);
+}
+
+test "table id and index id lookups" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/id1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    var idx_sch: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_index_schema_create(trx, "PRIMARY", "db/id1", &idx_sch),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(idx_sch, "id", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_set_clustered(idx_sch));
+    var index_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_create(idx_sch, &index_id));
+
+    var lookup_table: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_get_id("db/id1", &lookup_table));
+    try std.testing.expectEqual(table_id, lookup_table);
+
+    var lookup_index: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_get_id("db/id1", "PRIMARY", &lookup_index));
+    try std.testing.expectEqual(index_id, lookup_index);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/id1"));
+    ib_table_schema_delete(tbl_sch);
+    ib_index_schema_delete(idx_sch);
+}
+
+test "table and cursor truncate" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/trunc1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    var trunc_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_truncate("db/trunc1", &trunc_id));
+    try std.testing.expect(trunc_id != 0);
+    try std.testing.expect(trunc_id != table_id);
+
+    var lookup: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_get_id("db/trunc1", &lookup));
+    try std.testing.expectEqual(trunc_id, lookup);
+
+    var crsr: ib_crsr_t = null;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_open_table("db/trunc1", trx, &crsr));
+    var trunc_id2: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_truncate(&crsr, &trunc_id2));
+    try std.testing.expect(crsr == null);
+    try std.testing.expect(trunc_id2 != 0);
+
+    var lookup2: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_get_id("db/trunc1", &lookup2));
+    try std.testing.expectEqual(trunc_id2, lookup2);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/trunc1"));
+    ib_table_schema_delete(tbl_sch);
+}
+
+test "database create and drop" {
+    try std.testing.expectEqual(compat.IB_FALSE, ib_database_create("bad/name"));
+    try std.testing.expectEqual(compat.IB_TRUE, ib_database_create("okdb"));
+
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("dbdrop/t1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_database_drop("dbdrop"));
+
+    var lookup: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_TABLE_NOT_FOUND, ib_table_get_id("dbdrop/t1", &lookup));
+
+    ib_table_schema_delete(tbl_sch);
+}
+
+test "status get i64 from config" {
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_init());
+
+    var val: ib_i64_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_status_get_i64("buffer_pool_size", &val));
+    try std.testing.expectEqual(@as(ib_i64_t, 8 * 1024 * 1024), val);
+
+    try std.testing.expectEqual(errors.DbErr.DB_DATA_MISMATCH, ib_status_get_i64("data_home_dir", &val));
+    try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_status_get_i64("missing", &val));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cfg_shutdown());
 }
