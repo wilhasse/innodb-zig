@@ -6,9 +6,25 @@ pub const module_name = "lock";
 pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
 
+pub const lock_mode = enum(u8) {
+    LOCK_IS = 0,
+    LOCK_IX,
+    LOCK_S,
+    LOCK_X,
+    LOCK_AUTO_INC,
+    LOCK_NONE,
+    LOCK_NUM = LOCK_NONE,
+};
+
+pub const LOCK_MODE_MASK: ulint = 0x0F;
 pub const LOCK_TABLE: ulint = 16;
 pub const LOCK_REC: ulint = 32;
 pub const LOCK_TYPE_MASK: ulint = 0xF0;
+pub const LOCK_WAIT: ulint = 256;
+pub const LOCK_ORDINARY: ulint = 0;
+pub const LOCK_GAP: ulint = 512;
+pub const LOCK_REC_NOT_GAP: ulint = 1024;
+pub const LOCK_INSERT_INTENTION: ulint = 2048;
 
 pub const lock_t = struct {
     type_mode: ulint = 0,
@@ -21,8 +37,22 @@ pub const lock_queue_iterator_t = struct {
     bit_no: ulint = compat.ULINT_UNDEFINED,
 };
 
+pub const lock_sys_t = struct {
+    rec_hash: ?*anyopaque = null,
+};
+
+pub var lock_sys: ?*lock_sys_t = null;
+
 pub fn lock_get_type_low(lock: *const lock_t) ulint {
     return lock.type_mode & LOCK_TYPE_MASK;
+}
+
+pub fn lock_get_mode(lock: *const lock_t) ulint {
+    return lock.type_mode & LOCK_MODE_MASK;
+}
+
+pub fn lock_is_wait(lock: *const lock_t) ibool {
+    return if ((lock.type_mode & LOCK_WAIT) != 0) compat.TRUE else compat.FALSE;
 }
 
 pub fn lock_rec_find_set_bit(lock: *const lock_t) ulint {
@@ -32,6 +62,22 @@ pub fn lock_rec_find_set_bit(lock: *const lock_t) ulint {
 pub fn lock_rec_get_prev(lock: *const lock_t, heap_no: ulint) ?*const lock_t {
     _ = heap_no;
     return lock.prev;
+}
+
+pub fn lock_var_init() void {
+    if (lock_sys != null) {
+        return;
+    }
+    const sys = std.heap.page_allocator.create(lock_sys_t) catch return;
+    sys.* = .{};
+    lock_sys = sys;
+}
+
+pub fn lock_sys_close() void {
+    if (lock_sys) |sys| {
+        std.heap.page_allocator.destroy(sys);
+        lock_sys = null;
+    }
 }
 
 pub fn lock_queue_iterator_reset(iter: *lock_queue_iterator_t, lock: *const lock_t, bit_no: ulint) void {
@@ -94,4 +140,18 @@ test "lock iterator over table locks" {
 
     lock_queue_iterator_reset(&iter, &lock1, 9);
     try std.testing.expect(iter.bit_no == 9);
+}
+
+test "lock mode helpers and sys init" {
+    var lock = lock_t{ .type_mode = LOCK_TABLE | LOCK_WAIT | 3 };
+    try std.testing.expect(lock_get_type_low(&lock) == LOCK_TABLE);
+    try std.testing.expect(lock_get_mode(&lock) == 3);
+    try std.testing.expect(lock_is_wait(&lock) == compat.TRUE);
+
+    lock_sys_close();
+    try std.testing.expect(lock_sys == null);
+    lock_var_init();
+    try std.testing.expect(lock_sys != null);
+    lock_sys_close();
+    try std.testing.expect(lock_sys == null);
 }
