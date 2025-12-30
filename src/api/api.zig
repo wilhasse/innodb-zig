@@ -2261,6 +2261,29 @@ fn dupName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return buf;
 }
 
+fn tableNameValid(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "SYS_")) {
+        return std.mem.indexOfScalar(u8, name, '/') == null;
+    }
+
+    const slash = std.mem.indexOfScalar(u8, name, '/') orelse return false;
+    if (slash == 0 or slash + 1 >= name.len) {
+        return false;
+    }
+    if (std.mem.indexOfScalarPos(u8, name, slash + 1, '/') != null) {
+        return false;
+    }
+    const db = name[0..slash];
+    const table = name[slash + 1 ..];
+    if (std.mem.eql(u8, db, ".") or std.mem.eql(u8, db, "..")) {
+        return false;
+    }
+    if (std.mem.eql(u8, table, ".") or std.mem.eql(u8, table, "..")) {
+        return false;
+    }
+    return true;
+}
+
 fn cursorCreate(
     allocator: std.mem.Allocator,
     table_name: ?[]const u8,
@@ -3104,9 +3127,9 @@ pub fn ib_table_schema_create(
     ib_tbl_fmt: ib_tbl_fmt_t,
     page_size: ib_ulint_t,
 ) ib_err_t {
-    if (name.len == 0 or name.len > IB_MAX_TABLE_NAME_LEN) {
+    if (name.len == 0 or name.len > IB_MAX_TABLE_NAME_LEN or !tableNameValid(name)) {
         ib_tbl_sch.* = null;
-        return .DB_INVALID_INPUT;
+        return .DB_DATA_MISMATCH;
     }
     if (@intFromEnum(ib_tbl_fmt) > @intFromEnum(ib_tbl_fmt_t.IB_TBL_COMPRESSED)) {
         ib_tbl_sch.* = null;
