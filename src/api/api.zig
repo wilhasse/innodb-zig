@@ -22,6 +22,46 @@ pub const IB_API_VERSION_CURRENT: u64 = 3;
 pub const IB_API_VERSION_REVISION: u64 = 0;
 pub const IB_API_VERSION_AGE: u64 = 0;
 
+const dict_tf_format_max: u32 = 1;
+const file_format_names = [_][]const u8{
+    "Antelope",
+    "Barracuda",
+};
+
+pub const Trx = opaque {};
+pub const Cursor = opaque {};
+pub const Tuple = opaque {};
+pub const TableSchema = opaque {};
+pub const IndexSchema = opaque {};
+
+pub const ib_trx_t = ?*Trx;
+pub const ib_crsr_t = ?*Cursor;
+pub const ib_tpl_t = ?*Tuple;
+pub const ib_tbl_sch_t = ?*TableSchema;
+pub const ib_idx_sch_t = ?*IndexSchema;
+
+pub const ib_id_t = ib_u64_t;
+
+pub const ib_trx_level_t = enum(u32) {
+    IB_TRX_READ_UNCOMMITTED = 0,
+    IB_TRX_READ_COMMITTED = 1,
+    IB_TRX_REPEATABLE_READ = 2,
+    IB_TRX_SERIALIZABLE = 3,
+};
+
+pub const ib_trx_state_t = enum(u32) {
+    IB_TRX_NOT_STARTED = 0,
+    IB_TRX_ACTIVE = 1,
+    IB_TRX_COMMITTED_IN_MEMORY = 2,
+    IB_TRX_PREPARED = 3,
+};
+
+pub const ib_shutdown_t = enum(u32) {
+    IB_SHUTDOWN_NORMAL = 0,
+    IB_SHUTDOWN_NO_IBUFMERGE_PURGE = 1,
+    IB_SHUTDOWN_NO_BUFPOOL_FLUSH = 2,
+};
+
 pub const ib_col_type_t = enum(u32) {
     IB_VARCHAR = 1,
     IB_CHAR = 2,
@@ -45,6 +85,36 @@ pub const ib_col_attr_t = enum(u32) {
     IB_COL_CUSTOM1 = 8,
     IB_COL_CUSTOM2 = 16,
     IB_COL_CUSTOM3 = 32,
+};
+
+pub const ib_lck_mode_t = enum(u32) {
+    IB_LOCK_IS = 0,
+    IB_LOCK_IX = 1,
+    IB_LOCK_S = 2,
+    IB_LOCK_X = 3,
+    IB_LOCK_NOT_USED = 4,
+    IB_LOCK_NONE = 5,
+    IB_LOCK_NUM = 5,
+};
+
+pub const ib_srch_mode_t = enum(u32) {
+    IB_CUR_G = 1,
+    IB_CUR_GE = 2,
+    IB_CUR_L = 3,
+    IB_CUR_LE = 4,
+};
+
+pub const ib_match_mode_t = enum(u32) {
+    IB_CLOSEST_MATCH = 0,
+    IB_EXACT_MATCH = 1,
+    IB_EXACT_PREFIX = 2,
+};
+
+pub const ib_tbl_fmt_t = enum(u32) {
+    IB_TBL_REDUNDANT = 0,
+    IB_TBL_COMPACT = 1,
+    IB_TBL_DYNAMIC = 2,
+    IB_TBL_COMPRESSED = 3,
 };
 
 pub const ib_col_meta_t = struct {
@@ -102,6 +172,65 @@ pub fn ib_logger_set(ib_msg_log: ib_msg_log_t, ib_msg_stream: ib_msg_stream_t) v
 
 pub fn ib_strerror(err: ib_err_t) []const u8 {
     return errors.strerror(err);
+}
+
+const DbFormat = struct {
+    id: u32,
+    name: ?[]const u8,
+};
+
+var db_format: DbFormat = .{ .id = 0, .name = null };
+
+pub fn ib_init() ib_err_t {
+    return .DB_SUCCESS;
+}
+
+pub fn ib_startup(format: ?[]const u8) ib_err_t {
+    db_format.id = 0;
+    db_format.name = null;
+
+    if (format) |fmt| {
+        if (parseFileFormat(fmt)) |id| {
+            db_format.id = id;
+        } else {
+            db_format.id = dict_tf_format_max + 1;
+            log.logf("InnoDB: format '{s}' unknown.", .{fmt});
+            return .DB_UNSUPPORTED;
+        }
+    }
+
+    if (db_format.id <= dict_tf_format_max) {
+        db_format.name = file_format_names[db_format.id];
+    }
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
+    _ = flag;
+    db_format.id = 0;
+    db_format.name = null;
+    return .DB_SUCCESS;
+}
+
+fn parseFileFormat(format: []const u8) ?u32 {
+    if (format.len == 0) {
+        return null;
+    }
+    if (std.fmt.parseInt(u32, format, 10)) |id| {
+        if (id <= dict_tf_format_max) {
+            return id;
+        }
+        return null;
+    } else |_| {}
+
+    for (file_format_names, 0..) |name, id| {
+        if (std.ascii.eqlIgnoreCase(format, name)) {
+            return @intCast(id);
+        }
+    }
+
+    return null;
 }
 
 test "ib_api_version matches C constants" {
@@ -163,4 +292,17 @@ test "ib_logger_set wires logger" {
 
     ib_logger_set(log.nullLogger, null);
     try std.testing.expect(log.getLogger() == log.nullLogger);
+}
+
+test "ib_startup validates format" {
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_startup(null));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_startup("Antelope"));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_startup("barracuda"));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_startup("1"));
+    try std.testing.expectEqual(errors.DbErr.DB_UNSUPPORTED, ib_startup("Zebra"));
+}
+
+test "ib_init and shutdown succeed" {
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_init());
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_shutdown(.IB_SHUTDOWN_NORMAL));
 }
