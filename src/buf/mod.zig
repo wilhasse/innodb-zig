@@ -419,6 +419,8 @@ pub const buf_flush_stat_t = struct {
 pub const BUF_READ_AHEAD_AREA: ulint = 0;
 pub const BUF_FLUSH_FREE_BLOCK_MARGIN: ulint = 5 + BUF_READ_AHEAD_AREA;
 pub const BUF_FLUSH_EXTRA_MARGIN: ulint = BUF_FLUSH_FREE_BLOCK_MARGIN / 4 + 100;
+pub const BUF_READ_IBUF_PAGES_ONLY: ulint = 131;
+pub const BUF_READ_ANY_PAGE: ulint = 132;
 
 pub fn buf_flush_remove(bpage: *buf_page_t) void {
     _ = bpage;
@@ -548,6 +550,36 @@ pub fn buf_LRU_validate() ibool {
 
 pub fn buf_LRU_print() void {}
 
+pub fn buf_read_page(space: ulint, zip_size: ulint, offset: ulint) ibool {
+    _ = space;
+    _ = zip_size;
+    _ = offset;
+    return compat.TRUE;
+}
+
+pub fn buf_read_ahead_linear(space: ulint, zip_size: ulint, offset: ulint) ulint {
+    _ = space;
+    _ = zip_size;
+    _ = offset;
+    return 0;
+}
+
+pub fn buf_read_ibuf_merge_pages(sync: ibool, space_ids: []const ulint, space_versions: []const ib_int64_t, page_nos: []const ulint, n_stored: ulint) void {
+    _ = sync;
+    _ = space_ids;
+    _ = space_versions;
+    _ = page_nos;
+    _ = n_stored;
+}
+
+pub fn buf_read_recv_pages(sync: ibool, space: ulint, zip_size: ulint, page_nos: []const ulint, n_stored: ulint) void {
+    _ = sync;
+    _ = space;
+    _ = zip_size;
+    _ = page_nos;
+    _ = n_stored;
+}
+
 test "buf buddy slot and alloc/free" {
     buf_buddy_var_init();
     try std.testing.expectEqual(@as(ulint, 0), buf_buddy_get_slot(BUF_BUDDY_LOW));
@@ -609,4 +641,9 @@ test "buf LRU stubs" {
     var released: ibool = compat.TRUE;
     try std.testing.expectEqual(.BUF_LRU_FREED, buf_LRU_free_block(&page, compat.FALSE, &released));
     try std.testing.expectEqual(@as(ibool, compat.FALSE), released);
+}
+
+test "buf read stubs" {
+    try std.testing.expectEqual(compat.TRUE, buf_read_page(0, 0, 0));
+    try std.testing.expectEqual(@as(ulint, 0), buf_read_ahead_linear(0, 0, 0));
 }
