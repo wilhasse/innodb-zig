@@ -1,3 +1,4 @@
+const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const que = @import("../que/mod.zig");
 const row = @import("../row/mod.zig");
@@ -7,6 +8,7 @@ pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const opt = @import("opt.zig");
 pub const core = @import("core.zig");
+pub const sym = @import("sym.zig");
 
 pub const ulint = compat.ulint;
 pub const lint = compat.lint;
@@ -125,6 +127,7 @@ pub const sym_tab_entry = enum(ulint) {
 
 pub const sym_tab_t = struct {
     query_graph: ?*que.que_t = null,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 pub const pars_res_word_t = struct {
@@ -135,8 +138,12 @@ pub const sym_node_t = struct {
     common: que.que_common_t = .{ .type = que.QUE_NODE_SYMBOL },
     indirection: ?*sym_node_t = null,
     alias: ?*sym_node_t = null,
+    resolved: compat.ibool = compat.FALSE,
     token_type: sym_tab_entry = .SYM_VAR,
+    name: []const u8 = "",
+    name_len: ulint = 0,
     sym_table: ?*sym_tab_t = null,
+    prefetch_buf: ?*row.sel_buf_t = null,
     cursor_def: ?*row.sel_node_t = null,
 };
 

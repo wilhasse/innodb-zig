@@ -8,6 +8,7 @@ pub const sel_node_state = enum(u32) {
 };
 
 pub const plan_t = struct {};
+pub const sel_buf_t = struct {};
 
 pub const sel_node_t = struct {
     state: sel_node_state = .SEL_NODE_CLOSED,
