@@ -40,11 +40,16 @@ const SchemaLock = enum(u8) {
     exclusive,
 };
 
+const Savepoint = struct {
+    name: []u8,
+};
+
 pub const Trx = struct {
     state: ib_trx_state_t,
     isolation_level: ib_trx_level_t,
     client_thread_id: os_thread.ThreadId,
     schema_lock: SchemaLock,
+    savepoints: std.ArrayList(Savepoint),
 };
 pub const Cursor = struct {
     allocator: std.mem.Allocator,
@@ -59,6 +64,7 @@ pub const Cursor = struct {
     cluster_access: bool,
     simple_select: bool,
     last_row: ?*Tuple,
+    sql_stat_start: bool,
 };
 const Tuple = struct {
     tuple_type: ib_tuple_type_t,
@@ -780,6 +786,36 @@ pub fn ib_tuple_delete(ib_tpl: ib_tpl_t) void {
     tupleDestroy(tuple);
 }
 
+fn savepointsClear(trx: *Trx) void {
+    for (trx.savepoints.items) |sp| {
+        std.heap.page_allocator.free(sp.name);
+    }
+    trx.savepoints.clearAndFree();
+}
+
+fn savepointNameSlice(name: ?*const anyopaque, name_len: ib_ulint_t) ?[]const u8 {
+    const ptr = name orelse return null;
+    if (name_len == 0) {
+        return null;
+    }
+    const len: usize = @intCast(name_len);
+    return @as([*]const u8, @ptrCast(ptr))[0..len];
+}
+
+fn savepointFindIndex(trx: *Trx, name: []const u8) ?usize {
+    for (trx.savepoints.items, 0..) |sp, idx| {
+        if (std.mem.eql(u8, sp.name, name)) {
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn savepointRemoveAt(trx: *Trx, index: usize) void {
+    std.heap.page_allocator.free(trx.savepoints.items[index].name);
+    _ = trx.savepoints.orderedRemove(index);
+}
+
 pub fn ib_trx_start(ib_trx: ib_trx_t, ib_trx_level: ib_trx_level_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
     if (trx.client_thread_id != os_thread.currentId()) {
@@ -795,6 +831,7 @@ pub fn ib_trx_start(ib_trx: ib_trx_t, ib_trx_level: ib_trx_level_t) ib_err_t {
     }
 
     if (trx.state == .IB_TRX_NOT_STARTED) {
+        savepointsClear(trx);
         trx.state = .IB_TRX_ACTIVE;
         trx.isolation_level = ib_trx_level;
         trx.schema_lock = .none;
@@ -811,6 +848,7 @@ pub fn ib_trx_begin(ib_trx_level: ib_trx_level_t) ib_trx_t {
         .isolation_level = ib_trx_level,
         .client_thread_id = os_thread.currentId(),
         .schema_lock = .none,
+        .savepoints = std.ArrayList(Savepoint).init(std.heap.page_allocator),
     };
 
     if (ib_trx_start(trx, ib_trx_level) != .DB_SUCCESS) {
@@ -828,6 +866,7 @@ pub fn ib_trx_state(ib_trx: ib_trx_t) ib_trx_state_t {
 
 pub fn ib_trx_release(ib_trx: ib_trx_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
+    savepointsClear(trx);
     std.heap.page_allocator.destroy(trx);
     return .DB_SUCCESS;
 }
@@ -874,6 +913,7 @@ fn cursorCreate(
         .cluster_access = false,
         .simple_select = false,
         .last_row = null,
+        .sql_stat_start = false,
     };
 
     if (table_name) |name| {
@@ -906,6 +946,10 @@ fn cursorDestroy(cursor: *Cursor) void {
 
 fn cursorLockModeValid(mode: ib_lck_mode_t) bool {
     return @intFromEnum(mode) <= @intFromEnum(ib_lck_mode_t.IB_LOCK_NUM);
+}
+
+fn tableLockModeValid(mode: ib_lck_mode_t) bool {
+    return mode == .IB_LOCK_IS or mode == .IB_LOCK_IX;
 }
 
 pub fn ib_cursor_open_table_using_id(table_id: ib_id_t, ib_trx: ib_trx_t, ib_crsr: *ib_crsr_t) ib_err_t {
@@ -992,6 +1036,7 @@ pub fn ib_cursor_reset(ib_crsr: ib_crsr_t) ib_err_t {
     cursor.positioned = false;
     cursor.cluster_access = false;
     cursor.simple_select = false;
+    cursor.sql_stat_start = false;
     return .DB_SUCCESS;
 }
 
@@ -1155,6 +1200,80 @@ pub fn ib_cursor_set_cluster_access(ib_crsr: ib_crsr_t) void {
 pub fn ib_cursor_set_simple_select(ib_crsr: ib_crsr_t) void {
     const cursor = ib_crsr orelse return;
     cursor.simple_select = true;
+}
+
+pub fn ib_cursor_stmt_begin(ib_crsr: ib_crsr_t) void {
+    const cursor = ib_crsr orelse return;
+    cursor.sql_stat_start = true;
+}
+
+pub fn ib_table_lock(ib_trx: ib_trx_t, table_id: ib_id_t, ib_lck_mode: ib_lck_mode_t) ib_err_t {
+    _ = ib_trx orelse return .DB_ERROR;
+    if (!tableLockModeValid(ib_lck_mode)) {
+        return .DB_ERROR;
+    }
+    if (table_id == 0) {
+        return .DB_TABLE_NOT_FOUND;
+    }
+    for (table_registry.items) |table| {
+        if (table.id == table_id) {
+            return .DB_SUCCESS;
+        }
+    }
+    return .DB_TABLE_NOT_FOUND;
+}
+
+pub fn ib_savepoint_take(ib_trx: ib_trx_t, name: ?*const anyopaque, name_len: ib_ulint_t) void {
+    const trx = ib_trx orelse return;
+    const slice = savepointNameSlice(name, name_len) orelse return;
+    if (trx.state == .IB_TRX_NOT_STARTED) {
+        return;
+    }
+
+    if (savepointFindIndex(trx, slice)) |idx| {
+        savepointRemoveAt(trx, idx);
+    }
+
+    const copy = std.heap.page_allocator.alloc(u8, slice.len) catch return;
+    std.mem.copyForwards(u8, copy, slice);
+    trx.savepoints.append(.{ .name = copy }) catch {
+        std.heap.page_allocator.free(copy);
+    };
+}
+
+pub fn ib_savepoint_release(ib_trx: ib_trx_t, name: ?*const anyopaque, name_len: ib_ulint_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    const slice = savepointNameSlice(name, name_len) orelse return .DB_NO_SAVEPOINT;
+
+    if (savepointFindIndex(trx, slice)) |idx| {
+        savepointRemoveAt(trx, idx);
+        return .DB_SUCCESS;
+    }
+
+    return .DB_NO_SAVEPOINT;
+}
+
+pub fn ib_savepoint_rollback(ib_trx: ib_trx_t, name: ?*const anyopaque, name_len: ib_ulint_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    if (trx.state == .IB_TRX_NOT_STARTED) {
+        return .DB_ERROR;
+    }
+
+    const slice = savepointNameSlice(name, name_len);
+    if (slice == null) {
+        if (trx.savepoints.items.len == 0) {
+            return .DB_NO_SAVEPOINT;
+        }
+        savepointsClear(trx);
+        return .DB_SUCCESS;
+    }
+
+    const idx = savepointFindIndex(trx, slice.?) orelse return .DB_NO_SAVEPOINT;
+    while (trx.savepoints.items.len > idx + 1) {
+        savepointRemoveAt(trx, trx.savepoints.items.len - 1);
+    }
+
+    return .DB_SUCCESS;
 }
 
 fn schemaNameEq(a: []const u8, b: []const u8) bool {
@@ -2073,6 +2192,9 @@ test "cursor open/close and flags" {
     try std.testing.expect(cursor.cluster_access);
     try std.testing.expect(cursor.simple_select);
 
+    ib_cursor_stmt_begin(crsr);
+    try std.testing.expect(cursor.sql_stat_start);
+
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_close(crsr));
 }
 
@@ -2192,6 +2314,38 @@ test "schema lock state transitions" {
     try std.testing.expectEqual(compat.IB_TRUE, ib_schema_lock_is_exclusive(trx));
 }
 
+test "savepoint lifecycle" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    const sp1 = "sp1";
+    const sp2 = "sp2";
+
+    ib_savepoint_take(trx, @as(*const anyopaque, @ptrCast(sp1.ptr)), sp1.len);
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_savepoint_release(trx, @as(*const anyopaque, @ptrCast(sp1.ptr)), sp1.len),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_NO_SAVEPOINT,
+        ib_savepoint_release(trx, @as(*const anyopaque, @ptrCast(sp1.ptr)), sp1.len),
+    );
+
+    ib_savepoint_take(trx, @as(*const anyopaque, @ptrCast(sp1.ptr)), sp1.len);
+    ib_savepoint_take(trx, @as(*const anyopaque, @ptrCast(sp2.ptr)), sp2.len);
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_savepoint_rollback(trx, @as(*const anyopaque, @ptrCast(sp1.ptr)), sp1.len),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_NO_SAVEPOINT,
+        ib_savepoint_release(trx, @as(*const anyopaque, @ptrCast(sp2.ptr)), sp2.len),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_savepoint_rollback(trx, null, 0));
+    try std.testing.expectEqual(errors.DbErr.DB_NO_SAVEPOINT, ib_savepoint_rollback(trx, null, 0));
+}
+
 test "table schema create and create table" {
     const trx = ib_trx_begin(.IB_TRX_REPEATABLE_READ);
     defer _ = ib_trx_rollback(trx);
@@ -2228,6 +2382,32 @@ test "table schema create and create table" {
     try std.testing.expectEqual(table_id, again_id);
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/t4"));
+    ib_table_schema_delete(tbl_sch);
+}
+
+test "table lock uses catalog" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/lock1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_lock(trx, table_id, .IB_LOCK_IX));
+    try std.testing.expectEqual(errors.DbErr.DB_TABLE_NOT_FOUND, ib_table_lock(trx, 0, .IB_LOCK_IX));
+    try std.testing.expectEqual(errors.DbErr.DB_ERROR, ib_table_lock(trx, table_id, .IB_LOCK_S));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/lock1"));
     ib_table_schema_delete(tbl_sch);
 }
 
