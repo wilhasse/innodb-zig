@@ -33,6 +33,7 @@ pub const uins = @import("uins.zig");
 pub const umod = @import("umod.zig");
 pub const undo = @import("undo.zig");
 pub const upd = @import("upd.zig");
+pub const vers = @import("vers.zig");
 
 pub const FETCH_CACHE_SIZE: ulint = 16;
 pub const ROW_PREBUILT_ALLOCATED: ulint = 78540783;
