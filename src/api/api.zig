@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const errors = @import("../ut/errors.zig");
 const log = @import("../ut/log.zig");
+const os_thread = @import("../os/thread.zig");
 
 pub const ib_err_t = errors.DbErr;
 pub const ib_bool_t = compat.ib_bool_t;
@@ -28,7 +29,11 @@ const file_format_names = [_][]const u8{
     "Barracuda",
 };
 
-pub const Trx = opaque {};
+pub const Trx = struct {
+    state: ib_trx_state_t,
+    isolation_level: ib_trx_level_t,
+    client_thread_id: os_thread.ThreadId,
+};
 pub const Cursor = opaque {};
 pub const Tuple = opaque {};
 pub const TableSchema = opaque {};
@@ -233,6 +238,68 @@ fn parseFileFormat(format: []const u8) ?u32 {
     return null;
 }
 
+pub fn ib_trx_start(ib_trx: ib_trx_t, ib_trx_level: ib_trx_level_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    if (trx.client_thread_id != os_thread.currentId()) {
+        return .DB_ERROR;
+    }
+
+    switch (ib_trx_level) {
+        .IB_TRX_READ_UNCOMMITTED,
+        .IB_TRX_READ_COMMITTED,
+        .IB_TRX_REPEATABLE_READ,
+        .IB_TRX_SERIALIZABLE,
+        => {},
+    }
+
+    if (trx.state == .IB_TRX_NOT_STARTED) {
+        trx.state = .IB_TRX_ACTIVE;
+        trx.isolation_level = ib_trx_level;
+        return .DB_SUCCESS;
+    }
+
+    return .DB_ERROR;
+}
+
+pub fn ib_trx_begin(ib_trx_level: ib_trx_level_t) ib_trx_t {
+    const trx = std.heap.page_allocator.create(Trx) catch return null;
+    trx.* = .{
+        .state = .IB_TRX_NOT_STARTED,
+        .isolation_level = ib_trx_level,
+        .client_thread_id = os_thread.currentId(),
+    };
+
+    if (ib_trx_start(trx, ib_trx_level) != .DB_SUCCESS) {
+        std.heap.page_allocator.destroy(trx);
+        return null;
+    }
+
+    return trx;
+}
+
+pub fn ib_trx_state(ib_trx: ib_trx_t) ib_trx_state_t {
+    const trx = ib_trx orelse return .IB_TRX_NOT_STARTED;
+    return trx.state;
+}
+
+pub fn ib_trx_release(ib_trx: ib_trx_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    std.heap.page_allocator.destroy(trx);
+    return .DB_SUCCESS;
+}
+
+pub fn ib_trx_commit(ib_trx: ib_trx_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    trx.state = .IB_TRX_COMMITTED_IN_MEMORY;
+    return ib_trx_release(trx);
+}
+
+pub fn ib_trx_rollback(ib_trx: ib_trx_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    trx.state = .IB_TRX_NOT_STARTED;
+    return ib_trx_release(trx);
+}
+
 test "ib_api_version matches C constants" {
     const expected = (@as(ib_u64_t, 3) << 32) | (@as(ib_u64_t, 0) << 16) | @as(ib_u64_t, 0);
     try std.testing.expectEqual(expected, ib_api_version());
@@ -305,4 +372,17 @@ test "ib_startup validates format" {
 test "ib_init and shutdown succeed" {
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_init());
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_shutdown(.IB_SHUTDOWN_NORMAL));
+}
+
+test "ib_trx lifecycle stubs" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    try std.testing.expect(trx != null);
+    try std.testing.expectEqual(ib_trx_state_t.IB_TRX_ACTIVE, ib_trx_state(trx));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_trx_commit(trx));
+}
+
+test "ib_trx_start rejects already started" {
+    const trx = ib_trx_begin(.IB_TRX_REPEATABLE_READ) orelse return error.OutOfMemory;
+    defer _ = ib_trx_release(trx);
+    try std.testing.expectEqual(errors.DbErr.DB_ERROR, ib_trx_start(trx, .IB_TRX_REPEATABLE_READ));
 }
