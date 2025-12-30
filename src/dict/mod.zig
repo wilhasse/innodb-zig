@@ -39,12 +39,14 @@ pub const dict_col_t = struct {
 
 pub const dict_field_t = struct {
     col: ?*dict_col_t = null,
+    name: []const u8 = "",
     prefix_len: ulint = 0,
 };
 
 pub const dict_table_t = struct {
     name: []const u8 = "",
     id: dulint = .{ .high = 0, .low = 0 },
+    space: ulint = 0,
     flags: ulint = 0,
     n_def: ulint = 0,
     n_cols: ulint = 0,
@@ -53,19 +55,23 @@ pub const dict_table_t = struct {
     indexes: std.ArrayListUnmanaged(*dict_index_t) = .{},
     n_handles_opened: ulint = 0,
     cached: bool = false,
+    heap: ?*mem_heap_t = null,
     magic_n: ulint = DICT_TABLE_MAGIC_N,
 };
 
 pub const dict_index_t = struct {
     name: []const u8 = "",
+    table_name: []const u8 = "",
     id: dulint = .{ .high = 0, .low = 0 },
     type: ulint = 0,
+    space: ulint = 0,
     table: ?*dict_table_t = null,
     n_def: ulint = 0,
     n_fields: ulint = 0,
     n_uniq: ulint = 0,
     n_uniq_in_tree: ulint = 0,
     fields: std.ArrayListUnmanaged(dict_field_t) = .{},
+    heap: ?*mem_heap_t = null,
     magic_n: ulint = DICT_INDEX_MAGIC_N,
 };
 
@@ -127,10 +133,12 @@ pub const DICT_INDEX_MAGIC_N: ulint = 30505196;
 
 pub const DICT_CLUSTERED: ulint = 1;
 pub const DICT_UNIQUE: ulint = 2;
-pub const DICT_IBUF: ulint = 4;
+pub const DICT_UNIVERSAL: ulint = 4;
+pub const DICT_IBUF: ulint = 8;
 
 pub const DICT_TF_COMPACT: ulint = 1;
 pub const DICT_TF_FORMAT_MASK: ulint = 0xF;
+pub const DICT_HEAP_SIZE: ulint = 100;
 
 const DB_SUCCESS_ULINT: ulint = @intFromEnum(errors.DbErr.DB_SUCCESS);
 
@@ -930,6 +938,90 @@ pub fn dict_load_foreigns(table_name: []const u8, check_charsets: ibool) ulint {
 
 pub fn dict_print() void {}
 
+pub fn dict_mem_table_create(name: []const u8, space: ulint, n_cols: ulint, flags: ulint) ?*dict_table_t {
+    const table = std.heap.page_allocator.create(dict_table_t) catch return null;
+    table.* = .{
+        .name = name,
+        .id = dulintCreate(0, 0),
+        .space = space,
+        .flags = flags,
+        .n_def = 0,
+        .n_cols = n_cols + DATA_N_SYS_COLS,
+        .cols = .{},
+        .col_names = "",
+        .indexes = .{},
+        .n_handles_opened = 0,
+        .cached = false,
+        .heap = null,
+        .magic_n = DICT_TABLE_MAGIC_N,
+    };
+    return table;
+}
+
+pub fn dict_mem_table_free(table: *dict_table_t) void {
+    table.cols.deinit(std.heap.page_allocator);
+    table.indexes.deinit(std.heap.page_allocator);
+    std.heap.page_allocator.destroy(table);
+}
+
+pub fn dict_mem_table_add_col(table: *dict_table_t, heap: ?*mem_heap_t, name: ?[]const u8, mtype: ulint, prtype: ulint, len: ulint) void {
+    _ = heap;
+    const idx = @as(ulint, @intCast(table.cols.items.len));
+    var col = dict_col_t{
+        .name = name orelse "",
+        .mtype = mtype,
+        .prtype = prtype,
+        .len = len,
+        .ind = idx,
+    };
+    var mbmin: ulint = 0;
+    var mbmax: ulint = 0;
+    data.dtype_get_mblen(mtype, prtype, &mbmin, &mbmax);
+    col.mbminlen = mbmin;
+    col.mbmaxlen = mbmax;
+    table.cols.append(std.heap.page_allocator, col) catch return;
+    table.n_def = idx + 1;
+    if (table.n_cols < table.n_def) {
+        table.n_cols = table.n_def;
+    }
+}
+
+pub fn dict_mem_index_create(table_name: []const u8, index_name: []const u8, space: ulint, type_: ulint, n_fields: ulint) ?*dict_index_t {
+    const index = std.heap.page_allocator.create(dict_index_t) catch return null;
+    index.* = .{
+        .name = index_name,
+        .table_name = table_name,
+        .id = dulintCreate(0, 0),
+        .type = type_,
+        .space = space,
+        .table = null,
+        .n_def = 0,
+        .n_fields = n_fields,
+        .n_uniq = 0,
+        .n_uniq_in_tree = 0,
+        .fields = .{},
+        .heap = null,
+        .magic_n = DICT_INDEX_MAGIC_N,
+    };
+    return index;
+}
+
+pub fn dict_mem_index_add_field(index: *dict_index_t, name: []const u8, prefix_len: ulint) void {
+    index.fields.append(std.heap.page_allocator, .{ .col = null, .name = name, .prefix_len = prefix_len }) catch return;
+    index.n_fields = @as(ulint, @intCast(index.fields.items.len));
+}
+
+pub fn dict_mem_index_free(index: *dict_index_t) void {
+    index.fields.deinit(std.heap.page_allocator);
+    std.heap.page_allocator.destroy(index);
+}
+
+pub fn dict_mem_foreign_create() ?*dict_foreign_t {
+    const foreign = std.heap.page_allocator.create(dict_foreign_t) catch return null;
+    foreign.* = .{};
+    return foreign;
+}
+
 fn dict_hdr_create() ibool {
     dict_hdr_row_id = dulintCreate(0, DICT_HDR_FIRST_ID);
     dict_hdr_table_id = dulintCreate(0, DICT_HDR_FIRST_ID);
@@ -1133,4 +1225,21 @@ test "dict load helpers" {
 
     try std.testing.expect(dict_load_table(0, "db/load1") == &table);
     try std.testing.expect(dict_load_table_on_id(0, table.id) == &table);
+}
+
+test "dict mem object helpers" {
+    const table = dict_mem_table_create("db/mem1", 0, 1, 0) orelse return error.OutOfMemory;
+    defer dict_mem_table_free(table);
+
+    dict_mem_table_add_col(table, null, "c1", DATA_INT, 0, 4);
+    try std.testing.expectEqual(@as(ulint, 1), table.n_def);
+    try std.testing.expectEqual(@as(ulint, 1), @as(ulint, @intCast(table.cols.items.len)));
+
+    const index = dict_mem_index_create("db/mem1", "idx1", 0, DICT_UNIQUE, 1) orelse return error.OutOfMemory;
+    dict_mem_index_add_field(index, "c1", 0);
+    try std.testing.expectEqual(@as(ulint, 1), index.n_fields);
+    dict_mem_index_free(index);
+
+    const foreign = dict_mem_foreign_create() orelse return error.OutOfMemory;
+    std.heap.page_allocator.destroy(foreign);
 }
