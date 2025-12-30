@@ -892,6 +892,44 @@ pub fn dict_foreign_parse_drop_constraints(heap: *mem_heap_t, trx: *trx_t, table
     return DB_SUCCESS_ULINT;
 }
 
+pub fn dict_check_tablespaces_and_store_max_id(in_crash_recovery: ibool) void {
+    _ = in_crash_recovery;
+}
+
+pub fn dict_get_first_table_name_in_db(name: []const u8) ?[]u8 {
+    var iter = dict_sys.tables_by_name.iterator();
+    while (iter.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.startsWith(u8, key, name)) {
+            const buf = std.heap.page_allocator.alloc(u8, key.len) catch return null;
+            std.mem.copyForwards(u8, buf, key);
+            return buf;
+        }
+    }
+    return null;
+}
+
+pub fn dict_load_table(recovery: u8, name: []const u8) ?*dict_table_t {
+    _ = recovery;
+    return dict_table_get_low(name);
+}
+
+pub fn dict_load_table_on_id(recovery: u8, table_id: dulint) ?*dict_table_t {
+    return dict_table_get_on_id_low(recovery, table_id);
+}
+
+pub fn dict_load_sys_table(table: *dict_table_t) void {
+    dict_table_add_to_cache(table, &mem_heap_t{});
+}
+
+pub fn dict_load_foreigns(table_name: []const u8, check_charsets: ibool) ulint {
+    _ = table_name;
+    _ = check_charsets;
+    return DB_SUCCESS_ULINT;
+}
+
+pub fn dict_print() void {}
+
 fn dict_hdr_create() ibool {
     dict_hdr_row_id = dulintCreate(0, DICT_HDR_FIRST_ID);
     dict_hdr_table_id = dulintCreate(0, DICT_HDR_FIRST_ID);
@@ -1079,4 +1117,20 @@ test "dict reserved column names" {
     try std.testing.expectEqual(compat.TRUE, dict_col_name_is_reserved("db_row_id"));
     try std.testing.expectEqual(compat.TRUE, dict_col_name_is_reserved("DB_TRX_ID"));
     try std.testing.expectEqual(compat.FALSE, dict_col_name_is_reserved("user_col"));
+}
+
+test "dict load helpers" {
+    dict_var_init();
+    dict_init();
+
+    var table = dict_table_t{ .name = "db/load1", .id = dulintCreate(0, 300) };
+    dict_table_add_to_cache(&table, &mem_heap_t{});
+    defer dict_table_remove_from_cache(&table);
+
+    const first = dict_get_first_table_name_in_db("db/") orelse return error.OutOfMemory;
+    defer std.heap.page_allocator.free(first);
+    try std.testing.expect(std.mem.startsWith(u8, first, "db/"));
+
+    try std.testing.expect(dict_load_table(0, "db/load1") == &table);
+    try std.testing.expect(dict_load_table_on_id(0, table.id) == &table);
 }
