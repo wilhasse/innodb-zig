@@ -56,6 +56,7 @@ comptime {
         _ = @import("tests/ib_types.zig");
         _ = @import("tests/ib_update.zig");
         _ = @import("tests/ib_zip.zig");
+        _ = @import("tests/mysql_bulk_insert.zig");
     }
 }
 
