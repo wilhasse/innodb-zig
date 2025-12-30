@@ -18,6 +18,7 @@ pub const eval = @import("eval/mod.zig");
 pub const ddl = @import("ddl/mod.zig");
 pub const dict = @import("dict/mod.zig");
 pub const api = @import("api/mod.zig").impl;
+pub const ha = @import("ha/mod.zig");
 pub const BuildOptions = build_options;
 
 comptime {
