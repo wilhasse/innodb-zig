@@ -4,6 +4,7 @@ const compat = @import("../ut/compat.zig");
 const mt = @import("ib_mt_common.zig");
 const mt_base = @import("ib_mt_base.zig");
 const mt_t1 = @import("ib_mt_t1.zig");
+const mt_t2 = @import("ib_mt_t2.zig");
 
 const DATABASE: []const u8 = "test";
 const NUM_TBLS: usize = 8;
@@ -283,16 +284,6 @@ fn deleteSimple(arg: *mt.CbArgs) api.ib_err_t {
     return err;
 }
 
-fn register_t2_table(entry: *TableEntry) void {
-    mt_base.registerBaseTable(&entry.tbl);
-    mt.setName(&entry.tbl.name, "t2");
-    entry.tbl.dml_fn[@intFromEnum(mt.DmlOpType.insert)] = insertSimple;
-    entry.tbl.dml_fn[@intFromEnum(mt.DmlOpType.update)] = updateSimple;
-    entry.tbl.dml_fn[@intFromEnum(mt.DmlOpType.delete)] = deleteSimple;
-    entry.tbl.ddl_fn[@intFromEnum(mt.DdlOpType.create)] = createSimpleTable;
-    entry.tbl.ddl_fn[@intFromEnum(mt.DdlOpType.alter)] = alterSimple;
-}
-
 fn register_test_tables() void {
     for (&tbl_array) |*entry| {
         mt_base.registerBaseTable(&entry.tbl);
@@ -304,7 +295,7 @@ fn register_test_tables() void {
 
     mt_t1.register_t1_table(&tbl_array[num_tables].tbl);
     num_tables += 1;
-    register_t2_table(&tbl_array[num_tables]);
+    mt_t2.register_t2_table(&tbl_array[num_tables].tbl);
     num_tables += 1;
 }
 
