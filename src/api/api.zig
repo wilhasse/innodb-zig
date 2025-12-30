@@ -20,6 +20,8 @@ pub const ib_opaque_t = ?*anyopaque;
 pub const ib_charset_t = ib_opaque_t;
 pub const ib_cb_t = *const fn () callconv(.C) void;
 
+const charset_t = opaque {};
+
 pub const ib_logger_t = log.LoggerFn;
 pub const ib_stream_t = log.Stream;
 pub const ib_msg_log_t = log.LoggerFn;
@@ -417,6 +419,80 @@ pub fn ib_logger_set(ib_msg_log: ib_msg_log_t, ib_msg_stream: ib_msg_stream_t) v
 
 pub fn ib_strerror(err: ib_err_t) []const u8 {
     return errors.strerror(err);
+}
+
+pub fn ib_ucode_get_connection_charset() ?*const charset_t {
+    return null;
+}
+
+pub fn ib_ucode_get_charset(id: ib_ulint_t) ?*const charset_t {
+    _ = id;
+    return null;
+}
+
+pub fn ib_ucode_get_charset_width(cs: ?*const charset_t, mbminlen: *ib_ulint_t, mbmaxlen: *ib_ulint_t) void {
+    _ = cs;
+    mbminlen.* = 0;
+    mbmaxlen.* = 0;
+}
+
+fn compareIgnoreCase(a: []const u8, b: []const u8) i32 {
+    return switch (std.ascii.orderIgnoreCase(a, b)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
+pub fn ib_utf8_strcasecmp(p1: []const u8, p2: []const u8) i32 {
+    return compareIgnoreCase(p1, p2);
+}
+
+pub fn ib_utf8_strncasecmp(p1: []const u8, p2: []const u8, len: ib_ulint_t) i32 {
+    const n = @as(usize, @intCast(len));
+    const a = p1[0..@min(p1.len, n)];
+    const b = p2[0..@min(p2.len, n)];
+    return compareIgnoreCase(a, b);
+}
+
+pub fn ib_utf8_casedown(a: []u8) void {
+    for (a) |*ch| {
+        ch.* = std.ascii.toLower(ch.*);
+    }
+}
+
+fn copyWithLimit(to: []u8, from: []const u8, len: ib_ulint_t) void {
+    const max_len = @min(@as(usize, @intCast(len)), to.len);
+    const copy_len = @min(from.len, max_len);
+    if (copy_len > 0) {
+        std.mem.copyForwards(u8, to[0..copy_len], from[0..copy_len]);
+    }
+    if (copy_len < max_len) {
+        for (to[copy_len..max_len]) |*byte| {
+            byte.* = 0;
+        }
+    }
+}
+
+pub fn ib_utf8_convert_from_table_id(cs: ?*const charset_t, to: []u8, from: []const u8, len: ib_ulint_t) void {
+    _ = cs;
+    copyWithLimit(to, from, len);
+}
+
+pub fn ib_utf8_convert_from_id(cs: ?*const charset_t, to: []u8, from: []const u8, len: ib_ulint_t) void {
+    _ = cs;
+    copyWithLimit(to, from, len);
+}
+
+pub fn ib_utf8_isspace(cs: ?*const charset_t, c: u8) i32 {
+    _ = cs;
+    return if (std.ascii.isWhitespace(c)) 1 else 0;
+}
+
+pub fn ib_ucode_get_storage_size(cs: ?*const charset_t, prefix_len: ib_ulint_t, str_len: ib_ulint_t, str: []const u8) ib_ulint_t {
+    _ = cs;
+    _ = str;
+    return @min(prefix_len, str_len);
 }
 
 const DbFormat = struct {
@@ -4218,6 +4294,42 @@ test "status get i64" {
     try std.testing.expectEqual(@as(ib_i64_t, @intCast(compat.UNIV_PAGE_SIZE)), val);
 
     try std.testing.expectEqual(errors.DbErr.DB_NOT_FOUND, ib_status_get_i64("missing_status", &val));
+}
+
+test "ucode helpers" {
+    try std.testing.expect(ib_ucode_get_connection_charset() == null);
+    try std.testing.expect(ib_ucode_get_charset(42) == null);
+
+    var min_len: ib_ulint_t = 1;
+    var max_len: ib_ulint_t = 1;
+    ib_ucode_get_charset_width(null, &min_len, &max_len);
+    try std.testing.expectEqual(@as(ib_ulint_t, 0), min_len);
+    try std.testing.expectEqual(@as(ib_ulint_t, 0), max_len);
+
+    try std.testing.expectEqual(@as(i32, 0), ib_utf8_strcasecmp("AbC", "aBc"));
+    try std.testing.expect(ib_utf8_strcasecmp("a", "b") < 0);
+    try std.testing.expect(ib_utf8_strcasecmp("c", "b") > 0);
+
+    try std.testing.expectEqual(@as(i32, 0), ib_utf8_strncasecmp("AbCd", "aBcZ", 3));
+    try std.testing.expect(ib_utf8_strncasecmp("ab", "ac", 2) < 0);
+
+    var down = [_]u8{ 'A', 'B', 'C' };
+    ib_utf8_casedown(down[0..]);
+    try std.testing.expectEqualStrings("abc", down[0..]);
+
+    var out = [_]u8{0} ** 8;
+    ib_utf8_convert_from_table_id(null, out[0..], "tab", out.len);
+    try std.testing.expectEqualStrings("tab", out[0..3]);
+    try std.testing.expectEqual(@as(u8, 0), out[3]);
+
+    ib_utf8_convert_from_id(null, out[0..], "name", 4);
+    try std.testing.expectEqualStrings("name", out[0..4]);
+
+    try std.testing.expectEqual(@as(i32, 1), ib_utf8_isspace(null, @as(u8, ' ')));
+    try std.testing.expectEqual(@as(i32, 0), ib_utf8_isspace(null, @as(u8, 'a')));
+
+    try std.testing.expectEqual(@as(ib_ulint_t, 3), ib_ucode_get_storage_size(null, 5, 3, "hello"));
+    try std.testing.expectEqual(@as(ib_ulint_t, 2), ib_ucode_get_storage_size(null, 2, 10, "hello"));
 }
 
 test "misc tempfile and error handling" {
