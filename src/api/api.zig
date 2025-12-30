@@ -4,6 +4,11 @@ const errors = @import("../ut/errors.zig");
 const log = @import("../ut/log.zig");
 const os_thread = @import("../os/thread.zig");
 
+const ib_tuple_type_t = enum(u32) {
+    TPL_ROW = 0,
+    TPL_KEY = 1,
+};
+
 pub const ib_err_t = errors.DbErr;
 pub const ib_bool_t = compat.ib_bool_t;
 pub const ib_ulint_t = compat.ib_ulint_t;
@@ -35,7 +40,16 @@ pub const Trx = struct {
     client_thread_id: os_thread.ThreadId,
 };
 pub const Cursor = opaque {};
-pub const Tuple = opaque {};
+const Tuple = struct {
+    tuple_type: ib_tuple_type_t,
+    cols: []Column,
+    allocator: std.mem.Allocator,
+};
+
+const Column = struct {
+    meta: ib_col_meta_t,
+    data: ?[]u8,
+};
 pub const TableSchema = opaque {};
 pub const IndexSchema = opaque {};
 
@@ -46,6 +60,18 @@ pub const ib_tbl_sch_t = ?*TableSchema;
 pub const ib_idx_sch_t = ?*IndexSchema;
 
 pub const ib_id_t = ib_u64_t;
+
+pub const ib_i8_t = i8;
+pub const ib_u8_t = u8;
+pub const ib_i16_t = i16;
+pub const ib_i32_t = i32;
+pub const ib_i64_t = i64;
+
+pub const IB_SQL_NULL: ib_u32_t = 0xFFFF_FFFF;
+pub const IB_N_SYS_COLS: ib_u32_t = 3;
+pub const MAX_TEXT_LEN: ib_u32_t = 4096;
+pub const IB_MAX_COL_NAME_LEN: ib_u32_t = 64 * 3;
+pub const IB_MAX_TABLE_NAME_LEN: ib_u32_t = 64 * 3;
 
 pub const ib_trx_level_t = enum(u32) {
     IB_TRX_READ_UNCOMMITTED = 0,
@@ -238,6 +264,347 @@ fn parseFileFormat(format: []const u8) ?u32 {
     return null;
 }
 
+fn tupleCreate(allocator: std.mem.Allocator, tuple_type: ib_tuple_type_t, metas: []const ib_col_meta_t) !*Tuple {
+    const tuple = try allocator.create(Tuple);
+    const cols = try allocator.alloc(Column, metas.len);
+    for (cols, 0..) |*col, i| {
+        col.* = .{ .meta = metas[i], .data = null };
+    }
+    tuple.* = .{
+        .tuple_type = tuple_type,
+        .cols = cols,
+        .allocator = allocator,
+    };
+    return tuple;
+}
+
+fn tupleDestroy(tuple: *Tuple) void {
+    for (tuple.cols) |col| {
+        if (col.data) |buf| {
+            tuple.allocator.free(buf);
+        }
+    }
+    tuple.allocator.free(tuple.cols);
+    tuple.allocator.destroy(tuple);
+}
+
+fn tupleColumn(tuple: *Tuple, col_no: ib_ulint_t) ?*Column {
+    if (col_no >= tuple.cols.len) {
+        return null;
+    }
+    return &tuple.cols[@intCast(col_no)];
+}
+
+pub fn ib_col_set_value(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, src: ?*const anyopaque, len: ib_ulint_t) ib_err_t {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    const col = tupleColumn(tuple, col_no) orelse return .DB_ERROR;
+
+    if (len == @as(ib_ulint_t, IB_SQL_NULL)) {
+        if (col.data) |buf| {
+            tuple.allocator.free(buf);
+        }
+        col.data = null;
+        return .DB_SUCCESS;
+    }
+
+    const ptr = src orelse return .DB_ERROR;
+    const data_len: usize = @intCast(len);
+    const buf = tuple.allocator.alloc(u8, data_len) catch return .DB_OUT_OF_MEMORY;
+    const src_bytes = @as([*]const u8, @ptrCast(ptr))[0..data_len];
+    std.mem.copyForwards(u8, buf, src_bytes);
+
+    if (col.data) |old| {
+        tuple.allocator.free(old);
+    }
+    col.data = buf;
+
+    if (col.meta.type_len == 0 or col.meta.type_len == IB_SQL_NULL) {
+        col.meta.type_len = @intCast(data_len);
+    }
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_col_get_len(ib_tpl: ib_tpl_t, i: ib_ulint_t) ib_ulint_t {
+    const tuple = ib_tpl orelse return 0;
+    const col = tupleColumn(tuple, i) orelse return 0;
+    return if (col.data == null) @as(ib_ulint_t, IB_SQL_NULL) else @intCast(col.data.?.len);
+}
+
+pub fn ib_col_copy_value_low(ib_tpl: ib_tpl_t, i: ib_ulint_t, dst: *anyopaque, len: ib_ulint_t) ib_ulint_t {
+    const tuple = ib_tpl orelse return 0;
+    const col = tupleColumn(tuple, i) orelse return 0;
+    const data = col.data orelse return @as(ib_ulint_t, IB_SQL_NULL);
+
+    const data_len: ib_ulint_t = @intCast(data.len);
+    const max_len: ib_ulint_t = if (len < data_len) len else data_len;
+
+    switch (col.meta.type) {
+        .IB_INT, .IB_FLOAT, .IB_DOUBLE => {
+            if (len != data_len) {
+                return 0;
+            }
+        },
+        else => {},
+    }
+
+    const dst_bytes = @as([*]u8, @ptrCast(dst))[0..@intCast(max_len)];
+    std.mem.copyForwards(u8, dst_bytes, data[0..@intCast(max_len)]);
+    return max_len;
+}
+
+pub fn ib_col_copy_value(ib_tpl: ib_tpl_t, i: ib_ulint_t, dst: *anyopaque, len: ib_ulint_t) ib_ulint_t {
+    return ib_col_copy_value_low(ib_tpl, i, dst, len);
+}
+
+pub fn ib_col_get_value(ib_tpl: ib_tpl_t, i: ib_ulint_t) ?*const anyopaque {
+    const tuple = ib_tpl orelse return null;
+    const col = tupleColumn(tuple, i) orelse return null;
+    const data = col.data orelse return null;
+    return data.ptr;
+}
+
+pub fn ib_col_get_meta_low(ib_tpl: ib_tpl_t, i: ib_ulint_t, meta: *ib_col_meta_t) ib_ulint_t {
+    const tuple = ib_tpl orelse return 0;
+    const col = tupleColumn(tuple, i) orelse return 0;
+    meta.* = col.meta;
+    return if (col.data == null) @as(ib_ulint_t, IB_SQL_NULL) else @intCast(col.data.?.len);
+}
+
+pub fn ib_col_get_meta(ib_tpl: ib_tpl_t, i: ib_ulint_t, meta: *ib_col_meta_t) ib_ulint_t {
+    return ib_col_get_meta_low(ib_tpl, i, meta);
+}
+
+fn ib_tuple_check_int(ib_tpl: ib_tpl_t, i: ib_ulint_t, usign: ib_bool_t, size: usize) ib_err_t {
+    var meta: ib_col_meta_t = undefined;
+    _ = ib_col_get_meta_low(ib_tpl, i, &meta);
+
+    if (meta.type != .IB_INT) {
+        return .DB_DATA_MISMATCH;
+    } else if (meta.type_len == IB_SQL_NULL) {
+        return .DB_UNDERFLOW;
+    } else if (meta.type_len != size) {
+        return .DB_DATA_MISMATCH;
+    }
+
+    const attr_val = @intFromEnum(meta.attr);
+    if ((attr_val & @intFromEnum(ib_col_attr_t.IB_COL_UNSIGNED)) != 0 and usign == compat.IB_FALSE) {
+        return .DB_DATA_MISMATCH;
+    }
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_tuple_read_i8(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_i8_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_FALSE, @sizeOf(ib_i8_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_i8_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_u8(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_u8_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_TRUE, @sizeOf(ib_u8_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_u8_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_i16(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_i16_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_FALSE, @sizeOf(ib_i16_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_i16_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_u16(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_u16_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_TRUE, @sizeOf(ib_u16_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_u16_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_i32(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_i32_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_FALSE, @sizeOf(ib_i32_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_i32_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_u32(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_u32_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_TRUE, @sizeOf(ib_u32_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_u32_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_i64(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_i64_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_FALSE, @sizeOf(ib_i64_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_i64_t));
+    }
+    return err;
+}
+
+pub fn ib_tuple_read_u64(ib_tpl: ib_tpl_t, i: ib_ulint_t, ival: *ib_u64_t) ib_err_t {
+    const err = ib_tuple_check_int(ib_tpl, i, compat.IB_TRUE, @sizeOf(ib_u64_t));
+    if (err == .DB_SUCCESS) {
+        _ = ib_col_copy_value_low(ib_tpl, i, ival, @sizeOf(ib_u64_t));
+    }
+    return err;
+}
+
+fn ib_tuple_write_int(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, value: *const anyopaque, value_len: usize) ib_err_t {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    const col = tupleColumn(tuple, col_no) orelse return .DB_ERROR;
+
+    if (col.meta.type != .IB_INT) {
+        return .DB_DATA_MISMATCH;
+    }
+
+    if (col.meta.type_len != 0 and col.meta.type_len != IB_SQL_NULL and col.meta.type_len != value_len) {
+        return .DB_DATA_MISMATCH;
+    }
+
+    return ib_col_set_value(ib_tpl, col_no, value, @intCast(value_len));
+}
+
+pub fn ib_tuple_write_i8(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_i8_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_i8_t));
+}
+
+pub fn ib_tuple_write_u8(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_u8_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_u8_t));
+}
+
+pub fn ib_tuple_write_i16(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_i16_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_i16_t));
+}
+
+pub fn ib_tuple_write_u16(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_u16_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_u16_t));
+}
+
+pub fn ib_tuple_write_i32(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_i32_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_i32_t));
+}
+
+pub fn ib_tuple_write_u32(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_u32_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_u32_t));
+}
+
+pub fn ib_tuple_write_i64(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_i64_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_i64_t));
+}
+
+pub fn ib_tuple_write_u64(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: ib_u64_t) ib_err_t {
+    return ib_tuple_write_int(ib_tpl, col_no, &val, @sizeOf(ib_u64_t));
+}
+
+pub fn ib_tuple_write_double(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: f64) ib_err_t {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    const col = tupleColumn(tuple, col_no) orelse return .DB_ERROR;
+    if (col.meta.type != .IB_DOUBLE) {
+        return .DB_DATA_MISMATCH;
+    }
+    return ib_col_set_value(ib_tpl, col_no, &val, @sizeOf(f64));
+}
+
+pub fn ib_tuple_read_double(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, dval: *f64) ib_err_t {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    const col = tupleColumn(tuple, col_no) orelse return .DB_ERROR;
+    if (col.meta.type != .IB_DOUBLE) {
+        return .DB_DATA_MISMATCH;
+    }
+    _ = ib_col_copy_value_low(ib_tpl, col_no, dval, @sizeOf(f64));
+    return .DB_SUCCESS;
+}
+
+pub fn ib_tuple_write_float(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, val: f32) ib_err_t {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    const col = tupleColumn(tuple, col_no) orelse return .DB_ERROR;
+    if (col.meta.type != .IB_FLOAT) {
+        return .DB_DATA_MISMATCH;
+    }
+    return ib_col_set_value(ib_tpl, col_no, &val, @sizeOf(f32));
+}
+
+pub fn ib_tuple_read_float(ib_tpl: ib_tpl_t, col_no: ib_ulint_t, fval: *f32) ib_err_t {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    const col = tupleColumn(tuple, col_no) orelse return .DB_ERROR;
+    if (col.meta.type != .IB_FLOAT) {
+        return .DB_DATA_MISMATCH;
+    }
+    _ = ib_col_copy_value_low(ib_tpl, col_no, fval, @sizeOf(f32));
+    return .DB_SUCCESS;
+}
+
+pub fn ib_tuple_get_n_cols(ib_tpl: ib_tpl_t) ib_ulint_t {
+    const tuple = ib_tpl orelse return 0;
+    return @intCast(tuple.cols.len);
+}
+
+pub fn ib_tuple_get_n_user_cols(ib_tpl: ib_tpl_t) ib_ulint_t {
+    const tuple = ib_tpl orelse return 0;
+    return @intCast(tuple.cols.len);
+}
+
+pub fn ib_tuple_clear(ib_tpl: ib_tpl_t) ib_tpl_t {
+    const tuple = ib_tpl orelse return null;
+    for (tuple.cols) |*col| {
+        if (col.data) |buf| {
+            tuple.allocator.free(buf);
+        }
+        col.data = null;
+    }
+    return tuple;
+}
+
+pub fn ib_tuple_copy(ib_dst_tpl: ib_tpl_t, ib_src_tpl: ib_tpl_t) ib_err_t {
+    const src = ib_src_tpl orelse return .DB_ERROR;
+    const dst = ib_dst_tpl orelse return .DB_ERROR;
+
+    if (src == dst) {
+        return .DB_DATA_MISMATCH;
+    }
+    if (src.tuple_type != dst.tuple_type or src.cols.len != dst.cols.len) {
+        return .DB_DATA_MISMATCH;
+    }
+
+    for (src.cols, 0..) |src_col, idx| {
+        const dst_col = &dst.cols[idx];
+        if (src_col.meta.type != dst_col.meta.type or src_col.meta.type_len != dst_col.meta.type_len) {
+            return .DB_DATA_MISMATCH;
+        }
+
+        if (src_col.data) |data| {
+            const buf = dst.allocator.alloc(u8, data.len) catch return .DB_OUT_OF_MEMORY;
+            std.mem.copyForwards(u8, buf, data);
+            if (dst_col.data) |old| {
+                dst.allocator.free(old);
+            }
+            dst_col.data = buf;
+        } else {
+            if (dst_col.data) |old| {
+                dst.allocator.free(old);
+            }
+            dst_col.data = null;
+        }
+    }
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_tuple_delete(ib_tpl: ib_tpl_t) void {
+    const tuple = ib_tpl orelse return;
+    tupleDestroy(tuple);
+}
+
 pub fn ib_trx_start(ib_trx: ib_trx_t, ib_trx_level: ib_trx_level_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
     if (trx.client_thread_id != os_thread.currentId()) {
@@ -385,4 +752,75 @@ test "ib_trx_start rejects already started" {
     const trx = ib_trx_begin(.IB_TRX_REPEATABLE_READ) orelse return error.OutOfMemory;
     defer _ = ib_trx_release(trx);
     try std.testing.expectEqual(errors.DbErr.DB_ERROR, ib_trx_start(trx, .IB_TRX_REPEATABLE_READ));
+}
+
+test "tuple read/write int float double" {
+    const metas = [_]ib_col_meta_t{
+        .{
+            .type = .IB_INT,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(ib_i32_t)),
+            .client_type = 0,
+            .charset = null,
+        },
+        .{
+            .type = .IB_FLOAT,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(f32)),
+            .client_type = 0,
+            .charset = null,
+        },
+        .{
+            .type = .IB_DOUBLE,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(f64)),
+            .client_type = 0,
+            .charset = null,
+        },
+    };
+
+    const tuple = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(tuple);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(tuple, 0, 42));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_float(tuple, 1, 1.25));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_double(tuple, 2, 2.5));
+
+    var iv: ib_i32_t = 0;
+    var fv: f32 = 0;
+    var dv: f64 = 0;
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(tuple, 0, &iv));
+    try std.testing.expectEqual(@as(ib_i32_t, 42), iv);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_float(tuple, 1, &fv));
+    try std.testing.expectEqual(@as(f32, 1.25), fv);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_double(tuple, 2, &dv));
+    try std.testing.expectEqual(@as(f64, 2.5), dv);
+}
+
+test "tuple copy and clear" {
+    const metas = [_]ib_col_meta_t{
+        .{
+            .type = .IB_INT,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(ib_u32_t)),
+            .client_type = 0,
+            .charset = null,
+        },
+    };
+
+    const src = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(src);
+    const dst = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(dst);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_u32(src, 0, 7));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_copy(dst, src));
+
+    var out: ib_u32_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_u32(dst, 0, &out));
+    try std.testing.expectEqual(@as(ib_u32_t, 7), out);
+
+    _ = ib_tuple_clear(dst);
+    try std.testing.expectEqual(@as(ib_ulint_t, IB_SQL_NULL), ib_col_get_len(dst, 0));
 }
