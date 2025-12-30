@@ -9,3 +9,4 @@ pub const docs = @import("docs.zig");
 pub const list = @import("list.zig");
 pub const rnd = @import("rnd.zig");
 pub const mem = @import("mem.zig");
+pub const util = @import("util.zig");
