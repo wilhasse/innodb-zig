@@ -4,6 +4,7 @@ const os_thread = @import("../os/thread.zig");
 pub const module_name = "sync";
 pub const arr = @import("arr.zig");
 pub const rw = @import("rw.zig");
+pub const core = @import("core.zig");
 
 pub const Mutex = struct {
     inner: std.Thread.Mutex = .{},
