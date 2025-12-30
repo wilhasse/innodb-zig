@@ -37,6 +37,7 @@ comptime {
         _ = @import("tests/ib_drop.zig");
         _ = @import("tests/ib_index.zig");
         _ = @import("tests/ib_logger.zig");
+        _ = @import("tests/ib_mt_base.zig");
     }
 }
 
