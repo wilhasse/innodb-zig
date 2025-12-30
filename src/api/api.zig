@@ -69,7 +69,8 @@ pub const Cursor = struct {
     positioned: bool,
     cluster_access: bool,
     simple_select: bool,
-    last_row: ?*Tuple,
+    rows: ArrayList(*Tuple),
+    position: ?usize,
     sql_stat_start: bool,
 };
 const Tuple = struct {
@@ -1551,6 +1552,141 @@ fn tupleColumn(tuple: *Tuple, col_no: ib_ulint_t) ?*Column {
     return &tuple.cols[@intCast(col_no)];
 }
 
+fn columnIntValue(col: *const Column) ?i64 {
+    const data = col.data orelse return null;
+    const attr_val = @intFromEnum(col.meta.attr);
+    const is_unsigned = (attr_val & @intFromEnum(ib_col_attr_t.IB_COL_UNSIGNED)) != 0;
+
+    switch (data.len) {
+        1 => {
+            const slice = data[0..1];
+            if (is_unsigned) {
+                const v = std.mem.bytesToValue(u8, slice);
+                return @as(i64, @intCast(v));
+            }
+            const v = std.mem.bytesToValue(i8, slice);
+            return @as(i64, v);
+        },
+        2 => {
+            const slice = data[0..2];
+            if (is_unsigned) {
+                const v = std.mem.bytesToValue(u16, slice);
+                return @as(i64, @intCast(v));
+            }
+            const v = std.mem.bytesToValue(i16, slice);
+            return @as(i64, v);
+        },
+        4 => {
+            const slice = data[0..4];
+            if (is_unsigned) {
+                const v = std.mem.bytesToValue(u32, slice);
+                return @as(i64, @intCast(v));
+            }
+            const v = std.mem.bytesToValue(i32, slice);
+            return @as(i64, v);
+        },
+        8 => {
+            const slice = data[0..8];
+            if (is_unsigned) {
+                const v = std.mem.bytesToValue(u64, slice);
+                return @as(i64, @intCast(v));
+            }
+            const v = std.mem.bytesToValue(i64, slice);
+            return @as(i64, v);
+        },
+        else => return null,
+    }
+}
+
+fn columnCompare(a: *const Column, b: *const Column) i32 {
+    if (a.meta.type == .IB_INT and b.meta.type == .IB_INT) {
+        if (columnIntValue(a)) |av| {
+            if (columnIntValue(b)) |bv| {
+                if (av < bv) {
+                    return -1;
+                }
+                if (av > bv) {
+                    return 1;
+                }
+                return 0;
+            }
+        }
+    }
+
+    const a_data = a.data orelse return if (b.data == null) 0 else -1;
+    const b_data = b.data orelse return 1;
+    return ib_client_compare(&a.meta, a_data.ptr, @intCast(a_data.len), b_data.ptr, @intCast(b_data.len));
+}
+
+fn tupleKeyCompare(a: *Tuple, b: *Tuple) i32 {
+    const col_a = tupleColumn(a, 0) orelse return 0;
+    const col_b = tupleColumn(b, 0) orelse return 0;
+    return columnCompare(col_a, col_b);
+}
+
+fn cursorCurrentRow(cursor: *Cursor) ?*Tuple {
+    const pos = cursor.position orelse return null;
+    if (pos >= cursor.rows.items.len) {
+        return null;
+    }
+    return cursor.rows.items[pos];
+}
+
+fn cursorInsertIndex(cursor: *Cursor, row: *Tuple) usize {
+    var i: usize = 0;
+    while (i < cursor.rows.items.len) : (i += 1) {
+        if (tupleKeyCompare(row, cursor.rows.items[i]) < 0) {
+            return i;
+        }
+    }
+    return cursor.rows.items.len;
+}
+
+fn cursorFindRow(cursor: *Cursor, key: *Tuple, mode: ib_srch_mode_t) ?usize {
+    if (cursor.rows.items.len == 0) {
+        return null;
+    }
+
+    switch (mode) {
+        .IB_CUR_GE => {
+            for (cursor.rows.items, 0..) |row, idx| {
+                if (tupleKeyCompare(key, row) <= 0) {
+                    return idx;
+                }
+            }
+        },
+        .IB_CUR_G => {
+            for (cursor.rows.items, 0..) |row, idx| {
+                if (tupleKeyCompare(key, row) < 0) {
+                    return idx;
+                }
+            }
+        },
+        .IB_CUR_LE => {
+            var idx: usize = cursor.rows.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                const row = cursor.rows.items[idx];
+                if (tupleKeyCompare(key, row) >= 0) {
+                    return idx;
+                }
+            }
+        },
+        .IB_CUR_L => {
+            var idx: usize = cursor.rows.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                const row = cursor.rows.items[idx];
+                if (tupleKeyCompare(key, row) > 0) {
+                    return idx;
+                }
+            }
+        },
+    }
+
+    return null;
+}
+
 fn catalogColumnMeta(col: CatalogColumn) ib_col_meta_t {
     return .{
         .type = col.col_type,
@@ -2105,7 +2241,8 @@ fn cursorCreate(
         .positioned = false,
         .cluster_access = false,
         .simple_select = false,
-        .last_row = null,
+        .rows = ArrayList(*Tuple).init(allocator),
+        .position = null,
         .sql_stat_start = false,
     };
 
@@ -2131,9 +2268,10 @@ fn cursorDestroy(cursor: *Cursor) void {
     if (cursor.index_name) |buf| {
         cursor.allocator.free(buf);
     }
-    if (cursor.last_row) |row| {
+    for (cursor.rows.items) |row| {
         tupleDestroy(row);
     }
+    cursor.rows.deinit();
     cursor.allocator.destroy(cursor);
 }
 
@@ -2248,6 +2386,7 @@ pub fn ib_cursor_open_table(name: []const u8, ib_trx: ib_trx_t, ib_crsr: *ib_crs
 pub fn ib_cursor_reset(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
     cursor.positioned = false;
+    cursor.position = null;
     cursor.cluster_access = false;
     cursor.simple_select = false;
     cursor.sql_stat_start = false;
@@ -2263,10 +2402,11 @@ pub fn ib_cursor_close(ib_crsr: ib_crsr_t) ib_err_t {
 pub fn ib_cursor_read_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
     const tuple = ib_tpl orelse return .DB_ERROR;
-    if (!cursor.positioned or cursor.last_row == null) {
+    if (!cursor.positioned) {
         return .DB_RECORD_NOT_FOUND;
     }
-    return ib_tuple_copy(tuple, cursor.last_row.?);
+    const row = cursorCurrentRow(cursor) orelse return .DB_RECORD_NOT_FOUND;
+    return ib_tuple_copy(tuple, row);
 }
 
 pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
@@ -2277,10 +2417,9 @@ pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
     }
 
     const clone = tupleClone(cursor.allocator, tuple) catch return .DB_OUT_OF_MEMORY;
-    if (cursor.last_row) |row| {
-        tupleDestroy(row);
-    }
-    cursor.last_row = clone;
+    const insert_idx = cursorInsertIndex(cursor, clone);
+    cursor.rows.insert(insert_idx, clone) catch return .DB_OUT_OF_MEMORY;
+    cursor.position = insert_idx;
     cursor.positioned = true;
     return .DB_SUCCESS;
 }
@@ -2292,62 +2431,89 @@ pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl
     if (old_tuple.tuple_type != .TPL_ROW or new_tuple.tuple_type != .TPL_ROW) {
         return .DB_DATA_MISMATCH;
     }
-    if (cursor.last_row == null) {
+    const pos = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (pos >= cursor.rows.items.len) {
         return .DB_RECORD_NOT_FOUND;
     }
 
     const clone = tupleClone(cursor.allocator, new_tuple) catch return .DB_OUT_OF_MEMORY;
-    if (cursor.last_row) |row| {
-        tupleDestroy(row);
-    }
-    cursor.last_row = clone;
+    tupleDestroy(cursor.rows.items[pos]);
+    cursor.rows.items[pos] = clone;
     cursor.positioned = true;
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_delete_row(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (cursor.last_row == null) {
+    const pos = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (pos >= cursor.rows.items.len) {
         return .DB_RECORD_NOT_FOUND;
     }
-    tupleDestroy(cursor.last_row.?);
-    cursor.last_row = null;
-    cursor.positioned = false;
+    const removed = cursor.rows.orderedRemove(pos);
+    tupleDestroy(removed);
+    if (cursor.rows.items.len == 0) {
+        cursor.position = null;
+        cursor.positioned = false;
+    } else {
+        const next_pos = if (pos >= cursor.rows.items.len) cursor.rows.items.len - 1 else pos;
+        cursor.position = next_pos;
+        cursor.positioned = true;
+    }
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_prev(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (!cursor.positioned or cursor.last_row == null) {
+    if (!cursor.positioned) {
         return .DB_RECORD_NOT_FOUND;
     }
+    const pos = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (pos == 0) {
+        cursor.position = null;
+        cursor.positioned = false;
+        return .DB_END_OF_INDEX;
+    }
+    cursor.position = pos - 1;
+    cursor.positioned = true;
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_next(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (!cursor.positioned or cursor.last_row == null) {
+    if (!cursor.positioned) {
         return .DB_RECORD_NOT_FOUND;
     }
+    const pos = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (pos + 1 >= cursor.rows.items.len) {
+        cursor.position = null;
+        cursor.positioned = false;
+        return .DB_END_OF_INDEX;
+    }
+    cursor.position = pos + 1;
+    cursor.positioned = true;
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_first(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (cursor.last_row == null) {
+    if (cursor.rows.items.len == 0) {
+        cursor.position = null;
         cursor.positioned = false;
         return .DB_RECORD_NOT_FOUND;
     }
+    cursor.position = 0;
     cursor.positioned = true;
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_last(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (cursor.last_row == null) {
+    if (cursor.rows.items.len == 0) {
+        cursor.position = null;
         cursor.positioned = false;
         return .DB_RECORD_NOT_FOUND;
     }
+    cursor.position = cursor.rows.items.len - 1;
     cursor.positioned = true;
     return .DB_SUCCESS;
 }
@@ -2359,13 +2525,20 @@ pub fn ib_cursor_moveto(
     result: *i32,
 ) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    _ = ib_srch_mode;
     const tuple = ib_tpl orelse return .DB_ERROR;
     if (tuple.tuple_type != .TPL_KEY) {
         return .DB_DATA_MISMATCH;
     }
-    cursor.positioned = cursor.last_row != null;
-    result.* = 0;
+    const pos = cursorFindRow(cursor, tuple, ib_srch_mode) orelse {
+        cursor.position = null;
+        cursor.positioned = false;
+        result.* = -1;
+        return .DB_RECORD_NOT_FOUND;
+    };
+    cursor.position = pos;
+    cursor.positioned = true;
+    const row = cursor.rows.items[pos];
+    result.* = tupleKeyCompare(tuple, row);
     return .DB_SUCCESS;
 }
 
@@ -3623,6 +3796,7 @@ test "cursor moveto positions and read row" {
     defer ib_tuple_delete(row_tpl);
 
     var result: i32 = -1;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(key_tpl, 0, 42));
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_moveto(crsr, key_tpl, .IB_CUR_GE, &result));
     try std.testing.expectEqual(@as(i32, 0), result);
     try std.testing.expectEqual(compat.IB_TRUE, ib_cursor_is_positioned(crsr));

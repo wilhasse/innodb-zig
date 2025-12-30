@@ -28,6 +28,7 @@ comptime {
         _ = @import("tests/ib_bulk_insert.zig");
         _ = @import("tests/ib_cfg.zig");
         _ = @import("tests/ib_compressed.zig");
+        _ = @import("tests/ib_cursor.zig");
     }
 }
 
