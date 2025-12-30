@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const mem = @import("../mem/mod.zig");
+const api = @import("../api/mod.zig").impl;
 
 pub const module_name = "data";
 
@@ -14,6 +15,47 @@ pub const UNIV_SQL_NULL_U32: u32 = compat.UNIV_SQL_NULL;
 pub const mem_heap_t = mem.heap.MemHeap;
 
 pub var data_error: byte = 0;
+pub var data_client_default_charset_coll: ulint = 0;
+
+pub const DATA_CLIENT_LATIN1_SWEDISH_CHARSET_COLL: ulint = 8;
+pub const DATA_CLIENT_BINARY_CHARSET_COLL: ulint = 63;
+
+pub const DATA_VARCHAR: ulint = 1;
+pub const DATA_CHAR: ulint = 2;
+pub const DATA_FIXBINARY: ulint = 3;
+pub const DATA_BINARY: ulint = 4;
+pub const DATA_BLOB: ulint = 5;
+pub const DATA_INT: ulint = 6;
+pub const DATA_SYS_CHILD: ulint = 7;
+pub const DATA_SYS: ulint = 8;
+pub const DATA_FLOAT: ulint = 9;
+pub const DATA_DOUBLE: ulint = 10;
+pub const DATA_DECIMAL: ulint = 11;
+pub const DATA_VARCLIENT: ulint = 12;
+pub const DATA_CLIENT: ulint = 13;
+pub const DATA_MTYPE_MAX: ulint = 63;
+
+pub const DATA_ENGLISH: ulint = 4;
+pub const DATA_ERROR: ulint = 111;
+pub const DATA_CLIENT_TYPE_MASK: ulint = 0xFF;
+
+pub const DATA_ROW_ID: ulint = 0;
+pub const DATA_ROW_ID_LEN: ulint = 6;
+pub const DATA_TRX_ID: ulint = 1;
+pub const DATA_TRX_ID_LEN: ulint = 6;
+pub const DATA_ROLL_PTR: ulint = 2;
+pub const DATA_ROLL_PTR_LEN: ulint = 7;
+pub const DATA_N_SYS_COLS: ulint = 3;
+
+pub const DATA_SYS_PRTYPE_MASK: ulint = 0xF;
+
+pub const DATA_NOT_NULL: ulint = 256;
+pub const DATA_UNSIGNED: ulint = 512;
+pub const DATA_BINARY_TYPE: ulint = 1024;
+pub const DATA_CUSTOM_TYPE: ulint = 2048;
+
+pub const DATA_ORDER_NULL_TYPE_BUF_SIZE: ulint = 4;
+pub const DATA_NEW_ORDER_NULL_TYPE_BUF_SIZE: ulint = 6;
 
 pub const dtype_t = struct {
     mtype: ulint = 0,
@@ -288,8 +330,10 @@ pub fn dtuple_fold(tuple: *const dtuple_t, n_fields: ulint, n_bytes: ulint, tree
 }
 
 pub fn dtuple_set_types_binary(tuple: *dtuple_t, n: ulint) void {
-    _ = tuple;
-    _ = n;
+    const limit = @min(@as(usize, @intCast(n)), tuple.fields.len);
+    for (tuple.fields[0..limit]) |*field| {
+        dtype_set(&field.type, DATA_BINARY, 0, 0);
+    }
 }
 
 pub fn dtuple_contains_null(tuple: *const dtuple_t) ibool {
@@ -302,18 +346,24 @@ pub fn dtuple_contains_null(tuple: *const dtuple_t) ibool {
 }
 
 pub fn dfield_check_typed(field: *const dfield_t) ibool {
-    _ = field;
+    const mtype = field.type.mtype;
+    if (mtype < DATA_VARCHAR or mtype > DATA_CLIENT) {
+        return compat.FALSE;
+    }
     return compat.TRUE;
 }
 
 pub fn dtuple_check_typed(tuple: *const dtuple_t) ibool {
-    _ = tuple;
+    for (tuple.fields) |*field| {
+        if (dfield_check_typed(field) == compat.FALSE) {
+            return compat.FALSE;
+        }
+    }
     return compat.TRUE;
 }
 
 pub fn dtuple_check_typed_no_assert(tuple: *const dtuple_t) ibool {
-    _ = tuple;
-    return compat.TRUE;
+    return dtuple_check_typed(tuple);
 }
 
 pub fn dtuple_validate(tuple: *const dtuple_t) ibool {
@@ -358,14 +408,293 @@ pub fn data_write_sql_null(data: []byte) void {
     std.mem.set(u8, data, 0);
 }
 
-pub fn dtype_get_sql_null_size(type_: *const dtype_t, comp: ulint) ulint {
-    _ = comp;
+pub fn dtype_var_init() void {
+    data_client_default_charset_coll = 0;
+}
+
+pub fn dtype_get_at_most_n_mbchars(
+    prtype: ulint,
+    mbminlen: ulint,
+    mbmaxlen: ulint,
+    prefix_len: ulint,
+    data_len: ulint,
+    str: [*]const u8,
+) ulint {
+    if (mbminlen != mbmaxlen) {
+        const cs = api.ib_ucode_get_charset(dtype_get_charset_coll(prtype));
+        const slice = str[0..@as(usize, @intCast(data_len))];
+        return api.ib_ucode_get_storage_size(cs, prefix_len, data_len, slice);
+    }
+    if (prefix_len < data_len) {
+        return prefix_len;
+    }
+    return data_len;
+}
+
+pub fn dtype_is_string_type(mtype: ulint) ibool {
+    if (mtype <= DATA_BLOB or mtype == DATA_CLIENT or mtype == DATA_VARCLIENT) {
+        return compat.TRUE;
+    }
+    return compat.FALSE;
+}
+
+pub fn dtype_is_binary_string_type(mtype: ulint, prtype: ulint) ibool {
+    if (mtype == DATA_FIXBINARY or mtype == DATA_BINARY) {
+        return compat.TRUE;
+    }
+    if (mtype == DATA_BLOB and (prtype & DATA_BINARY_TYPE) != 0) {
+        return compat.TRUE;
+    }
+    return compat.FALSE;
+}
+
+pub fn dtype_is_non_binary_string_type(mtype: ulint, prtype: ulint) ibool {
+    if (dtype_is_string_type(mtype) == compat.TRUE and dtype_is_binary_string_type(mtype, prtype) == compat.FALSE) {
+        return compat.TRUE;
+    }
+    return compat.FALSE;
+}
+
+pub fn dtype_set(type_: *dtype_t, mtype: ulint, prtype: ulint, len: ulint) void {
+    type_.mtype = mtype;
+    type_.prtype = prtype;
+    type_.len = len;
+    dtype_set_mblen(type_);
+}
+
+pub fn dtype_copy(type1: *dtype_t, type2: *const dtype_t) void {
+    type1.* = type2.*;
+}
+
+pub fn dtype_get_mtype(type_: *const dtype_t) ulint {
+    return type_.mtype;
+}
+
+pub fn dtype_get_prtype(type_: *const dtype_t) ulint {
+    return type_.prtype;
+}
+
+pub fn dtype_get_mblen(mtype: ulint, prtype: ulint, mbminlen: *ulint, mbmaxlen: *ulint) void {
+    if (dtype_is_string_type(mtype) == compat.TRUE) {
+        const cs = api.ib_ucode_get_charset(dtype_get_charset_coll(prtype));
+        api.ib_ucode_get_charset_width(cs, mbminlen, mbmaxlen);
+    } else {
+        mbminlen.* = 0;
+        mbmaxlen.* = 0;
+    }
+}
+
+pub fn dtype_get_charset_coll(prtype: ulint) ulint {
+    return (prtype >> 16) & 0xFF;
+}
+
+pub fn dtype_form_prtype(old_prtype: ulint, charset_coll: ulint) ulint {
+    return old_prtype + (charset_coll << 16);
+}
+
+pub fn dtype_get_len(type_: *const dtype_t) ulint {
     return type_.len;
+}
+
+pub fn dtype_get_mbminlen(type_: *const dtype_t) ulint {
+    return type_.mbminlen;
+}
+
+pub fn dtype_get_mbmaxlen(type_: *const dtype_t) ulint {
+    return type_.mbmaxlen;
+}
+
+pub fn dtype_get_pad_char(mtype: ulint, prtype: ulint) ulint {
+    switch (mtype) {
+        DATA_FIXBINARY, DATA_BINARY => {
+            if (dtype_get_charset_coll(prtype) == DATA_CLIENT_BINARY_CHARSET_COLL) {
+                return compat.ULINT_UNDEFINED;
+            }
+        },
+        DATA_CHAR, DATA_VARCHAR, DATA_CLIENT, DATA_VARCLIENT => {
+            return 0x20;
+        },
+        DATA_BLOB => {
+            if ((prtype & DATA_BINARY_TYPE) == 0) {
+                return 0x20;
+            }
+        },
+        else => {},
+    }
+    return compat.ULINT_UNDEFINED;
+}
+
+pub fn dtype_get_fixed_size_low(
+    mtype: ulint,
+    prtype: ulint,
+    len: ulint,
+    mbminlen: ulint,
+    mbmaxlen: ulint,
+    comp: ulint,
+) ulint {
+    _ = comp;
+    switch (mtype) {
+        DATA_SYS => {
+            const sys_prtype = prtype & DATA_CLIENT_TYPE_MASK;
+            if (sys_prtype == DATA_ROW_ID or sys_prtype == DATA_TRX_ID or sys_prtype == DATA_ROLL_PTR) {
+                return len;
+            }
+            return 0;
+        },
+        DATA_CHAR, DATA_FIXBINARY, DATA_INT, DATA_FLOAT, DATA_DOUBLE => return len,
+        DATA_CLIENT => {
+            if ((prtype & DATA_BINARY_TYPE) != 0 or mbminlen == mbmaxlen) {
+                return len;
+            }
+            return 0;
+        },
+        DATA_VARCHAR, DATA_BINARY, DATA_DECIMAL, DATA_VARCLIENT, DATA_BLOB => return 0,
+        else => return 0,
+    }
+}
+
+pub fn dtype_get_min_size_low(
+    mtype: ulint,
+    prtype: ulint,
+    len: ulint,
+    mbminlen: ulint,
+    mbmaxlen: ulint,
+) ulint {
+    switch (mtype) {
+        DATA_SYS => {
+            const sys_prtype = prtype & DATA_CLIENT_TYPE_MASK;
+            if (sys_prtype == DATA_ROW_ID or sys_prtype == DATA_TRX_ID or sys_prtype == DATA_ROLL_PTR) {
+                return len;
+            }
+            return 0;
+        },
+        DATA_CHAR, DATA_FIXBINARY, DATA_INT, DATA_FLOAT, DATA_DOUBLE => return len,
+        DATA_CLIENT => {
+            if ((prtype & DATA_BINARY_TYPE) != 0 or mbminlen == mbmaxlen) {
+                return len;
+            }
+            if (mbmaxlen == 0) {
+                return 0;
+            }
+            return len * mbminlen / mbmaxlen;
+        },
+        DATA_VARCHAR, DATA_BINARY, DATA_DECIMAL, DATA_VARCLIENT, DATA_BLOB => return 0,
+        else => return 0,
+    }
+}
+
+pub fn dtype_get_max_size_low(mtype: ulint, len: ulint) ulint {
+    switch (mtype) {
+        DATA_SYS,
+        DATA_CHAR,
+        DATA_FIXBINARY,
+        DATA_INT,
+        DATA_FLOAT,
+        DATA_DOUBLE,
+        DATA_CLIENT,
+        DATA_VARCHAR,
+        DATA_BINARY,
+        DATA_DECIMAL,
+        DATA_VARCLIENT,
+        => return len,
+        DATA_BLOB => return compat.ULINT_MAX,
+        else => return compat.ULINT_MAX,
+    }
+}
+
+pub fn dtype_get_sql_null_size(type_: *const dtype_t, comp: ulint) ulint {
+    return dtype_get_fixed_size_low(type_.mtype, type_.prtype, type_.len, type_.mbminlen, type_.mbmaxlen, comp);
+}
+
+pub fn dtype_read_for_order_and_null_size(type_: *dtype_t, buf: []const byte) void {
+    type_.mtype = buf[0] & 63;
+    type_.prtype = buf[1];
+    if ((buf[0] & 128) != 0) {
+        type_.prtype |= DATA_BINARY_TYPE;
+    }
+    type_.len = readU16Be(buf[2..].ptr);
+    type_.prtype = dtype_form_prtype(type_.prtype, data_client_default_charset_coll);
+    dtype_set_mblen(type_);
+}
+
+pub fn dtype_new_store_for_order_and_null_size(buf: []byte, type_: *const dtype_t, prefix_len: ulint) void {
+    var flags: byte = @as(byte, @intCast(type_.mtype & 0xFF));
+    if ((type_.prtype & DATA_BINARY_TYPE) != 0) {
+        flags |= 0x80;
+    }
+    buf[0] = flags;
+    buf[1] = @as(byte, @intCast(type_.prtype & 0xFF));
+
+    const len = if (prefix_len != 0) prefix_len else type_.len;
+    writeU16Be(buf[2..].ptr, len & 0xFFFF);
+
+    const charset_coll = dtype_get_charset_coll(type_.prtype) & 0xFF;
+    writeU16Be(buf[4..].ptr, charset_coll);
+    if ((type_.prtype & DATA_NOT_NULL) != 0) {
+        buf[4] |= 0x80;
+    }
+}
+
+pub fn dtype_new_read_for_order_and_null_size(type_: *dtype_t, buf: []const byte) void {
+    type_.mtype = buf[0] & 63;
+    type_.prtype = buf[1];
+    if ((buf[0] & 128) != 0) {
+        type_.prtype |= DATA_BINARY_TYPE;
+    }
+    if ((buf[4] & 128) != 0) {
+        type_.prtype |= DATA_NOT_NULL;
+    }
+    type_.len = readU16Be(buf[2..].ptr);
+
+    const charset_coll = readU16Be(buf[4..].ptr) & 0x7FFF;
+    if (dtype_is_string_type(type_.mtype) == compat.TRUE) {
+        type_.prtype = dtype_form_prtype(type_.prtype, charset_coll);
+    }
+    dtype_set_mblen(type_);
+}
+
+pub fn dtype_validate(type_: *const dtype_t) ibool {
+    if (type_.mtype < DATA_VARCHAR or type_.mtype > DATA_CLIENT) {
+        return compat.FALSE;
+    }
+    if (type_.mtype == DATA_SYS and (type_.prtype & DATA_CLIENT_TYPE_MASK) >= DATA_N_SYS_COLS) {
+        return compat.FALSE;
+    }
+    if (type_.mbminlen > type_.mbmaxlen) {
+        return compat.FALSE;
+    }
+    return compat.TRUE;
+}
+
+pub fn dtype_print(type_: *const dtype_t) void {
+    _ = type_;
+}
+
+pub fn dtype_get_attrib(type_: *const dtype_t) ulint {
+    return type_.prtype & DATA_CLIENT_TYPE_MASK;
 }
 
 fn lenToU32(len: ulint) u32 {
     std.debug.assert(len <= std.math.maxInt(u32));
     return @as(u32, @intCast(len));
+}
+
+fn dtype_set_mblen(type_: *dtype_t) void {
+    var mbmin: ulint = 0;
+    var mbmax: ulint = 0;
+    dtype_get_mblen(type_.mtype, type_.prtype, &mbmin, &mbmax);
+    type_.mbminlen = mbmin;
+    type_.mbmaxlen = mbmax;
+}
+
+fn writeU16Be(ptr: [*]byte, value: ulint) void {
+    std.debug.assert(value <= 0xFFFF);
+    ptr[0] = @as(byte, @intCast((value >> 8) & 0xFF));
+    ptr[1] = @as(byte, @intCast(value & 0xFF));
+}
+
+fn readU16Be(ptr: [*]const byte) ulint {
+    return (@as(ulint, ptr[0]) << 8) | @as(ulint, ptr[1]);
 }
 
 fn fieldDataSlice(field: *const dfield_t, len: usize) []const u8 {
@@ -481,4 +810,49 @@ test "data sql null write" {
     try std.testing.expectEqual(@as(byte, 0), buf[0]);
     try std.testing.expectEqual(@as(byte, 0), buf[1]);
     try std.testing.expectEqual(@as(byte, 0), buf[2]);
+}
+
+test "data dtype basics" {
+    var dtype = dtype_t{};
+    dtype_set(&dtype, DATA_INT, DATA_UNSIGNED, 4);
+    try std.testing.expectEqual(@as(ulint, DATA_INT), dtype_get_mtype(&dtype));
+    try std.testing.expectEqual(@as(ulint, DATA_UNSIGNED), dtype_get_prtype(&dtype));
+    try std.testing.expectEqual(@as(ulint, 4), dtype_get_len(&dtype));
+    try std.testing.expectEqual(compat.TRUE, dtype_is_string_type(DATA_VARCHAR));
+    try std.testing.expectEqual(compat.TRUE, dtype_is_binary_string_type(DATA_BLOB, DATA_BINARY_TYPE));
+    try std.testing.expectEqual(compat.TRUE, dtype_is_non_binary_string_type(DATA_BLOB, 0));
+
+    var field = dfield_t{};
+    dtype_set(&field.type, DATA_INT, 0, 4);
+    try std.testing.expectEqual(compat.TRUE, dfield_check_typed(&field));
+    try std.testing.expectEqual(@as(ulint, 4), dtype_get_sql_null_size(&field.type, 0));
+}
+
+test "data dtype order buffer roundtrip" {
+    var dtype = dtype_t{};
+    const prtype = dtype_form_prtype(DATA_NOT_NULL, 33);
+    dtype_set(&dtype, DATA_VARCHAR, prtype, 12);
+
+    var buf: [DATA_NEW_ORDER_NULL_TYPE_BUF_SIZE]byte = undefined;
+    dtype_new_store_for_order_and_null_size(buf[0..], &dtype, 0);
+
+    var read = dtype_t{};
+    dtype_new_read_for_order_and_null_size(&read, buf[0..]);
+    try std.testing.expectEqual(dtype.mtype, read.mtype);
+    try std.testing.expectEqual(dtype.len, read.len);
+    try std.testing.expectEqual(@as(ulint, 33), dtype_get_charset_coll(read.prtype));
+}
+
+test "data dtype old order buffer" {
+    data_client_default_charset_coll = 8;
+    var buf: [DATA_ORDER_NULL_TYPE_BUF_SIZE]byte = undefined;
+    buf[0] = @as(byte, @intCast(DATA_CHAR));
+    buf[1] = 0;
+    writeU16Be(buf[2..].ptr, 5);
+
+    var dtype = dtype_t{};
+    dtype_read_for_order_and_null_size(&dtype, buf[0..]);
+    try std.testing.expectEqual(@as(ulint, DATA_CHAR), dtype.mtype);
+    try std.testing.expectEqual(@as(ulint, 5), dtype.len);
+    try std.testing.expectEqual(@as(ulint, 8), dtype_get_charset_coll(dtype.prtype));
 }
