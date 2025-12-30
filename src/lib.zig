@@ -49,6 +49,7 @@ comptime {
         _ = @import("tests/ib_simple_bulk.zig");
         _ = @import("tests/ib_status.zig");
         _ = @import("tests/ib_tablename.zig");
+        _ = @import("tests/ib_test1.zig");
     }
 }
 
