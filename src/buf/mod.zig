@@ -462,6 +462,92 @@ pub fn buf_flush_validate() ibool {
     return compat.TRUE;
 }
 
+pub const buf_lru_free_block_status = enum(u8) {
+    BUF_LRU_FREED = 0,
+    BUF_LRU_CANNOT_RELOCATE = 1,
+    BUF_LRU_NOT_FREED = 2,
+};
+
+pub const BUF_LRU_OLD_MIN_LEN: ulint = 512;
+pub const BUF_LRU_FREE_SEARCH_LEN: ulint = 5 + 2 * BUF_READ_AHEAD_AREA;
+pub var buf_LRU_old_ratio: ulint = 0;
+
+pub fn buf_LRU_try_free_flushed_blocks() void {}
+
+pub fn buf_LRU_buf_pool_running_out() ibool {
+    return compat.FALSE;
+}
+
+pub fn buf_LRU_invalidate_tablespace(id: ulint) void {
+    _ = id;
+}
+
+pub fn buf_LRU_insert_zip_clean(bpage: *buf_page_t) void {
+    _ = bpage;
+}
+
+pub fn buf_LRU_free_block(bpage: *buf_page_t, zip: ibool, buf_pool_mutex_released: ?*ibool) buf_lru_free_block_status {
+    _ = bpage;
+    _ = zip;
+    if (buf_pool_mutex_released) |flag| {
+        flag.* = compat.FALSE;
+    }
+    return .BUF_LRU_FREED;
+}
+
+pub fn buf_LRU_search_and_free_block(n_iterations: ulint) ibool {
+    _ = n_iterations;
+    return compat.FALSE;
+}
+
+pub fn buf_LRU_get_free_only() ?*buf_block_t {
+    return null;
+}
+
+pub fn buf_LRU_get_free_block(zip_size: ulint) ?*buf_block_t {
+    return buf_block_alloc(zip_size);
+}
+
+pub fn buf_LRU_block_free_non_file_page(block: *buf_block_t) void {
+    buf_block_free(block);
+}
+
+pub fn buf_LRU_add_block(bpage: *buf_page_t, old: ibool) void {
+    _ = bpage;
+    _ = old;
+}
+
+pub fn buf_unzip_LRU_add_block(block: *buf_block_t, old: ibool) void {
+    _ = block;
+    _ = old;
+}
+
+pub fn buf_LRU_make_block_young(bpage: *buf_page_t) void {
+    _ = bpage;
+}
+
+pub fn buf_LRU_make_block_old(bpage: *buf_page_t) void {
+    _ = bpage;
+}
+
+pub fn buf_LRU_old_ratio_update(old_pct: ulint, adjust: ibool) ulint {
+    _ = adjust;
+    buf_LRU_old_ratio = old_pct;
+    return old_pct;
+}
+
+pub fn buf_LRU_stat_update() void {}
+
+pub fn buf_LRU_var_init() void {
+    buf_LRU_old_ratio = 0;
+}
+
+pub fn buf_LRU_validate() ibool {
+    return compat.TRUE;
+}
+
+pub fn buf_LRU_print() void {}
+
 test "buf buddy slot and alloc/free" {
     buf_buddy_var_init();
     try std.testing.expectEqual(@as(ulint, 0), buf_buddy_get_slot(BUF_BUDDY_LOW));
@@ -509,4 +595,18 @@ test "buf flush stubs" {
     try std.testing.expectEqual(compat.TRUE, buf_flush_ready_for_replace(&page));
     try std.testing.expectEqual(@as(ulint, 0), buf_flush_get_desired_flush_rate());
     try std.testing.expectEqual(@as(ulint, 0), buf_flush_batch(.BUF_FLUSH_LRU, 0, 0));
+}
+
+test "buf LRU stubs" {
+    buf_LRU_var_init();
+    try std.testing.expectEqual(@as(ulint, 0), buf_LRU_old_ratio);
+
+    const updated = buf_LRU_old_ratio_update(37, compat.FALSE);
+    try std.testing.expectEqual(@as(ulint, 37), updated);
+    try std.testing.expectEqual(@as(ulint, 37), buf_LRU_old_ratio);
+
+    var page = buf_page_t{};
+    var released: ibool = compat.TRUE;
+    try std.testing.expectEqual(.BUF_LRU_FREED, buf_LRU_free_block(&page, compat.FALSE, &released));
+    try std.testing.expectEqual(@as(ibool, compat.FALSE), released);
 }
