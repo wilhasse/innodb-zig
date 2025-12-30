@@ -1160,36 +1160,108 @@ pub fn ib_update_statistics_if_needed(table: *CatalogTable) void {
     }
 }
 
-pub fn ib_exec_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
-    _ = n_args;
+pub const ib_sql_arg_t = union(enum) {
+    text: struct {
+        name: []const u8,
+        value: []const u8,
+    },
+    int: struct {
+        name: []const u8,
+        value: ib_i64_t,
+        unsigned: bool,
+        len: u8,
+    },
+    func: struct {
+        name: []const u8,
+        callback: ?ib_cb_t,
+        arg: ?*anyopaque,
+    },
+};
+
+fn sqlArgNameValid(name: []const u8) bool {
+    if (name.len < 2) {
+        return false;
+    }
+    return name[0] == ':' or name[0] == '$';
+}
+
+fn sqlArgsValidate(args: []const ib_sql_arg_t) ib_err_t {
+    for (args) |arg| {
+        switch (arg) {
+            .text => |payload| {
+                if (!sqlArgNameValid(payload.name)) {
+                    return .DB_INVALID_INPUT;
+                }
+            },
+            .int => |payload| {
+                if (!sqlArgNameValid(payload.name)) {
+                    return .DB_INVALID_INPUT;
+                }
+                switch (payload.len) {
+                    1, 2, 4, 8 => {},
+                    else => return .DB_INVALID_INPUT,
+                }
+            },
+            .func => |payload| {
+                if (!sqlArgNameValid(payload.name)) {
+                    return .DB_INVALID_INPUT;
+                }
+                if (payload.callback == null) {
+                    return .DB_INVALID_INPUT;
+                }
+            },
+        }
+    }
+    return .DB_SUCCESS;
+}
+
+fn execSqlCommon(sql: []const u8, args: []const ib_sql_arg_t, ddl: bool) ib_err_t {
     if (sql.len == 0) {
         return .DB_INVALID_INPUT;
     }
+    const arg_err = sqlArgsValidate(args);
+    if (arg_err != .DB_SUCCESS) {
+        return arg_err;
+    }
 
     const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED) orelse return .DB_OUT_OF_MEMORY;
+    if (ddl) {
+        const lock_err = ib_schema_lock_exclusive(trx);
+        if (lock_err != .DB_SUCCESS) {
+            _ = ib_trx_rollback(trx);
+            return lock_err;
+        }
+
+        const unlock_err = ib_schema_unlock(trx);
+        if (unlock_err != .DB_SUCCESS) {
+            _ = ib_trx_rollback(trx);
+            return unlock_err;
+        }
+    }
+
     return ib_trx_commit(trx);
 }
 
-pub fn ib_exec_ddl_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
-    _ = n_args;
-    if (sql.len == 0) {
+pub fn ib_exec_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
+    if (n_args != 0) {
         return .DB_INVALID_INPUT;
     }
+    return execSqlCommon(sql, &.{}, false);
+}
 
-    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED) orelse return .DB_OUT_OF_MEMORY;
-    const lock_err = ib_schema_lock_exclusive(trx);
-    if (lock_err != .DB_SUCCESS) {
-        _ = ib_trx_rollback(trx);
-        return lock_err;
+pub fn ib_exec_sql_args(sql: []const u8, args: []const ib_sql_arg_t) ib_err_t {
+    return execSqlCommon(sql, args, false);
+}
+
+pub fn ib_exec_ddl_sql(sql: []const u8, n_args: ib_ulint_t) ib_err_t {
+    if (n_args != 0) {
+        return .DB_INVALID_INPUT;
     }
+    return execSqlCommon(sql, &.{}, true);
+}
 
-    const unlock_err = ib_schema_unlock(trx);
-    if (unlock_err != .DB_SUCCESS) {
-        _ = ib_trx_rollback(trx);
-        return unlock_err;
-    }
-
-    return ib_trx_commit(trx);
+pub fn ib_exec_ddl_sql_args(sql: []const u8, args: []const ib_sql_arg_t) ib_err_t {
+    return execSqlCommon(sql, args, true);
 }
 
 fn parseFileFormat(format: []const u8) ?u32 {
@@ -3786,9 +3858,23 @@ test "config readonly after startup" {
 test "exec sql stubs validate input" {
     try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_sql("", 0));
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_sql("select 1", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_sql("select 1", 1));
 
     try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("", 0));
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql("create table t(a int)", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("create table t(a int)", 2));
+
+    const args = [_]ib_sql_arg_t{
+        .{ .text = .{ .name = ":name", .value = "alice" } },
+        .{ .int = .{ .name = ":id", .value = 42, .unsigned = true, .len = 4 } },
+    };
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_sql_args("select :id", &args));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql_args("create table t(a int)", &args));
+
+    const bad_args = [_]ib_sql_arg_t{
+        .{ .int = .{ .name = "id", .value = 1, .unsigned = false, .len = 3 } },
+    };
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_sql_args("select 1", &bad_args));
 }
 
 test "tuple create helpers and cluster key" {
