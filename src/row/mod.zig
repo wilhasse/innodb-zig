@@ -22,6 +22,7 @@ pub const row_ext_t = struct {
 
 pub const ext = @import("ext.zig");
 pub const ins = @import("ins.zig");
+pub const merge = @import("merge.zig");
 
 pub const sel_node_t = struct {
     state: sel_node_state = .SEL_NODE_CLOSED,
