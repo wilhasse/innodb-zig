@@ -58,6 +58,7 @@ pub const Cursor = struct {
     positioned: bool,
     cluster_access: bool,
     simple_select: bool,
+    last_row: ?*Tuple,
 };
 const Tuple = struct {
     tuple_type: ib_tuple_type_t,
@@ -339,6 +340,41 @@ fn tupleDestroy(tuple: *Tuple) void {
     }
     tuple.allocator.free(tuple.cols);
     tuple.allocator.destroy(tuple);
+}
+
+fn tupleClone(allocator: std.mem.Allocator, src: *const Tuple) !*Tuple {
+    const tuple = try allocator.create(Tuple);
+    const cols = try allocator.alloc(Column, src.cols.len);
+    errdefer {
+        for (cols) |col| {
+            if (col.data) |buf| {
+                allocator.free(buf);
+            }
+        }
+        allocator.free(cols);
+        allocator.destroy(tuple);
+    }
+
+    for (src.cols, 0..) |src_col, i| {
+        var data_copy: ?[]u8 = null;
+        if (src_col.data) |data| {
+            const buf = try allocator.alloc(u8, data.len);
+            std.mem.copyForwards(u8, buf, data);
+            data_copy = buf;
+        }
+        cols[i] = .{
+            .meta = src_col.meta,
+            .data = data_copy,
+        };
+    }
+
+    tuple.* = .{
+        .tuple_type = src.tuple_type,
+        .cols = cols,
+        .allocator = allocator,
+    };
+
+    return tuple;
 }
 
 fn tupleColumn(tuple: *Tuple, col_no: ib_ulint_t) ?*Column {
@@ -751,6 +787,7 @@ fn cursorCreate(
         .positioned = false,
         .cluster_access = false,
         .simple_select = false,
+        .last_row = null,
     };
 
     if (table_name) |name| {
@@ -774,6 +811,9 @@ fn cursorDestroy(cursor: *Cursor) void {
     }
     if (cursor.index_name) |buf| {
         cursor.allocator.free(buf);
+    }
+    if (cursor.last_row) |row| {
+        tupleDestroy(row);
     }
     cursor.allocator.destroy(cursor);
 }
@@ -877,16 +917,63 @@ pub fn ib_cursor_close(ib_crsr: ib_crsr_t) ib_err_t {
 
 pub fn ib_cursor_read_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    _ = ib_tpl orelse return .DB_ERROR;
-    if (!cursor.positioned) {
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    if (!cursor.positioned or cursor.last_row == null) {
         return .DB_RECORD_NOT_FOUND;
     }
+    return ib_tuple_copy(tuple, cursor.last_row.?);
+}
+
+pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
+    const cursor = ib_crsr orelse return .DB_ERROR;
+    const tuple = ib_tpl orelse return .DB_ERROR;
+    if (tuple.tuple_type != .TPL_ROW) {
+        return .DB_DATA_MISMATCH;
+    }
+
+    const clone = tupleClone(cursor.allocator, tuple) catch return .DB_OUT_OF_MEMORY;
+    if (cursor.last_row) |row| {
+        tupleDestroy(row);
+    }
+    cursor.last_row = clone;
+    cursor.positioned = true;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl: ib_tpl_t) ib_err_t {
+    const cursor = ib_crsr orelse return .DB_ERROR;
+    const old_tuple = ib_old_tpl orelse return .DB_ERROR;
+    const new_tuple = ib_new_tpl orelse return .DB_ERROR;
+    if (old_tuple.tuple_type != .TPL_ROW or new_tuple.tuple_type != .TPL_ROW) {
+        return .DB_DATA_MISMATCH;
+    }
+    if (cursor.last_row == null) {
+        return .DB_RECORD_NOT_FOUND;
+    }
+
+    const clone = tupleClone(cursor.allocator, new_tuple) catch return .DB_OUT_OF_MEMORY;
+    if (cursor.last_row) |row| {
+        tupleDestroy(row);
+    }
+    cursor.last_row = clone;
+    cursor.positioned = true;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_cursor_delete_row(ib_crsr: ib_crsr_t) ib_err_t {
+    const cursor = ib_crsr orelse return .DB_ERROR;
+    if (cursor.last_row == null) {
+        return .DB_RECORD_NOT_FOUND;
+    }
+    tupleDestroy(cursor.last_row.?);
+    cursor.last_row = null;
+    cursor.positioned = false;
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_prev(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (!cursor.positioned) {
+    if (!cursor.positioned or cursor.last_row == null) {
         return .DB_RECORD_NOT_FOUND;
     }
     return .DB_SUCCESS;
@@ -894,7 +981,7 @@ pub fn ib_cursor_prev(ib_crsr: ib_crsr_t) ib_err_t {
 
 pub fn ib_cursor_next(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
-    if (!cursor.positioned) {
+    if (!cursor.positioned or cursor.last_row == null) {
         return .DB_RECORD_NOT_FOUND;
     }
     return .DB_SUCCESS;
@@ -902,12 +989,20 @@ pub fn ib_cursor_next(ib_crsr: ib_crsr_t) ib_err_t {
 
 pub fn ib_cursor_first(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
+    if (cursor.last_row == null) {
+        cursor.positioned = false;
+        return .DB_RECORD_NOT_FOUND;
+    }
     cursor.positioned = true;
     return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_last(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
+    if (cursor.last_row == null) {
+        cursor.positioned = false;
+        return .DB_RECORD_NOT_FOUND;
+    }
     cursor.positioned = true;
     return .DB_SUCCESS;
 }
@@ -924,7 +1019,7 @@ pub fn ib_cursor_moveto(
     if (tuple.tuple_type != .TPL_KEY) {
         return .DB_DATA_MISMATCH;
     }
-    cursor.positioned = true;
+    cursor.positioned = cursor.last_row != null;
     result.* = 0;
     return .DB_SUCCESS;
 }
@@ -1573,6 +1668,21 @@ test "cursor open/close and flags" {
     try std.testing.expectEqual(ib_match_mode_t.IB_EXACT_MATCH, cursor.match_mode);
 
     try std.testing.expectEqual(errors.DbErr.DB_RECORD_NOT_FOUND, ib_cursor_next(crsr));
+
+    const metas = [_]ib_col_meta_t{
+        .{
+            .type = .IB_INT,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(ib_i32_t)),
+            .client_type = 0,
+            .charset = null,
+        },
+    };
+    const insert_tpl = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(insert_tpl);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(insert_tpl, 0, 7));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_insert_row(crsr, insert_tpl));
+
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_first(crsr));
     try std.testing.expectEqual(compat.IB_TRUE, ib_cursor_is_positioned(crsr));
 
@@ -1606,6 +1716,11 @@ test "cursor moveto positions and read row" {
             .charset = null,
         },
     };
+
+    const insert_tpl = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(insert_tpl);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(insert_tpl, 0, 42));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_insert_row(crsr, insert_tpl));
 
     const key_tpl = try tupleCreate(std.heap.page_allocator, .TPL_KEY, &metas);
     defer ib_tuple_delete(key_tpl);
@@ -1644,6 +1759,47 @@ test "cursor open index variants" {
     try std.testing.expectEqual(@as(ib_id_t, 1), id_cursor.table_id.?);
     try std.testing.expectEqual(idx_id, id_cursor.index_id.?);
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_close(idx_by_id));
+}
+
+test "cursor insert update delete" {
+    var crsr: ib_crsr_t = null;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_open_table("db/t6", null, &crsr));
+    defer _ = ib_cursor_close(crsr);
+
+    const metas = [_]ib_col_meta_t{
+        .{
+            .type = .IB_INT,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(ib_i32_t)),
+            .client_type = 0,
+            .charset = null,
+        },
+    };
+
+    const insert_tpl = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(insert_tpl);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(insert_tpl, 0, 10));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_insert_row(crsr, insert_tpl));
+
+    const read_tpl = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(read_tpl);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_read_row(crsr, read_tpl));
+
+    var out: ib_i32_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(read_tpl, 0, &out));
+    try std.testing.expectEqual(@as(ib_i32_t, 10), out);
+
+    const new_tpl = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(new_tpl);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(new_tpl, 0, 20));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_update_row(crsr, insert_tpl, new_tpl));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_read_row(crsr, read_tpl));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(read_tpl, 0, &out));
+    try std.testing.expectEqual(@as(ib_i32_t, 20), out);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_delete_row(crsr));
+    try std.testing.expectEqual(errors.DbErr.DB_RECORD_NOT_FOUND, ib_cursor_read_row(crsr, read_tpl));
 }
 
 test "schema lock state transitions" {
