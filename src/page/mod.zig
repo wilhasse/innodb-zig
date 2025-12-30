@@ -149,13 +149,13 @@ pub fn page_get_max_trx_id(page: *const page_t) trx_id_t {
     return page.header.max_trx_id;
 }
 
-pub fn page_set_max_trx_id(block: *buf_block_t, page_zip: ?*page_zip_des_t, trx_id: trx_id_t, mtr: *mtr_t) void {
+pub fn page_set_max_trx_id(block: *const buf_block_t, page_zip: ?*page_zip_des_t, trx_id: trx_id_t, mtr: *mtr_t) void {
     _ = page_zip;
     _ = mtr;
     block.frame.header.max_trx_id = trx_id;
 }
 
-pub fn page_update_max_trx_id(block: *buf_block_t, page_zip: ?*page_zip_des_t, trx_id: trx_id_t, mtr: *mtr_t) void {
+pub fn page_update_max_trx_id(block: *const buf_block_t, page_zip: ?*page_zip_des_t, trx_id: trx_id_t, mtr: *mtr_t) void {
     _ = page_zip;
     _ = mtr;
     if (trx_id > block.frame.header.max_trx_id) {
@@ -390,7 +390,7 @@ pub fn page_cur_search_with_match(
     page_cur_position(first, block, cursor);
 }
 
-pub fn page_cur_open_on_rnd_user_rec(block: *buf_block_t, cursor: *page_cur_t) void {
+pub fn page_cur_open_on_rnd_user_rec(block: *const buf_block_t, cursor: *page_cur_t) void {
     const page = block.frame;
     const first = page.infimum.next orelse &page.supremum;
     if (page_rec_is_supremum(first)) {
@@ -445,14 +445,14 @@ pub fn page_mem_free(page: *page_t, page_zip: ?*page_zip_des_t, rec: *rec_t, ind
     _ = offsets;
 }
 
-pub fn page_create(block: *buf_block_t, mtr: *mtr_t, comp: ulint) *page_t {
+pub fn page_create(block: *const buf_block_t, mtr: *mtr_t, comp: ulint) *page_t {
     _ = mtr;
     _ = comp;
     page_init(block.frame);
     return block.frame;
 }
 
-pub fn page_create_zip(block: *buf_block_t, index: *dict_index_t, level: ulint, mtr: *mtr_t) *page_t {
+pub fn page_create_zip(block: *const buf_block_t, index: *dict_index_t, level: ulint, mtr: *mtr_t) *page_t {
     _ = index;
     _ = mtr;
     page_init(block.frame);
@@ -679,7 +679,7 @@ pub fn page_zip_available(page_zip: *const page_zip_des_t, is_clust: ibool, leng
 test "page cursor movement and insert/delete" {
     var page = page_t{};
     page_init(&page);
-    var block = buf_block_t{ .frame = &page };
+    const block = buf_block_t{ .frame = &page };
     var cursor = page_cur_t{};
     var index = dict_index_t{};
     var mtr = mtr_t{};
@@ -703,8 +703,6 @@ test "page cursor movement and insert/delete" {
 test "page copy rec list end" {
     var page = page_t{};
     page_init(&page);
-    var block = buf_block_t{ .frame = &page };
-    _ = block;
     var index = dict_index_t{};
     var mtr = mtr_t{};
 
@@ -744,7 +742,7 @@ test "page copy rec list end" {
 test "page cursor open on rnd user rec" {
     var page = page_t{};
     page_init(&page);
-    var block = buf_block_t{ .frame = &page };
+    const block = buf_block_t{ .frame = &page };
     var cursor = page_cur_t{};
 
     page_cur_open_on_rnd_user_rec(&block, &cursor);
@@ -769,7 +767,7 @@ test "page header fields and create" {
     try std.testing.expectEqual(@as(ulint, 7), page_header_get_field(&page, PAGE_N_RECS));
     try std.testing.expectEqual(@as(ulint, PAGE_RIGHT), page_header_get_field(&page, PAGE_DIRECTION));
 
-    var block = buf_block_t{ .frame = &page };
+    const block = buf_block_t{ .frame = &page };
     var mtr = mtr_t{};
     page_set_max_trx_id(&block, null, 123, &mtr);
     try std.testing.expectEqual(@as(trx_id_t, 123), page_get_max_trx_id(&page));

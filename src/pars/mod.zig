@@ -5,6 +5,7 @@ const row = @import("../row/mod.zig");
 pub const module_name = "pars";
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
+pub const opt = @import("opt.zig");
 
 pub const ulint = compat.ulint;
 pub const lint = compat.lint;
@@ -65,6 +66,10 @@ pub const sym_node_t = struct {
     token_type: sym_tab_entry = .SYM_VAR,
     sym_table: ?*sym_tab_t = null,
     cursor_def: ?*row.sel_node_t = null,
+};
+
+pub const sym_node_list_t = struct {
+    head: ?*sym_node_t = null,
 };
 
 pub const func_node_t = struct {

@@ -7,6 +7,8 @@ pub const sel_node_state = enum(u32) {
     SEL_NODE_NO_MORE_ROWS = 3,
 };
 
+pub const plan_t = struct {};
+
 pub const sel_node_t = struct {
     state: sel_node_state = .SEL_NODE_CLOSED,
 };
