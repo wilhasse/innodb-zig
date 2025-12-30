@@ -13,6 +13,31 @@ pub const PAGE_CUR_GE: ulint = 2;
 pub const PAGE_CUR_L: ulint = 3;
 pub const PAGE_CUR_LE: ulint = 4;
 
+pub const PAGE_N_DIR_SLOTS: ulint = 0;
+pub const PAGE_HEAP_TOP: ulint = 2;
+pub const PAGE_N_HEAP: ulint = 4;
+pub const PAGE_FREE: ulint = 6;
+pub const PAGE_GARBAGE: ulint = 8;
+pub const PAGE_LAST_INSERT: ulint = 10;
+pub const PAGE_DIRECTION: ulint = 12;
+pub const PAGE_N_DIRECTION: ulint = 14;
+pub const PAGE_N_RECS: ulint = 16;
+pub const PAGE_MAX_TRX_ID: ulint = 18;
+pub const PAGE_LEVEL: ulint = 26;
+pub const PAGE_INDEX_ID: ulint = 28;
+
+pub const PAGE_HEAP_NO_INFIMUM: ulint = 0;
+pub const PAGE_HEAP_NO_SUPREMUM: ulint = 1;
+pub const PAGE_HEAP_NO_USER_LOW: ulint = 2;
+
+pub const PAGE_LEFT: ulint = 1;
+pub const PAGE_RIGHT: ulint = 2;
+pub const PAGE_SAME_REC: ulint = 3;
+pub const PAGE_SAME_PAGE: ulint = 4;
+pub const PAGE_NO_DIRECTION: ulint = 5;
+
+pub const trx_id_t = compat.ib_uint64_t;
+
 pub const page_zip_des_t = struct {};
 pub const dict_index_t = struct {};
 pub const dtuple_t = struct {};
@@ -26,10 +51,25 @@ pub const rec_t = struct {
     key: i64 = 0,
 };
 
+pub const PageHeader = struct {
+    n_dir_slots: ulint = 0,
+    heap_top: ulint = 0,
+    n_heap: ulint = 0,
+    free: ulint = 0,
+    garbage: ulint = 0,
+    last_insert: ulint = 0,
+    direction: ulint = PAGE_NO_DIRECTION,
+    n_direction: ulint = 0,
+    n_recs: ulint = 0,
+    max_trx_id: trx_id_t = 0,
+    level: ulint = 0,
+    index_id: compat.Dulint = .{ .high = 0, .low = 0 },
+};
+
 pub const page_t = struct {
+    header: PageHeader = .{},
     infimum: rec_t = .{ .is_infimum = true },
     supremum: rec_t = .{ .is_supremum = true },
-    n_recs: ulint = 0,
 };
 
 pub const buf_block_t = struct {
@@ -43,13 +83,14 @@ pub const page_cur_t = struct {
 };
 
 pub fn page_init(page: *page_t) void {
+    page.header = .{};
     page.infimum.is_infimum = true;
     page.supremum.is_supremum = true;
     page.infimum.prev = null;
     page.infimum.next = &page.supremum;
     page.supremum.prev = &page.infimum;
     page.supremum.next = null;
-    page.n_recs = 0;
+    page.header.n_recs = 0;
 }
 
 pub fn buf_block_get_frame(block: *const buf_block_t) *page_t {
@@ -82,6 +123,74 @@ pub fn page_rec_get_next(rec: *rec_t) *rec_t {
 
 pub fn page_rec_get_prev(rec: *rec_t) *rec_t {
     return rec.prev orelse rec;
+}
+
+pub fn page_align(ptr: *const anyopaque) *page_t {
+    return @ptrCast(@alignCast(ptr));
+}
+
+pub fn page_offset(ptr: *const anyopaque) ulint {
+    _ = ptr;
+    return 0;
+}
+
+pub fn page_get_max_trx_id(page: *const page_t) trx_id_t {
+    return page.header.max_trx_id;
+}
+
+pub fn page_set_max_trx_id(block: *buf_block_t, page_zip: ?*page_zip_des_t, trx_id: trx_id_t, mtr: *mtr_t) void {
+    _ = page_zip;
+    _ = mtr;
+    block.frame.header.max_trx_id = trx_id;
+}
+
+pub fn page_update_max_trx_id(block: *buf_block_t, page_zip: ?*page_zip_des_t, trx_id: trx_id_t, mtr: *mtr_t) void {
+    _ = page_zip;
+    _ = mtr;
+    if (trx_id > block.frame.header.max_trx_id) {
+        block.frame.header.max_trx_id = trx_id;
+    }
+}
+
+pub fn page_header_get_field(page: *const page_t, field: ulint) ulint {
+    return switch (field) {
+        PAGE_N_DIR_SLOTS => page.header.n_dir_slots,
+        PAGE_HEAP_TOP => page.header.heap_top,
+        PAGE_N_HEAP => page.header.n_heap,
+        PAGE_FREE => page.header.free,
+        PAGE_GARBAGE => page.header.garbage,
+        PAGE_LAST_INSERT => page.header.last_insert,
+        PAGE_DIRECTION => page.header.direction,
+        PAGE_N_DIRECTION => page.header.n_direction,
+        PAGE_N_RECS => page.header.n_recs,
+        PAGE_LEVEL => page.header.level,
+        PAGE_INDEX_ID => page.header.index_id.low,
+        PAGE_MAX_TRX_ID => @as(ulint, @intCast(page.header.max_trx_id & 0xFFFF_FFFF)),
+        else => 0,
+    };
+}
+
+pub fn page_header_set_field(page: *page_t, page_zip: ?*page_zip_des_t, field: ulint, val: ulint) void {
+    _ = page_zip;
+    switch (field) {
+        PAGE_N_DIR_SLOTS => page.header.n_dir_slots = val,
+        PAGE_HEAP_TOP => page.header.heap_top = val,
+        PAGE_N_HEAP => page.header.n_heap = val,
+        PAGE_FREE => page.header.free = val,
+        PAGE_GARBAGE => page.header.garbage = val,
+        PAGE_LAST_INSERT => page.header.last_insert = val,
+        PAGE_DIRECTION => page.header.direction = val,
+        PAGE_N_DIRECTION => page.header.n_direction = val,
+        PAGE_N_RECS => page.header.n_recs = val,
+        PAGE_LEVEL => page.header.level = val,
+        PAGE_INDEX_ID => page.header.index_id.low = val,
+        PAGE_MAX_TRX_ID => page.header.max_trx_id = @as(trx_id_t, @intCast(val)),
+        else => {},
+    }
+}
+
+pub fn page_header_get_offs(page: *const page_t, field: ulint) ulint {
+    return page_header_get_field(page, field);
 }
 
 pub fn page_cur_get_page(cur: *page_cur_t) ?*page_t {
@@ -166,7 +275,7 @@ pub fn page_cur_rec_insert(cursor: *page_cur_t, rec: *rec_t, index: *dict_index_
         nxt.prev = rec;
     }
     if (cursor.block) |block| {
-        block.frame.n_recs += 1;
+        block.frame.header.n_recs += 1;
     }
     return rec;
 }
@@ -209,7 +318,7 @@ pub fn page_copy_rec_list_end_to_created_page(new_page: *page_t, rec: *rec_t, in
         copy.next = sup;
         prev.next = copy;
         sup.prev = copy;
-        new_page.n_recs += 1;
+        new_page.header.n_recs += 1;
         current = node.next;
     }
 }
@@ -230,8 +339,8 @@ pub fn page_cur_delete_rec(cursor: *page_cur_t, index: *dict_index_t, offsets: *
         nxt.prev = current.prev;
     }
     if (cursor.block) |block| {
-        if (block.frame.n_recs > 0) {
-            block.frame.n_recs -= 1;
+        if (block.frame.header.n_recs > 0) {
+            block.frame.header.n_recs -= 1;
         }
     }
     cursor.rec = next;
@@ -305,6 +414,153 @@ pub fn page_cur_parse_delete_rec(ptr: [*]byte, end_ptr: [*]byte, block: ?*buf_bl
     return ptr;
 }
 
+pub fn page_mem_alloc_heap(page: *page_t, page_zip: ?*page_zip_des_t, need: ulint, heap_no: *ulint) ?[*]byte {
+    _ = page_zip;
+    if (need == 0) {
+        heap_no.* = 0;
+        return null;
+    }
+    const buf = std.heap.page_allocator.alloc(byte, need) catch return null;
+    heap_no.* = page.header.n_heap;
+    page.header.n_heap += 1;
+    return buf.ptr;
+}
+
+pub fn page_mem_free(page: *page_t, page_zip: ?*page_zip_des_t, rec: *rec_t, index: *dict_index_t, offsets: *const ulint) void {
+    _ = page;
+    _ = page_zip;
+    _ = rec;
+    _ = index;
+    _ = offsets;
+}
+
+pub fn page_create(block: *buf_block_t, mtr: *mtr_t, comp: ulint) *page_t {
+    _ = mtr;
+    _ = comp;
+    page_init(block.frame);
+    return block.frame;
+}
+
+pub fn page_create_zip(block: *buf_block_t, index: *dict_index_t, level: ulint, mtr: *mtr_t) *page_t {
+    _ = index;
+    _ = mtr;
+    page_init(block.frame);
+    block.frame.header.level = level;
+    return block.frame;
+}
+
+pub fn page_copy_rec_list_end_no_locks(new_block: *buf_block_t, block: *buf_block_t, rec: *rec_t, index: *dict_index_t, mtr: *mtr_t) void {
+    _ = block;
+    page_copy_rec_list_end_to_created_page(new_block.frame, rec, index, mtr);
+}
+
+pub fn page_copy_rec_list_end(new_block: *buf_block_t, block: *buf_block_t, rec: *rec_t, index: *dict_index_t, mtr: *mtr_t) ?*rec_t {
+    page_copy_rec_list_end_no_locks(new_block, block, rec, index, mtr);
+    return new_block.frame.infimum.next;
+}
+
+pub fn page_copy_rec_list_start(new_block: *buf_block_t, block: *buf_block_t, rec: *rec_t, index: *dict_index_t, mtr: *mtr_t) ?*rec_t {
+    _ = index;
+    _ = mtr;
+    var current = block.frame.infimum.next;
+    while (current) |node| {
+        if (node == rec or node.is_supremum) {
+            break;
+        }
+        const copy = std.heap.page_allocator.create(rec_t) catch break;
+        copy.* = .{ .key = node.key };
+        const sup = &new_block.frame.supremum;
+        const prev = sup.prev orelse &new_block.frame.infimum;
+        copy.prev = prev;
+        copy.next = sup;
+        prev.next = copy;
+        sup.prev = copy;
+        new_block.frame.header.n_recs += 1;
+        current = node.next;
+    }
+    return new_block.frame.supremum.prev;
+}
+
+pub fn page_get_middle_rec(page: *page_t) ?*rec_t {
+    if (page.header.n_recs == 0) {
+        return null;
+    }
+    const target = page.header.n_recs / 2;
+    var idx: ulint = 0;
+    var current = page.infimum.next;
+    while (current) |node| {
+        if (node.is_supremum) {
+            return null;
+        }
+        if (idx == target) {
+            return node;
+        }
+        idx += 1;
+        current = node.next;
+    }
+    return null;
+}
+
+pub fn page_rec_get_n_recs_before(page: *page_t, rec: *rec_t) ulint {
+    var count: ulint = 0;
+    var current = page.infimum.next;
+    while (current) |node| {
+        if (node == rec or node.is_supremum) {
+            break;
+        }
+        count += 1;
+        current = node.next;
+    }
+    return count;
+}
+
+pub fn page_rec_validate(rec: *rec_t, offsets: *const ulint) ibool {
+    _ = offsets;
+    if (rec.is_infimum or rec.is_supremum) {
+        return compat.TRUE;
+    }
+    if (rec.prev == null or rec.next == null) {
+        return compat.FALSE;
+    }
+    return compat.TRUE;
+}
+
+pub fn page_check_dir(page: *const page_t) void {
+    _ = page;
+}
+
+pub fn page_simple_validate_old(page: *page_t) ibool {
+    _ = page;
+    return compat.TRUE;
+}
+
+pub fn page_simple_validate_new(page: *page_t) ibool {
+    _ = page;
+    return compat.TRUE;
+}
+
+pub fn page_validate(page: *page_t, index: *dict_index_t) ibool {
+    _ = page;
+    _ = index;
+    return compat.TRUE;
+}
+
+pub fn page_find_rec_with_heap_no(page: *page_t, heap_no: ulint) ?*rec_t {
+    var count: ulint = 0;
+    var current = page.infimum.next;
+    while (current) |node| {
+        if (node.is_supremum) {
+            break;
+        }
+        if (count == heap_no) {
+            return node;
+        }
+        count += 1;
+        current = node.next;
+    }
+    return null;
+}
+
 test "page cursor movement and insert/delete" {
     var page = page_t{};
     page_init(&page);
@@ -319,13 +575,13 @@ test "page cursor movement and insert/delete" {
 
     var rec1 = rec_t{ .key = 10 };
     _ = page_cur_rec_insert(&cursor, &rec1, &index, &offsets, &mtr);
-    try std.testing.expectEqual(@as(ulint, 1), page.n_recs);
+    try std.testing.expectEqual(@as(ulint, 1), page.header.n_recs);
 
     page_cur_move_to_next(&cursor);
     try std.testing.expect(cursor.rec == &rec1);
 
     page_cur_delete_rec(&cursor, &index, &offsets, &mtr);
-    try std.testing.expectEqual(@as(ulint, 0), page.n_recs);
+    try std.testing.expectEqual(@as(ulint, 0), page.header.n_recs);
     try std.testing.expect(page_cur_is_after_last(&cursor) == compat.TRUE);
 }
 
@@ -349,13 +605,13 @@ test "page copy rec list end" {
     rec2.next = sup;
     page.infimum.next = rec1;
     sup.prev = rec2;
-    page.n_recs = 2;
+    page.header.n_recs = 2;
 
     var new_page = page_t{};
     page_init(&new_page);
     page_copy_rec_list_end_to_created_page(&new_page, rec1, &index, &mtr);
 
-    try std.testing.expectEqual(@as(ulint, 2), new_page.n_recs);
+    try std.testing.expectEqual(@as(ulint, 2), new_page.header.n_recs);
     try std.testing.expect(new_page.infimum.next != &new_page.supremum);
 
     var node = new_page.infimum.next;
@@ -384,8 +640,53 @@ test "page cursor open on rnd user rec" {
     rec1.prev = &page.infimum;
     rec1.next = &page.supremum;
     page.supremum.prev = &rec1;
-    page.n_recs = 1;
+    page.header.n_recs = 1;
 
     page_cur_open_on_rnd_user_rec(&block, &cursor);
     try std.testing.expect(cursor.rec == &rec1);
+}
+
+test "page header fields and create" {
+    var page = page_t{};
+    page_init(&page);
+    page_header_set_field(&page, null, PAGE_N_RECS, 7);
+    page_header_set_field(&page, null, PAGE_DIRECTION, PAGE_RIGHT);
+    try std.testing.expectEqual(@as(ulint, 7), page_header_get_field(&page, PAGE_N_RECS));
+    try std.testing.expectEqual(@as(ulint, PAGE_RIGHT), page_header_get_field(&page, PAGE_DIRECTION));
+
+    var block = buf_block_t{ .frame = &page };
+    var mtr = mtr_t{};
+    page_set_max_trx_id(&block, null, 123, &mtr);
+    try std.testing.expectEqual(@as(trx_id_t, 123), page_get_max_trx_id(&page));
+    page_update_max_trx_id(&block, null, 100, &mtr);
+    try std.testing.expectEqual(@as(trx_id_t, 123), page_get_max_trx_id(&page));
+    page_update_max_trx_id(&block, null, 200, &mtr);
+    try std.testing.expectEqual(@as(trx_id_t, 200), page_get_max_trx_id(&page));
+
+    _ = page_create(&block, &mtr, 0);
+    try std.testing.expectEqual(@as(ulint, 0), page.header.n_recs);
+    try std.testing.expect(page.infimum.next == &page.supremum);
+}
+
+test "page middle rec and count" {
+    var page = page_t{};
+    page_init(&page);
+
+    var rec1 = rec_t{ .key = 1 };
+    var rec2 = rec_t{ .key = 2 };
+    var rec3 = rec_t{ .key = 3 };
+
+    page.infimum.next = &rec1;
+    rec1.prev = &page.infimum;
+    rec1.next = &rec2;
+    rec2.prev = &rec1;
+    rec2.next = &rec3;
+    rec3.prev = &rec2;
+    rec3.next = &page.supremum;
+    page.supremum.prev = &rec3;
+    page.header.n_recs = 3;
+
+    const middle = page_get_middle_rec(&page) orelse return error.TestExpectedEqual;
+    try std.testing.expect(middle == &rec2);
+    try std.testing.expectEqual(@as(ulint, 2), page_rec_get_n_recs_before(&page, &rec3));
 }
