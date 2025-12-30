@@ -38,6 +38,11 @@ pub const BTR_IGNORE_SEC_UNIQUE: ulint = 2048;
 pub const BTR_NO_UNDO_LOG_FLAG: ulint = 1;
 pub const BTR_NO_LOCKING_FLAG: ulint = 2;
 pub const BTR_KEEP_SYS_FLAG: ulint = 4;
+pub const BTR_PCUR_ON: ulint = 1;
+pub const BTR_PCUR_BEFORE: ulint = 2;
+pub const BTR_PCUR_AFTER: ulint = 3;
+pub const BTR_PCUR_BEFORE_FIRST_IN_TREE: ulint = 4;
+pub const BTR_PCUR_AFTER_LAST_IN_TREE: ulint = 5;
 
 pub var btr_cur_print_record_ops: ibool = compat.FALSE;
 pub var btr_cur_n_non_sea: ulint = 0;
@@ -73,6 +78,12 @@ pub const btr_cur_t = struct {
     rec: ?*rec_t = null,
     block: ?*buf_block_t = null,
     opened: bool = false,
+};
+
+pub const btr_pcur_t = struct {
+    btr_cur: btr_cur_t = .{},
+    rel_pos: ulint = 0,
+    stored: bool = false,
 };
 
 pub const dtuple_t = struct {};
@@ -658,6 +669,83 @@ pub fn btr_rec_copy_externally_stored_field(
     return null;
 }
 
+pub fn btr_pcur_create() ?*btr_pcur_t {
+    const cursor = std.heap.page_allocator.create(btr_pcur_t) catch return null;
+    cursor.* = btr_pcur_t{};
+    return cursor;
+}
+
+pub fn btr_pcur_free(cursor: ?*btr_pcur_t) void {
+    if (cursor) |pcur| {
+        std.heap.page_allocator.destroy(pcur);
+    }
+}
+
+pub fn btr_pcur_copy_stored_position(pcur_receive: *btr_pcur_t, pcur_donate: *btr_pcur_t) void {
+    pcur_receive.rel_pos = pcur_donate.rel_pos;
+    pcur_receive.stored = pcur_donate.stored;
+}
+
+pub fn btr_pcur_open_on_user_rec_func(
+    index: *dict_index_t,
+    tuple: *const dtuple_t,
+    mode: ulint,
+    latch_mode: ulint,
+    cursor: *btr_pcur_t,
+    file: []const u8,
+    line: ulint,
+    mtr: *mtr_t,
+) void {
+    _ = tuple;
+    _ = mode;
+    _ = latch_mode;
+    _ = file;
+    _ = line;
+    _ = mtr;
+    cursor.btr_cur.index = index;
+    cursor.btr_cur.rec = null;
+    cursor.btr_cur.block = null;
+    cursor.btr_cur.opened = true;
+    cursor.rel_pos = BTR_PCUR_ON;
+    cursor.stored = false;
+}
+
+pub fn btr_pcur_store_position(cursor: *btr_pcur_t, mtr: *mtr_t) void {
+    _ = mtr;
+    cursor.rel_pos = BTR_PCUR_ON;
+    cursor.stored = true;
+}
+
+pub fn btr_pcur_restore_position_func(
+    latch_mode: ulint,
+    cursor: *btr_pcur_t,
+    file: []const u8,
+    line: ulint,
+    mtr: *mtr_t,
+) ibool {
+    _ = latch_mode;
+    _ = file;
+    _ = line;
+    _ = mtr;
+    cursor.btr_cur.opened = true;
+    return if (cursor.stored) compat.TRUE else compat.FALSE;
+}
+
+pub fn btr_pcur_release_leaf(cursor: *btr_pcur_t, mtr: *mtr_t) void {
+    _ = cursor;
+    _ = mtr;
+}
+
+pub fn btr_pcur_move_to_next_page(cursor: *btr_pcur_t, mtr: *mtr_t) void {
+    _ = mtr;
+    cursor.rel_pos = BTR_PCUR_AFTER;
+}
+
+pub fn btr_pcur_move_backward_from_page(cursor: *btr_pcur_t, mtr: *mtr_t) void {
+    _ = mtr;
+    cursor.rel_pos = BTR_PCUR_BEFORE;
+}
+
 test "btr prev and next user record stubs" {
     var a = rec_t{};
     var b = rec_t{};
@@ -725,4 +813,36 @@ test "btr external field prefix copy" {
     const copied = btr_copy_externally_stored_field_prefix(buf[0..].ptr, 5, 0, data[0..].ptr, 3);
     try std.testing.expectEqual(@as(ulint, 3), copied);
     try std.testing.expectEqualStrings("abc", buf[0..3]);
+}
+
+test "btr persistent cursor state" {
+    const pcur = btr_pcur_create() orelse return error.OutOfMemory;
+    defer btr_pcur_free(pcur);
+
+    try std.testing.expect(!pcur.stored);
+
+    var index = dict_index_t{};
+    var tuple = dtuple_t{};
+    var mtr = mtr_t{};
+
+    btr_pcur_open_on_user_rec_func(&index, &tuple, 0, 0, pcur, "file", 1, &mtr);
+    try std.testing.expect(pcur.btr_cur.opened);
+    try std.testing.expectEqual(@as(ulint, BTR_PCUR_ON), pcur.rel_pos);
+
+    btr_pcur_store_position(pcur, &mtr);
+    try std.testing.expect(pcur.stored);
+
+    const restored = btr_pcur_restore_position_func(0, pcur, "file", 2, &mtr);
+    try std.testing.expectEqual(compat.TRUE, restored);
+
+    btr_pcur_move_to_next_page(pcur, &mtr);
+    try std.testing.expectEqual(@as(ulint, BTR_PCUR_AFTER), pcur.rel_pos);
+
+    btr_pcur_move_backward_from_page(pcur, &mtr);
+    try std.testing.expectEqual(@as(ulint, BTR_PCUR_BEFORE), pcur.rel_pos);
+
+    var other = btr_pcur_t{};
+    btr_pcur_copy_stored_position(&other, pcur);
+    try std.testing.expectEqual(pcur.rel_pos, other.rel_pos);
+    try std.testing.expect(other.stored);
 }
