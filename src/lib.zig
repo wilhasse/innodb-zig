@@ -7,6 +7,7 @@ pub const mem = @import("mem/mod.zig");
 pub const os = @import("os/mod.zig");
 pub const sync = @import("sync/mod.zig");
 pub const thr = @import("thr/mod.zig");
+pub const api = @import("api/mod.zig").impl;
 pub const BuildOptions = build_options;
 
 comptime {
