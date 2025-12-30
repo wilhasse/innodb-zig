@@ -59,6 +59,7 @@ pub const rec_t = struct {
     next: ?*rec_t = null,
     is_infimum: bool = false,
     is_supremum: bool = false,
+    deleted: bool = false,
     key: i64 = 0,
 };
 
