@@ -6,4 +6,5 @@ pub const errors = @import("errors.zig");
 pub const log = @import("log.zig");
 pub const c_tests = @import("c_tests.zig");
 pub const docs = @import("docs.zig");
+pub const list = @import("list.zig");
 pub const rnd = @import("rnd.zig");
