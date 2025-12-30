@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const log = @import("../ut/log.zig");
+const rnd = @import("../ut/rnd.zig");
 
 pub const module_name = "ha";
 
@@ -15,15 +16,237 @@ pub const ha_node_t = struct {
     fold: ulint = 0,
 };
 
-pub const hash_table_t = struct {
-    map: std.AutoHashMap(ulint, *ha_node_t),
-    n_cells: ulint = 0,
-    n_mutexes: ulint = 0,
+pub const hash_cell_t = struct {
+    node: ?*anyopaque = null,
 };
 
+pub const HASH_TABLE_MAGIC_N: ulint = 76561114;
+
+pub const hash_table_t = struct {
+    n_cells: ulint,
+    array: []hash_cell_t,
+    n_mutexes: ulint = 0,
+    mutexes: ?[]std.Thread.Mutex = null,
+    heaps: ?[]*anyopaque = null,
+    heap: ?*anyopaque = null,
+    magic_n: ulint = HASH_TABLE_MAGIC_N,
+};
+
+pub fn hash_get_nth_cell(table: *hash_table_t, n: ulint) *hash_cell_t {
+    std.debug.assert(n < table.n_cells);
+    return &table.array[@as(usize, @intCast(n))];
+}
+
+pub fn hash_table_clear(table: *hash_table_t) void {
+    for (table.array) |*cell| {
+        cell.node = null;
+    }
+}
+
+pub fn hash_get_n_cells(table: *hash_table_t) ulint {
+    return table.n_cells;
+}
+
+pub fn hash_calc_hash(fold: ulint, table: *hash_table_t) ulint {
+    return rnd.ut_hash_ulint(fold, table.n_cells);
+}
+
+pub fn hash_create(n: ulint) ?*hash_table_t {
+    const prime = rnd.ut_find_prime(n);
+    const table = std.heap.page_allocator.create(hash_table_t) catch return null;
+    const array = std.heap.page_allocator.alloc(hash_cell_t, @as(usize, @intCast(prime))) catch {
+        std.heap.page_allocator.destroy(table);
+        return null;
+    };
+    for (array) |*cell| {
+        cell.* = .{};
+    }
+    table.* = .{
+        .n_cells = prime,
+        .array = array,
+        .magic_n = HASH_TABLE_MAGIC_N,
+    };
+    return table;
+}
+
+pub fn hash_table_free(table: *hash_table_t) void {
+    hash_free_mutexes_func(table);
+    if (table.heaps) |heaps| {
+        std.heap.page_allocator.free(heaps);
+        table.heaps = null;
+    }
+    std.heap.page_allocator.free(table.array);
+    std.heap.page_allocator.destroy(table);
+}
+
+pub fn hash_create_mutexes_func(table: *hash_table_t, n_mutexes: ulint) ibool {
+    std.debug.assert(n_mutexes > 0);
+    std.debug.assert(compat.ut_is_2pow(n_mutexes));
+
+    const mutexes = std.heap.page_allocator.alloc(
+        std.Thread.Mutex,
+        @as(usize, @intCast(n_mutexes)),
+    ) catch return compat.FALSE;
+    for (mutexes) |*mutex| {
+        mutex.* = .{};
+    }
+    table.mutexes = mutexes;
+    table.n_mutexes = n_mutexes;
+    return compat.TRUE;
+}
+
+pub fn hash_free_mutexes_func(table: *hash_table_t) void {
+    if (table.mutexes) |mutexes| {
+        std.heap.page_allocator.free(mutexes);
+        table.mutexes = null;
+    }
+    table.n_mutexes = 0;
+}
+
+pub fn hash_get_mutex_no(table: *hash_table_t, fold: ulint) ulint {
+    std.debug.assert(compat.ut_is_2pow(table.n_mutexes));
+    return compat.ut_2pow_remainder(hash_calc_hash(fold, table), table.n_mutexes);
+}
+
+pub fn hash_get_nth_mutex(table: *hash_table_t, i: ulint) *std.Thread.Mutex {
+    std.debug.assert(i < table.n_mutexes);
+    return &table.mutexes.?[@as(usize, @intCast(i))];
+}
+
+pub fn hash_get_mutex(table: *hash_table_t, fold: ulint) *std.Thread.Mutex {
+    const i = hash_get_mutex_no(table, fold);
+    return hash_get_nth_mutex(table, i);
+}
+
+pub fn hash_mutex_enter(table: *hash_table_t, fold: ulint) void {
+    if (table.mutexes != null) {
+        hash_get_mutex(table, fold).lock();
+    }
+}
+
+pub fn hash_mutex_exit(table: *hash_table_t, fold: ulint) void {
+    if (table.mutexes != null) {
+        hash_get_mutex(table, fold).unlock();
+    }
+}
+
+pub fn hash_mutex_enter_all(table: *hash_table_t) void {
+    if (table.mutexes) |mutexes| {
+        for (mutexes) |*mutex| {
+            mutex.lock();
+        }
+    }
+}
+
+pub fn hash_mutex_exit_all(table: *hash_table_t) void {
+    if (table.mutexes) |mutexes| {
+        for (mutexes) |*mutex| {
+            mutex.unlock();
+        }
+    }
+}
+
+pub fn hash_insert(
+    comptime T: type,
+    comptime next_field: []const u8,
+    table: *hash_table_t,
+    fold: ulint,
+    node: *T,
+) void {
+    @field(node, next_field) = null;
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    if (cell.node == null) {
+        cell.node = @ptrCast(node);
+        return;
+    }
+    var cur: *T = @ptrCast(@alignCast(cell.node.?));
+    while (true) {
+        const next_opt = @field(cur, next_field);
+        if (next_opt) |next| {
+            cur = next;
+        } else {
+            @field(cur, next_field) = node;
+            return;
+        }
+    }
+}
+
+pub fn hash_delete(
+    comptime T: type,
+    comptime next_field: []const u8,
+    table: *hash_table_t,
+    fold: ulint,
+    node: *T,
+) void {
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    if (cell.node == null) {
+        return;
+    }
+    const head: *T = @ptrCast(@alignCast(cell.node.?));
+    if (head == node) {
+        cell.node = if (@field(node, next_field)) |next| @ptrCast(next) else null;
+        return;
+    }
+    var cur: *T = head;
+    while (true) {
+        const next_opt = @field(cur, next_field) orelse return;
+        if (next_opt == node) {
+            @field(cur, next_field) = @field(node, next_field);
+            return;
+        }
+        cur = next_opt;
+    }
+}
+
+pub fn hash_search(
+    comptime T: type,
+    comptime next_field: []const u8,
+    table: *hash_table_t,
+    fold: ulint,
+    test_fn: anytype,
+) ?*T {
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    var cur_opt: ?*anyopaque = cell.node;
+    while (cur_opt) |ptr| {
+        const cur: *T = @ptrCast(@alignCast(ptr));
+        if (test_fn(cur)) {
+            return cur;
+        }
+        const next_opt = @field(cur, next_field);
+        cur_opt = if (next_opt) |next| @ptrCast(next) else null;
+    }
+    return null;
+}
+
+pub fn hash_search_all(
+    comptime T: type,
+    comptime next_field: []const u8,
+    table: *hash_table_t,
+    test_fn: anytype,
+) ?*T {
+    var i: ulint = 0;
+    while (i < table.n_cells) : (i += 1) {
+        var cur_opt: ?*anyopaque = table.array[@as(usize, @intCast(i))].node;
+        while (cur_opt) |ptr| {
+            const cur: *T = @ptrCast(@alignCast(ptr));
+            if (test_fn(cur)) {
+                return cur;
+            }
+            const next_opt = @field(cur, next_field);
+            cur_opt = if (next_opt) |next| @ptrCast(next) else null;
+        }
+    }
+    return null;
+}
+
 pub fn ha_search_and_get_data(table: *hash_table_t, fold: ulint) ?*anyopaque {
-    if (table.map.get(fold)) |node| {
-        return node.data;
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    var node_opt: ?*ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    while (node_opt) |node| {
+        if (node.fold == fold) {
+            return node.data;
+        }
+        node_opt = node.next;
     }
     return null;
 }
@@ -34,65 +257,93 @@ pub fn ha_search_and_update_if_found_func(
     data: *anyopaque,
     new_data: *anyopaque,
 ) void {
-    if (table.map.get(fold)) |node| {
-        if (node.data == data) {
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    var node_opt: ?*ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    while (node_opt) |node| {
+        if (node.fold == fold and node.data == data) {
             node.data = new_data;
+            return;
         }
+        node_opt = node.next;
     }
 }
 
 pub fn ha_create_func(n: ulint, n_mutexes: ulint) ?*hash_table_t {
-    const table = std.heap.page_allocator.create(hash_table_t) catch return null;
-    table.* = .{
-        .map = std.AutoHashMap(ulint, *ha_node_t).init(std.heap.page_allocator),
-        .n_cells = n,
-        .n_mutexes = n_mutexes,
-    };
+    const table = hash_create(n) orelse return null;
+    if (n_mutexes > 0) {
+        if (hash_create_mutexes_func(table, n_mutexes) == compat.FALSE) {
+            hash_table_free(table);
+            return null;
+        }
+    }
     return table;
 }
 
 pub fn ha_clear(table: *hash_table_t) void {
-    var it = table.map.valueIterator();
-    while (it.next()) |node| {
-        std.heap.page_allocator.destroy(node.*);
+    for (table.array) |*cell| {
+        var node_opt: ?*ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        while (node_opt) |node| {
+            const next = node.next;
+            std.heap.page_allocator.destroy(node);
+            node_opt = next;
+        }
+        cell.node = null;
     }
-    table.map.clearAndFree();
 }
 
 pub fn ha_insert_for_fold_func(table: *hash_table_t, fold: ulint, data: *anyopaque) ibool {
-    if (table.map.get(fold)) |node| {
-        node.data = data;
-        return compat.TRUE;
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    var node_opt: ?*ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    while (node_opt) |node| {
+        if (node.fold == fold) {
+            node.data = data;
+            return compat.TRUE;
+        }
+        node_opt = node.next;
     }
+
     const node = std.heap.page_allocator.create(ha_node_t) catch return compat.FALSE;
     node.* = .{
         .data = data,
         .fold = fold,
     };
-    table.map.put(fold, node) catch {
-        std.heap.page_allocator.destroy(node);
-        return compat.FALSE;
-    };
+    hash_insert(ha_node_t, "next", table, fold, node);
     return compat.TRUE;
 }
 
 pub fn ha_search_and_delete_if_found(table: *hash_table_t, fold: ulint, data: *anyopaque) ibool {
-    if (table.map.get(fold)) |node| {
-        if (node.data == data) {
-            _ = table.map.remove(fold);
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    if (cell.node == null) {
+        return compat.FALSE;
+    }
+    var node_opt: ?*ha_node_t = @ptrCast(@alignCast(cell.node.?));
+    var prev: ?*ha_node_t = null;
+    while (node_opt) |node| {
+        if (node.fold == fold and node.data == data) {
+            if (prev) |prev_node| {
+                prev_node.next = node.next;
+            } else {
+                cell.node = if (node.next) |next| @ptrCast(next) else null;
+            }
             std.heap.page_allocator.destroy(node);
             return compat.TRUE;
         }
+        prev = node;
+        node_opt = node.next;
     }
     return compat.FALSE;
 }
 
 pub fn ha_remove_all_nodes_to_page(table: *hash_table_t, fold: ulint, page: *const anyopaque) void {
     _ = page;
-    if (table.map.get(fold)) |node| {
-        _ = table.map.remove(fold);
+    const cell = hash_get_nth_cell(table, hash_calc_hash(fold, table));
+    var node_opt: ?*ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    while (node_opt) |node| {
+        const next = node.next;
         std.heap.page_allocator.destroy(node);
+        node_opt = next;
     }
+    cell.node = null;
 }
 
 pub fn ha_validate(table: *hash_table_t, start_index: ulint, end_index: ulint) ibool {
@@ -104,7 +355,14 @@ pub fn ha_validate(table: *hash_table_t, start_index: ulint, end_index: ulint) i
 
 pub fn ha_print_info(ib_stream: ib_stream_t, table: *hash_table_t) void {
     _ = ib_stream;
-    const count = table.map.count();
+    var count: usize = 0;
+    for (table.array) |cell| {
+        var node_opt: ?*ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        while (node_opt) |node| {
+            count += 1;
+            node_opt = node.next;
+        }
+    }
     log.logf("ha: entries={d}\n", .{count});
 }
 
@@ -206,7 +464,7 @@ test "ha insert/search/update/delete" {
     const table = ha_create_func(8, 0) orelse return error.OutOfMemory;
     defer {
         ha_clear(table);
-        std.heap.page_allocator.destroy(table);
+        hash_table_free(table);
     }
 
     var value1: u32 = 10;
@@ -222,6 +480,62 @@ test "ha insert/search/update/delete" {
 
     try std.testing.expect(ha_search_and_delete_if_found(table, 5, ptr2) == compat.TRUE);
     try std.testing.expect(ha_search_and_get_data(table, 5) == null);
+}
+
+test "hash insert/search/delete" {
+    const table = hash_create(7) orelse return error.OutOfMemory;
+    defer hash_table_free(table);
+
+    var node1 = ha_node_t{ .fold = 11 };
+    var node2 = ha_node_t{ .fold = 11 };
+    var node3 = ha_node_t{ .fold = 13 };
+
+    hash_insert(ha_node_t, "next", table, node1.fold, &node1);
+    hash_insert(ha_node_t, "next", table, node2.fold, &node2);
+    hash_insert(ha_node_t, "next", table, node3.fold, &node3);
+
+    try std.testing.expect(node1.next == &node2);
+
+    const found = hash_search(
+        ha_node_t,
+        "next",
+        table,
+        13,
+        struct {
+            fn predicate(node: *ha_node_t) bool {
+                return node.fold == 13;
+            }
+        }.predicate,
+    );
+    try std.testing.expect(found == &node3);
+
+    hash_delete(ha_node_t, "next", table, 13, &node3);
+    const missing = hash_search(
+        ha_node_t,
+        "next",
+        table,
+        13,
+        struct {
+            fn predicate(node: *ha_node_t) bool {
+                return node.fold == 13;
+            }
+        }.predicate,
+    );
+    try std.testing.expect(missing == null);
+
+    hash_table_clear(table);
+    const after_clear = hash_search_all(
+        ha_node_t,
+        "next",
+        table,
+        struct {
+            fn predicate(node: *ha_node_t) bool {
+                _ = node;
+                return true;
+            }
+        }.predicate,
+    );
+    try std.testing.expect(after_clear == null);
 }
 
 test "ha storage deduplicates data" {

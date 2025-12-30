@@ -93,6 +93,14 @@ pub inline fn isAligned(value: usize, alignment: usize) bool {
     return (value & (alignment - 1)) == 0;
 }
 
+pub inline fn ut_is_2pow(n: ulint) bool {
+    return (n & (n -% 1)) == 0;
+}
+
+pub inline fn ut_2pow_remainder(n: ulint, m: ulint) ulint {
+    return n & (m -% 1);
+}
+
 pub inline fn arrSize(arr: anytype) comptime_int {
     return switch (@typeInfo(@TypeOf(arr))) {
         .array => |info| info.len,
@@ -122,6 +130,14 @@ test "compat alignment helpers" {
     try std.testing.expect(alignDown(5, 4) == 4);
     try std.testing.expect(isAligned(8, 4));
     try std.testing.expect(!isAligned(6, 4));
+}
+
+test "compat power-of-two helpers" {
+    try std.testing.expect(ut_is_2pow(0));
+    try std.testing.expect(ut_is_2pow(1));
+    try std.testing.expect(ut_is_2pow(2));
+    try std.testing.expect(!ut_is_2pow(3));
+    try std.testing.expect(ut_2pow_remainder(13, 8) == 5);
 }
 
 test "compat arrSize" {
