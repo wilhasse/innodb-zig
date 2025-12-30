@@ -3,6 +3,7 @@ const os_thread = @import("../os/thread.zig");
 
 pub const module_name = "sync";
 pub const arr = @import("arr.zig");
+pub const rw = @import("rw.zig");
 
 pub const Mutex = struct {
     inner: std.Thread.Mutex = .{},
@@ -78,11 +79,11 @@ test "mutex lock/unlock" {
 }
 
 test "rwlock shared/exclusive" {
-    var rw = RwLock.init();
-    rw.lockShared();
-    rw.unlockShared();
-    rw.lock();
-    rw.unlock();
+    var rw_lock = RwLock.init();
+    rw_lock.lockShared();
+    rw_lock.unlockShared();
+    rw_lock.lock();
+    rw_lock.unlock();
 }
 
 test "condvar wait/signal" {
