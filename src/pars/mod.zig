@@ -3,6 +3,7 @@ const que = @import("../que/mod.zig");
 const row = @import("../row/mod.zig");
 
 pub const module_name = "pars";
+pub const lexer = @import("lexer.zig");
 
 pub const ulint = compat.ulint;
 pub const lint = compat.lint;
@@ -13,6 +14,9 @@ pub const PARS_FUNC_CMP: ulint = 3;
 pub const PARS_FUNC_PREDEFINED: ulint = 4;
 pub const PARS_FUNC_AGGREGATE: ulint = 5;
 
+pub const PARS_INT_LIT: i32 = 258;
+pub const PARS_STR_LIT: i32 = 260;
+pub const PARS_ID_TOKEN: i32 = 264;
 pub const PARS_AND_TOKEN: i32 = 265;
 pub const PARS_OR_TOKEN: i32 = 266;
 pub const PARS_NOT_TOKEN: i32 = 267;
