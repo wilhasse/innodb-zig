@@ -105,6 +105,36 @@ pub const IndexSchema = struct {
     trx: ib_trx_t,
 };
 
+const CatalogColumn = struct {
+    name: []u8,
+    col_type: ib_col_type_t,
+    attr: ib_col_attr_t,
+    len: ib_ulint_t,
+};
+
+const CatalogIndexColumn = struct {
+    name: []u8,
+    prefix_len: ib_ulint_t,
+};
+
+const CatalogIndex = struct {
+    name: []u8,
+    clustered: bool,
+    unique: bool,
+    id: ib_id_t,
+    columns: std.ArrayList(CatalogIndexColumn),
+};
+
+const CatalogTable = struct {
+    allocator: std.mem.Allocator,
+    name: []u8,
+    format: ib_tbl_fmt_t,
+    page_size: ib_ulint_t,
+    id: ib_id_t,
+    columns: std.ArrayList(CatalogColumn),
+    indexes: std.ArrayList(CatalogIndex),
+};
+
 pub const ib_trx_t = ?*Trx;
 pub const ib_crsr_t = ?*Cursor;
 pub const ib_tpl_t = ?*Tuple;
@@ -124,6 +154,58 @@ pub const IB_N_SYS_COLS: ib_u32_t = 3;
 pub const MAX_TEXT_LEN: ib_u32_t = 4096;
 pub const IB_MAX_COL_NAME_LEN: ib_u32_t = 64 * 3;
 pub const IB_MAX_TABLE_NAME_LEN: ib_u32_t = 64 * 3;
+
+pub const ib_schema_visitor_version_t = enum(u32) {
+    IB_SCHEMA_VISITOR_TABLE = 1,
+    IB_SCHEMA_VISITOR_TABLE_COL = 2,
+    IB_SCHEMA_VISITOR_TABLE_AND_INDEX = 3,
+    IB_SCHEMA_VISITOR_TABLE_AND_INDEX_COL = 4,
+};
+
+pub const ib_schema_visitor_table_all_t = *const fn (
+    arg: ib_opaque_t,
+    name: [*]const u8,
+    name_len: i32,
+) callconv(.C) i32;
+
+pub const ib_schema_visitor_table_t = *const fn (
+    arg: ib_opaque_t,
+    name: [*]const u8,
+    tbl_fmt: ib_tbl_fmt_t,
+    page_size: ib_ulint_t,
+    n_cols: i32,
+    n_indexes: i32,
+) callconv(.C) i32;
+
+pub const ib_schema_visitor_table_col_t = *const fn (
+    arg: ib_opaque_t,
+    name: [*]const u8,
+    col_type: ib_col_type_t,
+    len: ib_ulint_t,
+    attr: ib_col_attr_t,
+) callconv(.C) i32;
+
+pub const ib_schema_visitor_index_t = *const fn (
+    arg: ib_opaque_t,
+    name: [*]const u8,
+    clustered: ib_bool_t,
+    unique: ib_bool_t,
+    n_cols: i32,
+) callconv(.C) i32;
+
+pub const ib_schema_visitor_index_col_t = *const fn (
+    arg: ib_opaque_t,
+    name: [*]const u8,
+    prefix_len: ib_ulint_t,
+) callconv(.C) i32;
+
+pub const ib_schema_visitor_t = struct {
+    version: ib_schema_visitor_version_t,
+    table: ?ib_schema_visitor_table_t,
+    table_col: ?ib_schema_visitor_table_col_t,
+    index: ?ib_schema_visitor_index_t,
+    index_col: ?ib_schema_visitor_index_col_t,
+};
 
 pub const ib_trx_level_t = enum(u32) {
     IB_TRX_READ_UNCOMMITTED = 0,
@@ -265,6 +347,7 @@ const DbFormat = struct {
 var db_format: DbFormat = .{ .id = 0, .name = null };
 var next_table_id: ib_id_t = 1;
 var next_index_id: ib_id_t = 1;
+var table_registry = std.ArrayList(*CatalogTable).init(std.heap.page_allocator);
 
 pub fn ib_init() ib_err_t {
     return .DB_SUCCESS;
@@ -295,6 +378,9 @@ pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
     db_format.id = 0;
     db_format.name = null;
+    catalogClear();
+    next_table_id = 1;
+    next_index_id = 1;
     return .DB_SUCCESS;
 }
 
@@ -1127,6 +1213,152 @@ fn tableSchemaDestroy(schema: *TableSchema) void {
     schema.allocator.destroy(schema);
 }
 
+fn catalogIndexDestroy(index: *CatalogIndex, allocator: std.mem.Allocator) void {
+    for (index.columns.items) |col| {
+        allocator.free(col.name);
+    }
+    index.columns.deinit();
+    allocator.free(index.name);
+}
+
+fn catalogDestroy(table: *CatalogTable) void {
+    for (table.columns.items) |col| {
+        table.allocator.free(col.name);
+    }
+    table.columns.deinit();
+
+    for (table.indexes.items) |*idx| {
+        catalogIndexDestroy(idx, table.allocator);
+    }
+    table.indexes.deinit();
+
+    table.allocator.free(table.name);
+    table.allocator.destroy(table);
+}
+
+fn catalogClear() void {
+    for (table_registry.items) |table| {
+        catalogDestroy(table);
+    }
+    table_registry.clearAndFree();
+}
+
+fn catalogFindByName(name: []const u8) ?*CatalogTable {
+    for (table_registry.items) |table| {
+        if (schemaNameEq(table.name, name)) {
+            return table;
+        }
+    }
+    return null;
+}
+
+fn catalogRemoveByName(name: []const u8) bool {
+    for (table_registry.items, 0..) |table, idx| {
+        if (schemaNameEq(table.name, name)) {
+            catalogDestroy(table);
+            _ = table_registry.orderedRemove(idx);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn catalogCreateFromSchema(schema: *const TableSchema, id: ib_id_t) !*CatalogTable {
+    const allocator = std.heap.page_allocator;
+    const table = try allocator.create(CatalogTable);
+    const name_copy = try dupName(allocator, schema.name);
+
+    table.* = .{
+        .allocator = allocator,
+        .name = name_copy,
+        .format = schema.format,
+        .page_size = schema.page_size,
+        .id = id,
+        .columns = std.ArrayList(CatalogColumn).init(allocator),
+        .indexes = std.ArrayList(CatalogIndex).init(allocator),
+    };
+
+    errdefer catalogDestroy(table);
+
+    for (schema.columns.items) |col| {
+        const col_name = try dupName(allocator, col.name);
+        table.columns.append(.{
+            .name = col_name,
+            .col_type = col.col_type,
+            .attr = col.attr,
+            .len = col.len,
+        }) catch {
+            allocator.free(col_name);
+            return error.OutOfMemory;
+        };
+    }
+
+    for (schema.indexes.items) |idx| {
+        var catalog_index = CatalogIndex{
+            .name = try dupName(allocator, idx.name),
+            .clustered = idx.clustered,
+            .unique = idx.unique,
+            .id = 0,
+            .columns = std.ArrayList(CatalogIndexColumn).init(allocator),
+        };
+
+        var appended = false;
+        defer {
+            if (!appended) {
+                catalogIndexDestroy(&catalog_index, allocator);
+            }
+        }
+
+        for (idx.columns.items) |icol| {
+            const icol_name = try dupName(allocator, icol.name);
+            catalog_index.columns.append(.{
+                .name = icol_name,
+                .prefix_len = icol.prefix_len,
+            }) catch {
+                allocator.free(icol_name);
+                return error.OutOfMemory;
+            };
+        }
+
+        try table.indexes.append(catalog_index);
+        appended = true;
+    }
+
+    return table;
+}
+
+fn catalogAppendIndex(table: *CatalogTable, index: *const IndexSchema, id: ib_id_t) !void {
+    const allocator = table.allocator;
+    var catalog_index = CatalogIndex{
+        .name = try dupName(allocator, index.name),
+        .clustered = index.clustered,
+        .unique = index.unique,
+        .id = id,
+        .columns = std.ArrayList(CatalogIndexColumn).init(allocator),
+    };
+
+    var appended = false;
+    defer {
+        if (!appended) {
+            catalogIndexDestroy(&catalog_index, allocator);
+        }
+    }
+
+    for (index.columns.items) |icol| {
+        const icol_name = try dupName(allocator, icol.name);
+        catalog_index.columns.append(.{
+            .name = icol_name,
+            .prefix_len = icol.prefix_len,
+        }) catch {
+            allocator.free(icol_name);
+            return error.OutOfMemory;
+        };
+    }
+
+    try table.indexes.append(catalog_index);
+    appended = true;
+}
+
 pub fn ib_schema_lock_shared(ib_trx: ib_trx_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
     switch (trx.schema_lock) {
@@ -1355,6 +1587,10 @@ pub fn ib_index_schema_create(
         ib_idx_sch.* = null;
         return .DB_TABLE_NOT_FOUND;
     }
+    if (catalogFindByName(table_name) == null) {
+        ib_idx_sch.* = null;
+        return .DB_TABLE_NOT_FOUND;
+    }
 
     const allocator = std.heap.page_allocator;
     const index = allocator.create(IndexSchema) catch {
@@ -1422,6 +1658,10 @@ pub fn ib_table_create(ib_trx: ib_trx_t, ib_tbl_sch: ib_tbl_sch_t, id: *ib_id_t)
     }
 
     const schema = ib_tbl_sch orelse return .DB_ERROR;
+    if (catalogFindByName(schema.name)) |existing| {
+        id.* = existing.id;
+        return .DB_TABLE_IS_BEING_USED;
+    }
     if (schema.table_id) |existing| {
         id.* = existing;
         return .DB_TABLE_IS_BEING_USED;
@@ -1443,9 +1683,16 @@ pub fn ib_table_create(ib_trx: ib_trx_t, ib_tbl_sch: ib_tbl_sch_t, id: *ib_id_t)
         }
     }
 
-    id.* = next_table_id;
+    const new_id = next_table_id;
+    const catalog = catalogCreateFromSchema(schema, new_id) catch return .DB_OUT_OF_MEMORY;
+    table_registry.append(catalog) catch {
+        catalogDestroy(catalog);
+        return .DB_OUT_OF_MEMORY;
+    };
+
     next_table_id += 1;
-    schema.table_id = id.*;
+    schema.table_id = new_id;
+    id.* = new_id;
     return .DB_SUCCESS;
 }
 
@@ -1459,7 +1706,18 @@ pub fn ib_table_rename(ib_trx: ib_trx_t, old_name: []const u8, new_name: []const
     if (old_name.len == 0 or new_name.len == 0) {
         return .DB_INVALID_INPUT;
     }
-    return .DB_SUCCESS;
+    if (catalogFindByName(new_name) != null and !schemaNameEq(old_name, new_name)) {
+        return .DB_DUPLICATE_KEY;
+    }
+
+    if (catalogFindByName(old_name)) |table| {
+        const name_copy = dupName(table.allocator, new_name) catch return .DB_OUT_OF_MEMORY;
+        table.allocator.free(table.name);
+        table.name = name_copy;
+        return .DB_SUCCESS;
+    }
+
+    return .DB_TABLE_NOT_FOUND;
 }
 
 pub fn ib_index_create(ib_idx_sch: ib_idx_sch_t, index_id: *ib_id_t) ib_err_t {
@@ -1475,6 +1733,12 @@ pub fn ib_index_create(ib_idx_sch: ib_idx_sch_t, index_id: *ib_id_t) ib_err_t {
     const low_bits = next_index_id & 0xFFFF_FFFF;
     next_index_id += 1;
     index_id.* = if (table_id) |tid| (tid << 32) | low_bits else low_bits;
+
+    if (index.schema_owner == null) {
+        const table = catalogFindByName(index.table_name) orelse return .DB_TABLE_NOT_FOUND;
+        catalogAppendIndex(table, index, index_id.*) catch return .DB_OUT_OF_MEMORY;
+    }
+
     return .DB_SUCCESS;
 }
 
@@ -1485,7 +1749,7 @@ pub fn ib_table_drop(ib_trx: ib_trx_t, name: []const u8) ib_err_t {
     if (name.len == 0) {
         return .DB_INVALID_INPUT;
     }
-    return .DB_SUCCESS;
+    return if (catalogRemoveByName(name)) .DB_SUCCESS else .DB_TABLE_NOT_FOUND;
 }
 
 pub fn ib_index_drop(ib_trx: ib_trx_t, index_id: ib_id_t) ib_err_t {
@@ -1495,6 +1759,116 @@ pub fn ib_index_drop(ib_trx: ib_trx_t, index_id: ib_id_t) ib_err_t {
     if (index_id == 0) {
         return .DB_TABLE_NOT_FOUND;
     }
+    for (table_registry.items) |table| {
+        for (table.indexes.items, 0..) |idx, idx_pos| {
+            if (idx.id == index_id) {
+                catalogIndexDestroy(&table.indexes.items[idx_pos], table.allocator);
+                _ = table.indexes.orderedRemove(idx_pos);
+                return .DB_SUCCESS;
+            }
+        }
+    }
+    return .DB_TABLE_NOT_FOUND;
+}
+
+pub fn ib_table_schema_visit(
+    ib_trx: ib_trx_t,
+    name: []const u8,
+    visitor: *const ib_schema_visitor_t,
+    arg: ib_opaque_t,
+) ib_err_t {
+    if (ib_schema_lock_is_exclusive(ib_trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    if (name.len == 0) {
+        return .DB_TABLE_NOT_FOUND;
+    }
+    const table = catalogFindByName(name) orelse return .DB_TABLE_NOT_FOUND;
+
+    if (@intFromEnum(visitor.version) < @intFromEnum(ib_schema_visitor_version_t.IB_SCHEMA_VISITOR_TABLE)) {
+        return .DB_SUCCESS;
+    }
+
+    if (visitor.table) |func| {
+        const user_err = func(
+            arg,
+            table.name.ptr,
+            table.format,
+            table.page_size,
+            @intCast(table.columns.items.len),
+            @intCast(table.indexes.items.len),
+        );
+        if (user_err != 0) {
+            return .DB_ERROR;
+        }
+    }
+
+    if (@intFromEnum(visitor.version) < @intFromEnum(ib_schema_visitor_version_t.IB_SCHEMA_VISITOR_TABLE_COL)) {
+        return .DB_SUCCESS;
+    }
+
+    if (visitor.table_col) |func| {
+        for (table.columns.items) |col| {
+            const user_err = func(arg, col.name.ptr, col.col_type, col.len, col.attr);
+            if (user_err != 0) {
+                return .DB_ERROR;
+            }
+        }
+    }
+
+    if (visitor.index == null or @intFromEnum(visitor.version) < @intFromEnum(ib_schema_visitor_version_t.IB_SCHEMA_VISITOR_TABLE_AND_INDEX)) {
+        return .DB_SUCCESS;
+    }
+
+    for (table.indexes.items) |idx| {
+        if (idx.columns.items.len == 0) {
+            continue;
+        }
+        const user_err = visitor.index.?(
+            arg,
+            idx.name.ptr,
+            if (idx.clustered) compat.IB_TRUE else compat.IB_FALSE,
+            if (idx.unique) compat.IB_TRUE else compat.IB_FALSE,
+            @intCast(idx.columns.items.len),
+        );
+        if (user_err != 0) {
+            return .DB_ERROR;
+        }
+
+        if (@intFromEnum(visitor.version) >= @intFromEnum(ib_schema_visitor_version_t.IB_SCHEMA_VISITOR_TABLE_AND_INDEX_COL)) {
+            if (visitor.index_col) |icol_func| {
+                for (idx.columns.items) |icol| {
+                    const col_err = icol_func(arg, icol.name.ptr, icol.prefix_len);
+                    if (col_err != 0) {
+                        return .DB_ERROR;
+                    }
+                }
+            }
+        }
+    }
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_schema_tables_iterate(
+    ib_trx: ib_trx_t,
+    visitor: ib_schema_visitor_table_all_t,
+    arg: ib_opaque_t,
+) ib_err_t {
+    if (ib_schema_lock_is_exclusive(ib_trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    if (table_registry.items.len == 0) {
+        return .DB_TABLE_NOT_FOUND;
+    }
+
+    for (table_registry.items) |table| {
+        const user_err = visitor(arg, table.name.ptr, @intCast(table.name.len));
+        if (user_err != 0) {
+            break;
+        }
+    }
+
     return .DB_SUCCESS;
 }
 
@@ -1733,6 +2107,9 @@ test "cursor moveto positions and read row" {
     try std.testing.expectEqual(compat.IB_TRUE, ib_cursor_is_positioned(crsr));
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_read_row(crsr, row_tpl));
+    var out: ib_i32_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(row_tpl, 0, &out));
+    try std.testing.expectEqual(@as(ib_i32_t, 42), out);
 }
 
 test "cursor open index variants" {
@@ -1850,6 +2227,7 @@ test "table schema create and create table" {
     try std.testing.expectEqual(errors.DbErr.DB_TABLE_IS_BEING_USED, ib_table_create(trx, tbl_sch, &again_id));
     try std.testing.expectEqual(table_id, again_id);
 
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/t4"));
     ib_table_schema_delete(tbl_sch);
 }
 
@@ -1860,13 +2238,27 @@ test "index schema create and index create" {
     var idx_sch: ib_idx_sch_t = null;
     try std.testing.expectEqual(
         errors.DbErr.DB_SCHEMA_NOT_LOCKED,
-        ib_index_schema_create(trx, "idx1", "db/t4", &idx_sch),
+        ib_index_schema_create(trx, "idx1", "db/t5", &idx_sch),
+    );
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/t5", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "col1", .IB_INT, .IB_COL_NONE, 0, 4),
     );
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
     try std.testing.expectEqual(
         errors.DbErr.DB_SUCCESS,
-        ib_index_schema_create(trx, "idx1", "db/t4", &idx_sch),
+        ib_index_schema_create(trx, "idx1", "db/t5", &idx_sch),
     );
     try std.testing.expect(idx_sch != null);
 
@@ -1878,4 +2270,187 @@ test "index schema create and index create" {
     try std.testing.expect(index_id != 0);
 
     ib_index_schema_delete(idx_sch);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/t5"));
+    ib_table_schema_delete(tbl_sch);
+}
+
+test "schema visitor callbacks" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/visit1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "name", .IB_VARCHAR, .IB_COL_NONE, 0, 8),
+    );
+
+    var primary_idx: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_index(tbl_sch, "PRIMARY", &primary_idx),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(primary_idx, "id", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_set_clustered(primary_idx));
+
+    var name_idx: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_index(tbl_sch, "idx_name", &name_idx),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(name_idx, "name", 0));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    const VisitCtx = struct {
+        table_calls: usize,
+        col_calls: usize,
+        index_calls: usize,
+        index_col_calls: usize,
+        last_n_cols: i32,
+        last_n_indexes: i32,
+    };
+
+    const Visitor = struct {
+        fn table(
+            arg: ib_opaque_t,
+            _: [*]const u8,
+            _: ib_tbl_fmt_t,
+            _: ib_ulint_t,
+            n_cols: i32,
+            n_indexes: i32,
+        ) callconv(.C) i32 {
+            const ctx_ptr = arg orelse return 1;
+            const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
+            ctx.table_calls += 1;
+            ctx.last_n_cols = n_cols;
+            ctx.last_n_indexes = n_indexes;
+            return 0;
+        }
+
+        fn tableCol(
+            arg: ib_opaque_t,
+            _: [*]const u8,
+            _: ib_col_type_t,
+            _: ib_ulint_t,
+            _: ib_col_attr_t,
+        ) callconv(.C) i32 {
+            const ctx_ptr = arg orelse return 1;
+            const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
+            ctx.col_calls += 1;
+            return 0;
+        }
+
+        fn index(
+            arg: ib_opaque_t,
+            _: [*]const u8,
+            _: ib_bool_t,
+            _: ib_bool_t,
+            _: i32,
+        ) callconv(.C) i32 {
+            const ctx_ptr = arg orelse return 1;
+            const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
+            ctx.index_calls += 1;
+            return 0;
+        }
+
+        fn indexCol(
+            arg: ib_opaque_t,
+            _: [*]const u8,
+            _: ib_ulint_t,
+        ) callconv(.C) i32 {
+            const ctx_ptr = arg orelse return 1;
+            const ctx = @as(*VisitCtx, @ptrCast(@alignCast(ctx_ptr)));
+            ctx.index_col_calls += 1;
+            return 0;
+        }
+    };
+
+    var ctx = VisitCtx{
+        .table_calls = 0,
+        .col_calls = 0,
+        .index_calls = 0,
+        .index_col_calls = 0,
+        .last_n_cols = 0,
+        .last_n_indexes = 0,
+    };
+    const visitor = ib_schema_visitor_t{
+        .version = .IB_SCHEMA_VISITOR_TABLE_AND_INDEX_COL,
+        .table = Visitor.table,
+        .table_col = Visitor.tableCol,
+        .index = Visitor.index,
+        .index_col = Visitor.indexCol,
+    };
+    const arg: ib_opaque_t = @as(*anyopaque, @ptrCast(&ctx));
+
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_visit(trx, "db/visit1", &visitor, arg),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.table_calls);
+    try std.testing.expectEqual(@as(usize, 2), ctx.col_calls);
+    try std.testing.expectEqual(@as(usize, 2), ctx.index_calls);
+    try std.testing.expectEqual(@as(usize, 2), ctx.index_col_calls);
+    try std.testing.expectEqual(@as(i32, 2), ctx.last_n_cols);
+    try std.testing.expectEqual(@as(i32, 2), ctx.last_n_indexes);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/visit1"));
+    ib_table_schema_delete(tbl_sch);
+}
+
+test "schema tables iterate" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/iter1", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+
+    const IterCtx = struct {
+        calls: usize,
+        saw_target: bool,
+        target: []const u8,
+    };
+
+    const Iterator = struct {
+        fn table(arg: ib_opaque_t, name: [*]const u8, name_len: i32) callconv(.C) i32 {
+            const ctx_ptr = arg orelse return 1;
+            const ctx = @as(*IterCtx, @ptrCast(@alignCast(ctx_ptr)));
+            ctx.calls += 1;
+            const slice = name[0..@intCast(name_len)];
+            if (std.mem.eql(u8, slice, ctx.target)) {
+                ctx.saw_target = true;
+            }
+            return 0;
+        }
+    };
+
+    var ctx = IterCtx{ .calls = 0, .saw_target = false, .target = "db/iter1" };
+    const arg: ib_opaque_t = @as(*anyopaque, @ptrCast(&ctx));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_tables_iterate(trx, Iterator.table, arg));
+    try std.testing.expect(ctx.calls > 0);
+    try std.testing.expect(ctx.saw_target);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/iter1"));
+    ib_table_schema_delete(tbl_sch);
 }
