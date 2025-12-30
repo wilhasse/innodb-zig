@@ -34,10 +34,17 @@ const file_format_names = [_][]const u8{
     "Barracuda",
 };
 
+const SchemaLock = enum(u8) {
+    none,
+    shared,
+    exclusive,
+};
+
 pub const Trx = struct {
     state: ib_trx_state_t,
     isolation_level: ib_trx_level_t,
     client_thread_id: os_thread.ThreadId,
+    schema_lock: SchemaLock,
 };
 pub const Cursor = struct {
     allocator: std.mem.Allocator,
@@ -62,8 +69,40 @@ const Column = struct {
     meta: ib_col_meta_t,
     data: ?[]u8,
 };
-pub const TableSchema = opaque {};
-pub const IndexSchema = opaque {};
+
+const SchemaColumn = struct {
+    name: []u8,
+    col_type: ib_col_type_t,
+    attr: ib_col_attr_t,
+    client_type: ib_u16_t,
+    len: ib_ulint_t,
+};
+
+const IndexColumn = struct {
+    name: []u8,
+    prefix_len: ib_ulint_t,
+};
+
+pub const TableSchema = struct {
+    allocator: std.mem.Allocator,
+    name: []u8,
+    format: ib_tbl_fmt_t,
+    page_size: ib_ulint_t,
+    columns: std.ArrayList(SchemaColumn),
+    indexes: std.ArrayList(*IndexSchema),
+    table_id: ?ib_id_t,
+};
+
+pub const IndexSchema = struct {
+    allocator: std.mem.Allocator,
+    name: []u8,
+    table_name: []u8,
+    columns: std.ArrayList(IndexColumn),
+    clustered: bool,
+    unique: bool,
+    schema_owner: ?*TableSchema,
+    trx: ib_trx_t,
+};
 
 pub const ib_trx_t = ?*Trx;
 pub const ib_crsr_t = ?*Cursor;
@@ -223,6 +262,8 @@ const DbFormat = struct {
 };
 
 var db_format: DbFormat = .{ .id = 0, .name = null };
+var next_table_id: ib_id_t = 1;
+var next_index_id: ib_id_t = 1;
 
 pub fn ib_init() ib_err_t {
     return .DB_SUCCESS;
@@ -634,6 +675,7 @@ pub fn ib_trx_start(ib_trx: ib_trx_t, ib_trx_level: ib_trx_level_t) ib_err_t {
     if (trx.state == .IB_TRX_NOT_STARTED) {
         trx.state = .IB_TRX_ACTIVE;
         trx.isolation_level = ib_trx_level;
+        trx.schema_lock = .none;
         return .DB_SUCCESS;
     }
 
@@ -646,6 +688,7 @@ pub fn ib_trx_begin(ib_trx_level: ib_trx_level_t) ib_trx_t {
         .state = .IB_TRX_NOT_STARTED,
         .isolation_level = ib_trx_level,
         .client_thread_id = os_thread.currentId(),
+        .schema_lock = .none,
     };
 
     if (ib_trx_start(trx, ib_trx_level) != .DB_SUCCESS) {
@@ -669,12 +712,14 @@ pub fn ib_trx_release(ib_trx: ib_trx_t) ib_err_t {
 
 pub fn ib_trx_commit(ib_trx: ib_trx_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
+    trx.schema_lock = .none;
     trx.state = .IB_TRX_COMMITTED_IN_MEMORY;
     return ib_trx_release(trx);
 }
 
 pub fn ib_trx_rollback(ib_trx: ib_trx_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
+    trx.schema_lock = .none;
     trx.state = .IB_TRX_NOT_STARTED;
     return ib_trx_release(trx);
 }
@@ -931,6 +976,433 @@ pub fn ib_cursor_set_simple_select(ib_crsr: ib_crsr_t) void {
     cursor.simple_select = true;
 }
 
+fn schemaNameEq(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn tableSchemaFindColumn(schema: *const TableSchema, name: []const u8) bool {
+    for (schema.columns.items) |col| {
+        if (schemaNameEq(col.name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn tableSchemaFindIndex(schema: *const TableSchema, name: []const u8) ?*IndexSchema {
+    for (schema.indexes.items) |idx| {
+        if (schemaNameEq(idx.name, name)) {
+            return idx;
+        }
+    }
+    return null;
+}
+
+fn indexSchemaHasColumn(index: *const IndexSchema, name: []const u8) bool {
+    for (index.columns.items) |col| {
+        if (schemaNameEq(col.name, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn indexSchemaDestroy(index: *IndexSchema) void {
+    for (index.columns.items) |col| {
+        index.allocator.free(col.name);
+    }
+    index.columns.deinit();
+    index.allocator.free(index.name);
+    index.allocator.free(index.table_name);
+    index.allocator.destroy(index);
+}
+
+fn tableSchemaDestroy(schema: *TableSchema) void {
+    for (schema.columns.items) |col| {
+        schema.allocator.free(col.name);
+    }
+    schema.columns.deinit();
+
+    for (schema.indexes.items) |idx| {
+        indexSchemaDestroy(idx);
+    }
+    schema.indexes.deinit();
+
+    schema.allocator.free(schema.name);
+    schema.allocator.destroy(schema);
+}
+
+pub fn ib_schema_lock_shared(ib_trx: ib_trx_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    switch (trx.schema_lock) {
+        .none, .shared => trx.schema_lock = .shared,
+        .exclusive => {},
+    }
+    return .DB_SUCCESS;
+}
+
+pub fn ib_schema_lock_exclusive(ib_trx: ib_trx_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    switch (trx.schema_lock) {
+        .none, .exclusive => {
+            trx.schema_lock = .exclusive;
+            return .DB_SUCCESS;
+        },
+        .shared => return .DB_SCHEMA_NOT_LOCKED,
+    }
+}
+
+pub fn ib_schema_lock_is_exclusive(ib_trx: ib_trx_t) ib_bool_t {
+    const trx = ib_trx orelse return compat.IB_FALSE;
+    return if (trx.schema_lock == .exclusive) compat.IB_TRUE else compat.IB_FALSE;
+}
+
+pub fn ib_schema_lock_is_shared(ib_trx: ib_trx_t) ib_bool_t {
+    const trx = ib_trx orelse return compat.IB_FALSE;
+    return if (trx.schema_lock == .shared) compat.IB_TRUE else compat.IB_FALSE;
+}
+
+pub fn ib_schema_unlock(ib_trx: ib_trx_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_ERROR;
+    if (trx.schema_lock == .none) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    trx.schema_lock = .none;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_schema_create(
+    name: []const u8,
+    ib_tbl_sch: *ib_tbl_sch_t,
+    ib_tbl_fmt: ib_tbl_fmt_t,
+    page_size: ib_ulint_t,
+) ib_err_t {
+    if (name.len == 0 or name.len > IB_MAX_TABLE_NAME_LEN) {
+        ib_tbl_sch.* = null;
+        return .DB_INVALID_INPUT;
+    }
+    if (@intFromEnum(ib_tbl_fmt) > @intFromEnum(ib_tbl_fmt_t.IB_TBL_COMPRESSED)) {
+        ib_tbl_sch.* = null;
+        return .DB_INVALID_INPUT;
+    }
+
+    var final_page_size = page_size;
+    if (ib_tbl_fmt != .IB_TBL_COMPRESSED) {
+        final_page_size = 0;
+    } else if (final_page_size == 0) {
+        final_page_size = 8;
+    }
+
+    const allocator = std.heap.page_allocator;
+    const schema = allocator.create(TableSchema) catch {
+        ib_tbl_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    const name_copy = dupName(allocator, name) catch {
+        allocator.destroy(schema);
+        ib_tbl_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    schema.* = .{
+        .allocator = allocator,
+        .name = name_copy,
+        .format = ib_tbl_fmt,
+        .page_size = final_page_size,
+        .columns = std.ArrayList(SchemaColumn).init(allocator),
+        .indexes = std.ArrayList(*IndexSchema).init(allocator),
+        .table_id = null,
+    };
+
+    ib_tbl_sch.* = schema;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_schema_add_col(
+    ib_tbl_sch: ib_tbl_sch_t,
+    name: []const u8,
+    ib_col_type: ib_col_type_t,
+    ib_col_attr: ib_col_attr_t,
+    client_type: ib_u16_t,
+    len: ib_ulint_t,
+) ib_err_t {
+    const schema = ib_tbl_sch orelse return .DB_ERROR;
+    if (schema.table_id != null) {
+        return .DB_ERROR;
+    }
+    if (name.len == 0 or name.len > IB_MAX_COL_NAME_LEN) {
+        return .DB_INVALID_INPUT;
+    }
+    if (tableSchemaFindColumn(schema, name)) {
+        return .DB_DUPLICATE_KEY;
+    }
+
+    const name_copy = dupName(schema.allocator, name) catch return .DB_OUT_OF_MEMORY;
+    schema.columns.append(.{
+        .name = name_copy,
+        .col_type = ib_col_type,
+        .attr = ib_col_attr,
+        .client_type = client_type,
+        .len = len,
+    }) catch {
+        schema.allocator.free(name_copy);
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_schema_add_index(
+    ib_tbl_sch: ib_tbl_sch_t,
+    name: []const u8,
+    ib_idx_sch: *ib_idx_sch_t,
+) ib_err_t {
+    const schema = ib_tbl_sch orelse return .DB_ERROR;
+    if (schema.table_id != null) {
+        ib_idx_sch.* = null;
+        return .DB_ERROR;
+    }
+    if (name.len == 0 or schemaNameEq(name, "GEN_CLUST_INDEX")) {
+        ib_idx_sch.* = null;
+        return .DB_INVALID_INPUT;
+    }
+    if (tableSchemaFindIndex(schema, name) != null) {
+        ib_idx_sch.* = null;
+        return .DB_DUPLICATE_KEY;
+    }
+
+    const allocator = schema.allocator;
+    const index = allocator.create(IndexSchema) catch {
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    const name_copy = dupName(allocator, name) catch {
+        allocator.destroy(index);
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+    const table_name_copy = dupName(allocator, schema.name) catch {
+        allocator.free(name_copy);
+        allocator.destroy(index);
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    index.* = .{
+        .allocator = allocator,
+        .name = name_copy,
+        .table_name = table_name_copy,
+        .columns = std.ArrayList(IndexColumn).init(allocator),
+        .clustered = false,
+        .unique = false,
+        .schema_owner = schema,
+        .trx = null,
+    };
+
+    schema.indexes.append(index) catch {
+        indexSchemaDestroy(index);
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    ib_idx_sch.* = index;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_schema_delete(ib_tbl_sch: ib_tbl_sch_t) void {
+    const schema = ib_tbl_sch orelse return;
+    tableSchemaDestroy(schema);
+}
+
+pub fn ib_index_schema_add_col(ib_idx_sch: ib_idx_sch_t, name: []const u8, prefix_len: ib_ulint_t) ib_err_t {
+    const index = ib_idx_sch orelse return .DB_ERROR;
+    if (name.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+    if (indexSchemaHasColumn(index, name)) {
+        return .DB_COL_APPEARS_TWICE_IN_INDEX;
+    }
+    if (index.schema_owner) |owner| {
+        if (!tableSchemaFindColumn(owner, name)) {
+            return .DB_NOT_FOUND;
+        }
+    }
+
+    const name_copy = dupName(index.allocator, name) catch return .DB_OUT_OF_MEMORY;
+    index.columns.append(.{
+        .name = name_copy,
+        .prefix_len = prefix_len,
+    }) catch {
+        index.allocator.free(name_copy);
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_schema_create(
+    ib_usr_trx: ib_trx_t,
+    name: []const u8,
+    table_name: []const u8,
+    ib_idx_sch: *ib_idx_sch_t,
+) ib_err_t {
+    if (ib_schema_lock_is_exclusive(ib_usr_trx) != compat.IB_TRUE) {
+        ib_idx_sch.* = null;
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    if (name.len == 0 or schemaNameEq(name, "GEN_CLUST_INDEX")) {
+        ib_idx_sch.* = null;
+        return .DB_INVALID_INPUT;
+    }
+    if (table_name.len == 0) {
+        ib_idx_sch.* = null;
+        return .DB_TABLE_NOT_FOUND;
+    }
+
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(IndexSchema) catch {
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    const name_copy = dupName(allocator, name) catch {
+        allocator.destroy(index);
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+    const table_name_copy = dupName(allocator, table_name) catch {
+        allocator.free(name_copy);
+        allocator.destroy(index);
+        ib_idx_sch.* = null;
+        return .DB_OUT_OF_MEMORY;
+    };
+
+    index.* = .{
+        .allocator = allocator,
+        .name = name_copy,
+        .table_name = table_name_copy,
+        .columns = std.ArrayList(IndexColumn).init(allocator),
+        .clustered = false,
+        .unique = false,
+        .schema_owner = null,
+        .trx = ib_usr_trx,
+    };
+
+    ib_idx_sch.* = index;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_schema_set_clustered(ib_idx_sch: ib_idx_sch_t) ib_err_t {
+    const index = ib_idx_sch orelse return .DB_ERROR;
+    if (index.schema_owner) |owner| {
+        for (owner.indexes.items) |idx| {
+            idx.clustered = false;
+        }
+    }
+    index.unique = true;
+    index.clustered = true;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_schema_set_unique(ib_idx_sch: ib_idx_sch_t) ib_err_t {
+    const index = ib_idx_sch orelse return .DB_ERROR;
+    index.unique = true;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_schema_delete(ib_idx_sch: ib_idx_sch_t) void {
+    const index = ib_idx_sch orelse return;
+    if (index.schema_owner != null) {
+        return;
+    }
+    indexSchemaDestroy(index);
+}
+
+pub fn ib_table_create(ib_trx: ib_trx_t, ib_tbl_sch: ib_tbl_sch_t, id: *ib_id_t) ib_err_t {
+    const trx = ib_trx orelse return .DB_SCHEMA_NOT_LOCKED;
+    if (ib_schema_lock_is_exclusive(trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+
+    const schema = ib_tbl_sch orelse return .DB_ERROR;
+    if (schema.table_id) |existing| {
+        id.* = existing;
+        return .DB_TABLE_IS_BEING_USED;
+    }
+    if (schema.columns.items.len == 0) {
+        return .DB_SCHEMA_ERROR;
+    }
+
+    var clustered_count: usize = 0;
+    for (schema.indexes.items) |idx| {
+        if (idx.columns.items.len == 0) {
+            return .DB_SCHEMA_ERROR;
+        }
+        if (idx.clustered) {
+            clustered_count += 1;
+            if (clustered_count > 1) {
+                return .DB_SCHEMA_ERROR;
+            }
+        }
+    }
+
+    id.* = next_table_id;
+    next_table_id += 1;
+    schema.table_id = id.*;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_rename(ib_trx: ib_trx_t, old_name: []const u8, new_name: []const u8) ib_err_t {
+    if (ib_schema_lock_is_exclusive(ib_trx) != compat.IB_TRUE) {
+        const err = ib_schema_lock_exclusive(ib_trx);
+        if (err != .DB_SUCCESS) {
+            return err;
+        }
+    }
+    if (old_name.len == 0 or new_name.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_create(ib_idx_sch: ib_idx_sch_t, index_id: *ib_id_t) ib_err_t {
+    const index = ib_idx_sch orelse return .DB_ERROR;
+    if (ib_schema_lock_is_exclusive(index.trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    if (index.columns.items.len == 0) {
+        return .DB_SCHEMA_ERROR;
+    }
+
+    const table_id = if (index.schema_owner) |owner| owner.table_id else null;
+    const low_bits = next_index_id & 0xFFFF_FFFF;
+    next_index_id += 1;
+    index_id.* = if (table_id) |tid| (tid << 32) | low_bits else low_bits;
+    return .DB_SUCCESS;
+}
+
+pub fn ib_table_drop(ib_trx: ib_trx_t, name: []const u8) ib_err_t {
+    if (ib_schema_lock_is_exclusive(ib_trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    if (name.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+    return .DB_SUCCESS;
+}
+
+pub fn ib_index_drop(ib_trx: ib_trx_t, index_id: ib_id_t) ib_err_t {
+    if (ib_schema_lock_is_exclusive(ib_trx) != compat.IB_TRUE) {
+        return .DB_SCHEMA_NOT_LOCKED;
+    }
+    if (index_id == 0) {
+        return .DB_TABLE_NOT_FOUND;
+    }
+    return .DB_SUCCESS;
+}
+
 test "ib_api_version matches C constants" {
     const expected = (@as(ib_u64_t, 3) << 32) | (@as(ib_u64_t, 0) << 16) | @as(ib_u64_t, 0);
     try std.testing.expectEqual(expected, ib_api_version());
@@ -1172,4 +1644,82 @@ test "cursor open index variants" {
     try std.testing.expectEqual(@as(ib_id_t, 1), id_cursor.table_id.?);
     try std.testing.expectEqual(idx_id, id_cursor.index_id.?);
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_close(idx_by_id));
+}
+
+test "schema lock state transitions" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    try std.testing.expectEqual(compat.IB_FALSE, ib_schema_lock_is_shared(trx));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_shared(trx));
+    try std.testing.expectEqual(compat.IB_TRUE, ib_schema_lock_is_shared(trx));
+    try std.testing.expectEqual(errors.DbErr.DB_SCHEMA_NOT_LOCKED, ib_schema_lock_exclusive(trx));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_unlock(trx));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    try std.testing.expectEqual(compat.IB_TRUE, ib_schema_lock_is_exclusive(trx));
+}
+
+test "table schema create and create table" {
+    const trx = ib_trx_begin(.IB_TRX_REPEATABLE_READ);
+    defer _ = ib_trx_rollback(trx);
+
+    var tbl_sch: ib_tbl_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_create("db/t4", &tbl_sch, .IB_TBL_COMPACT, 0),
+    );
+    try std.testing.expect(tbl_sch != null);
+
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_UNSIGNED, 0, 4),
+    );
+
+    var idx_sch: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_index(tbl_sch, "PRIMARY", &idx_sch),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(idx_sch, "id", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_set_clustered(idx_sch));
+
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SCHEMA_NOT_LOCKED, ib_table_create(trx, tbl_sch, &table_id));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+    try std.testing.expect(table_id != 0);
+
+    var again_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_TABLE_IS_BEING_USED, ib_table_create(trx, tbl_sch, &again_id));
+    try std.testing.expectEqual(table_id, again_id);
+
+    ib_table_schema_delete(tbl_sch);
+}
+
+test "index schema create and index create" {
+    const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx);
+
+    var idx_sch: ib_idx_sch_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SCHEMA_NOT_LOCKED,
+        ib_index_schema_create(trx, "idx1", "db/t4", &idx_sch),
+    );
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_index_schema_create(trx, "idx1", "db/t4", &idx_sch),
+    );
+    try std.testing.expect(idx_sch != null);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(idx_sch, "col1", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_set_unique(idx_sch));
+
+    var index_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_create(idx_sch, &index_id));
+    try std.testing.expect(index_id != 0);
+
+    ib_index_schema_delete(idx_sch);
 }
