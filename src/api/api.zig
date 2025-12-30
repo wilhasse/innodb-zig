@@ -2050,10 +2050,6 @@ pub fn ib_tuple_copy(ib_dst_tpl: ib_tpl_t, ib_src_tpl: ib_tpl_t) ib_err_t {
 
     for (src.cols, 0..) |src_col, idx| {
         const dst_col = &dst.cols[idx];
-        if (src_col.meta.type != dst_col.meta.type or src_col.meta.type_len != dst_col.meta.type_len) {
-            return .DB_DATA_MISMATCH;
-        }
-
         if (src_col.data) |data| {
             const buf = dst.allocator.alloc(u8, data.len) catch return .DB_OUT_OF_MEMORY;
             std.mem.copyForwards(u8, buf, data);
