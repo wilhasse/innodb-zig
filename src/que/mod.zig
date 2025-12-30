@@ -60,6 +60,8 @@ pub const que_thr_t = struct {
 };
 
 pub const sess_t = struct {
+    state: ulint = 0,
+    trx: ?*anyopaque = null,
     graphs_head: ?*que_t = null,
 };
 
