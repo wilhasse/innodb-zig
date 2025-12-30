@@ -1,3 +1,4 @@
+const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const data = @import("../data/mod.zig");
 const row = @import("../row/mod.zig");
@@ -32,6 +33,10 @@ pub const que_node_t = que_common_t;
 
 pub const que_fork_t = struct {
     common: que_common_t = .{ .type = QUE_NODE_FORK },
+    graph: ?*que_t = null,
+    fork_type: ulint = 0,
+    n_active_thrs: ulint = 0,
+    thrs_head: ?*que_thr_t = null,
     last_sel_node: ?*row.sel_node_t = null,
 };
 
@@ -40,6 +45,12 @@ pub const que_t = que_fork_t;
 pub const que_thr_t = struct {
     run_node: ?*que_node_t = null,
     prev_node: ?*que_node_t = null,
+    parent: ?*que_fork_t = null,
+    next: ?*que_thr_t = null,
+};
+
+pub const sess_t = struct {
+    graphs_head: ?*que_t = null,
 };
 
 pub fn que_node_get_type(node: *que_node_t) ulint {
@@ -80,4 +91,90 @@ pub fn que_node_get_containing_loop_node(node: *que_node_t) ?*que_node_t {
         cur = ptr.parent;
     }
     return null;
+}
+
+pub fn que_var_init() void {}
+
+pub fn que_graph_publish(graph: *que_t, sess: *sess_t) void {
+    graph.common.brother = sess.graphs_head;
+    sess.graphs_head = graph;
+}
+
+pub fn que_fork_create(graph: ?*que_t, parent: ?*que_node_t, fork_type: ulint, allocator: std.mem.Allocator) *que_fork_t {
+    const fork = allocator.create(que_fork_t) catch @panic("que_fork_create");
+    fork.* = .{};
+    fork.common.type = QUE_NODE_FORK;
+    fork.common.parent = parent;
+    fork.fork_type = fork_type;
+    fork.n_active_thrs = 0;
+    fork.graph = graph orelse fork;
+    return fork;
+}
+
+pub fn que_fork_get_first_thr(fork: *que_fork_t) ?*que_thr_t {
+    return fork.thrs_head;
+}
+
+pub fn que_fork_get_child(fork: *que_fork_t) ?*que_node_t {
+    return if (fork.thrs_head) |thr| thr.run_node else null;
+}
+
+pub fn que_node_set_parent(node: *que_node_t, parent: ?*que_node_t) void {
+    node.parent = parent;
+}
+
+pub fn que_thr_create(parent: *que_fork_t, allocator: std.mem.Allocator) *que_thr_t {
+    const thr = allocator.create(que_thr_t) catch @panic("que_thr_create");
+    thr.* = .{};
+    thr.parent = parent;
+    if (parent.thrs_head == null) {
+        parent.thrs_head = thr;
+    } else {
+        var cur = parent.thrs_head.?;
+        while (cur.next) |next| {
+            cur = next;
+        }
+        cur.next = thr;
+    }
+    return thr;
+}
+
+pub fn que_graph_free_recursive(node: *que_node_t) void {
+    _ = node;
+}
+
+pub fn que_graph_free(graph: *que_t) void {
+    _ = graph;
+}
+
+test "que fork create defaults graph" {
+    const allocator = std.testing.allocator;
+    const fork = que_fork_create(null, null, 7, allocator);
+    defer allocator.destroy(fork);
+    try std.testing.expect(fork.graph == fork);
+    try std.testing.expectEqual(@as(ulint, 7), fork.fork_type);
+}
+
+test "que thr create links into fork" {
+    const allocator = std.testing.allocator;
+    const fork = que_fork_create(null, null, 0, allocator);
+    defer allocator.destroy(fork);
+    const thr1 = que_thr_create(fork, allocator);
+    const thr2 = que_thr_create(fork, allocator);
+    defer {
+        allocator.destroy(thr2);
+        allocator.destroy(thr1);
+    }
+    try std.testing.expect(fork.thrs_head == thr1);
+    try std.testing.expect(thr1.next == thr2);
+    try std.testing.expect(thr2.next == null);
+    try std.testing.expect(thr1.parent == fork);
+    try std.testing.expect(thr2.parent == fork);
+}
+
+test "que node set parent" {
+    var parent_node = que_node_t{};
+    var child_node = que_node_t{};
+    que_node_set_parent(&child_node, &parent_node);
+    try std.testing.expect(child_node.parent == &parent_node);
 }
