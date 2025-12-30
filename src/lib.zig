@@ -11,6 +11,7 @@ pub const buf = @import("buf/mod.zig");
 pub const btr = @import("btr/mod.zig");
 pub const data = @import("data/mod.zig");
 pub const ddl = @import("ddl/mod.zig");
+pub const dict = @import("dict/mod.zig");
 pub const api = @import("api/mod.zig").impl;
 pub const BuildOptions = build_options;
 
