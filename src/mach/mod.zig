@@ -117,6 +117,53 @@ pub fn mach_read_compressed(b: [*]const byte) ulint {
     }
 }
 
+pub fn mach_dulint_write_compressed(b: [*]byte, n: dulint) ulint {
+    const size = mach_write_compressed(b, n.high);
+    mach_write_to_4(b + size, n.low);
+    return size + 4;
+}
+
+pub fn mach_dulint_get_compressed_size(n: dulint) ulint {
+    return 4 + mach_get_compressed_size(n.high);
+}
+
+pub fn mach_dulint_read_compressed(b: [*]const byte) dulint {
+    const high = mach_read_compressed(b);
+    const size = mach_get_compressed_size(high);
+    const low = mach_read_from_4(b + size);
+    return .{ .high = high, .low = low };
+}
+
+pub fn mach_dulint_write_much_compressed(b: [*]byte, n: dulint) ulint {
+    if (n.high == 0) {
+        return mach_write_compressed(b, n.low);
+    }
+
+    b[0] = 0xFF;
+    var size = 1 + mach_write_compressed(b + 1, n.high);
+    size += mach_write_compressed(b + size, n.low);
+    return size;
+}
+
+pub fn mach_dulint_get_much_compressed_size(n: dulint) ulint {
+    if (n.high == 0) {
+        return mach_get_compressed_size(n.low);
+    }
+    return 1 + mach_get_compressed_size(n.high) + mach_get_compressed_size(n.low);
+}
+
+pub fn mach_dulint_read_much_compressed(b: [*]const byte) dulint {
+    if (b[0] != 0xFF) {
+        const low = mach_read_compressed(b);
+        return .{ .high = 0, .low = low };
+    }
+
+    const high = mach_read_compressed(b + 1);
+    const size = mach_get_compressed_size(high);
+    const low = mach_read_compressed(b + 1 + size);
+    return .{ .high = high, .low = low };
+}
+
 pub fn mach_parse_compressed(ptr: [*]byte, end_ptr: [*]byte, val: *ulint) ?[*]byte {
     if (@intFromPtr(ptr) >= @intFromPtr(end_ptr)) {
         return null;
@@ -200,4 +247,31 @@ test "mach dulint parse compressed" {
     try std.testing.expect(end_ptr != null);
     try std.testing.expect(value.high == high);
     try std.testing.expect(value.low == low);
+}
+
+test "mach dulint compressed roundtrip" {
+    var buf = [_]byte{0} ** 16;
+    const input: dulint = .{ .high = 0x2, .low = 0x11223344 };
+    const size = mach_dulint_write_compressed(&buf, input);
+    const out = mach_dulint_read_compressed(&buf);
+    try std.testing.expectEqual(input.high, out.high);
+    try std.testing.expectEqual(input.low, out.low);
+    try std.testing.expectEqual(size, mach_dulint_get_compressed_size(input));
+}
+
+test "mach dulint much compressed roundtrip" {
+    var buf = [_]byte{0} ** 16;
+    const input: dulint = .{ .high = 0x1, .low = 0x22334455 };
+    const size = mach_dulint_write_much_compressed(&buf, input);
+    const out = mach_dulint_read_much_compressed(&buf);
+    try std.testing.expectEqual(input.high, out.high);
+    try std.testing.expectEqual(input.low, out.low);
+    try std.testing.expectEqual(size, mach_dulint_get_much_compressed_size(input));
+
+    const low_only: dulint = .{ .high = 0, .low = 0x77 };
+    const size_low = mach_dulint_write_much_compressed(&buf, low_only);
+    const out_low = mach_dulint_read_much_compressed(&buf);
+    try std.testing.expectEqual(low_only.high, out_low.high);
+    try std.testing.expectEqual(low_only.low, out_low.low);
+    try std.testing.expectEqual(size_low, mach_dulint_get_much_compressed_size(low_only));
 }
