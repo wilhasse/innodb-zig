@@ -33,6 +33,7 @@ comptime {
         _ = @import("tests/ib_detailed_query.zig");
         _ = @import("tests/ib_ddl.zig");
         _ = @import("tests/ib_deadlock.zig");
+        _ = @import("tests/ib_dict.zig");
     }
 }
 
