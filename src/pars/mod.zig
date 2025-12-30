@@ -5,6 +5,7 @@ const row = @import("../row/mod.zig");
 pub const module_name = "pars";
 
 pub const ulint = compat.ulint;
+pub const lint = compat.lint;
 
 pub const PARS_FUNC_ARITH: ulint = 1;
 pub const PARS_FUNC_LOGICAL: ulint = 2;
@@ -66,4 +67,51 @@ pub const func_node_t = struct {
     func: i32 = 0,
     class: ulint = 0,
     args: ?*que.que_node_t = null,
+};
+
+pub const proc_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_PROC },
+};
+
+pub const elsif_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_ELSIF },
+    cond: ?*que.que_node_t = null,
+    stat_list: ?*que.que_node_t = null,
+};
+
+pub const if_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_IF },
+    cond: ?*que.que_node_t = null,
+    stat_list: ?*que.que_node_t = null,
+    else_part: ?*que.que_node_t = null,
+    elsif_list: ?*elsif_node_t = null,
+};
+
+pub const while_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_WHILE },
+    cond: ?*que.que_node_t = null,
+    stat_list: ?*que.que_node_t = null,
+};
+
+pub const assign_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_ASSIGNMENT },
+    @"var": ?*sym_node_t = null,
+    val: ?*que.que_node_t = null,
+};
+
+pub const for_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_FOR },
+    loop_var: ?*sym_node_t = null,
+    loop_start_limit: ?*que.que_node_t = null,
+    loop_end_limit: ?*que.que_node_t = null,
+    loop_end_value: lint = 0,
+    stat_list: ?*que.que_node_t = null,
+};
+
+pub const exit_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_EXIT },
+};
+
+pub const return_node_t = struct {
+    common: que.que_common_t = .{ .type = que.QUE_NODE_RETURN },
 };

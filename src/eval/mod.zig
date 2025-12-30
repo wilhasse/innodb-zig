@@ -16,6 +16,14 @@ pub const byte = compat.byte;
 pub const que_node_t = que.que_node_t;
 pub const func_node_t = pars.func_node_t;
 pub const sym_node_t = pars.sym_node_t;
+pub const que_thr_t = que.que_thr_t;
+pub const if_node_t = pars.if_node_t;
+pub const elsif_node_t = pars.elsif_node_t;
+pub const while_node_t = pars.while_node_t;
+pub const assign_node_t = pars.assign_node_t;
+pub const for_node_t = pars.for_node_t;
+pub const exit_node_t = pars.exit_node_t;
+pub const return_node_t = pars.return_node_t;
 pub const dfield_t = data.dfield_t;
 
 const UNIV_SQL_NULL: ulint = @as(ulint, compat.UNIV_SQL_NULL);
@@ -709,6 +717,134 @@ pub fn eval_func(func_node: *func_node_t) void {
     }
 }
 
+pub fn if_step(thr: *que_thr_t) *que_thr_t {
+    ut_ad(thr.run_node != null);
+    const node = @as(*if_node_t, @ptrCast(thr.run_node.?));
+    ut_ad(que.que_node_get_type(&node.common) == que.QUE_NODE_IF);
+
+    const parent = que.que_node_get_parent(&node.common);
+    if (thr.prev_node == parent) {
+        eval_exp(node.cond.?);
+        if (eval_node_get_ibool_val(node.cond.?) == compat.TRUE) {
+            thr.run_node = node.stat_list;
+        } else if (node.else_part != null) {
+            thr.run_node = node.else_part;
+        } else if (node.elsif_list != null) {
+            var elsif_node = node.elsif_list;
+            while (elsif_node) |cur| {
+                eval_exp(cur.cond.?);
+                if (eval_node_get_ibool_val(cur.cond.?) == compat.TRUE) {
+                    thr.run_node = cur.stat_list;
+                    break;
+                }
+                const next = que.que_node_get_next(&cur.common);
+                elsif_node = if (next) |ptr| @as(*elsif_node_t, @ptrCast(ptr)) else null;
+                if (elsif_node == null) {
+                    thr.run_node = null;
+                    break;
+                }
+            }
+        } else {
+            thr.run_node = null;
+        }
+    } else {
+        ut_ad(thr.prev_node != null);
+        ut_ad(que.que_node_get_next(thr.prev_node.?) == null);
+        thr.run_node = null;
+    }
+
+    if (thr.run_node == null) {
+        thr.run_node = parent;
+    }
+    return thr;
+}
+
+pub fn while_step(thr: *que_thr_t) *que_thr_t {
+    ut_ad(thr.run_node != null);
+    const node = @as(*while_node_t, @ptrCast(thr.run_node.?));
+    ut_ad(que.que_node_get_type(&node.common) == que.QUE_NODE_WHILE);
+
+    const parent = que.que_node_get_parent(&node.common);
+    ut_ad(thr.prev_node == parent or (thr.prev_node != null and que.que_node_get_next(thr.prev_node.?) == null));
+
+    eval_exp(node.cond.?);
+    if (eval_node_get_ibool_val(node.cond.?) == compat.TRUE) {
+        thr.run_node = node.stat_list;
+    } else {
+        thr.run_node = parent;
+    }
+
+    return thr;
+}
+
+pub fn assign_step(thr: *que_thr_t) *que_thr_t {
+    ut_ad(thr.run_node != null);
+    const node = @as(*assign_node_t, @ptrCast(thr.run_node.?));
+    ut_ad(que.que_node_get_type(&node.common) == que.QUE_NODE_ASSIGNMENT);
+
+    eval_exp(node.val.?);
+    eval_node_copy_val(&node.@"var".?.alias.?.common, node.val.?);
+    thr.run_node = que.que_node_get_parent(&node.common);
+    return thr;
+}
+
+pub fn for_step(thr: *que_thr_t) *que_thr_t {
+    ut_ad(thr.run_node != null);
+    const node = @as(*for_node_t, @ptrCast(thr.run_node.?));
+    ut_ad(que.que_node_get_type(&node.common) == que.QUE_NODE_FOR);
+
+    const parent = que.que_node_get_parent(&node.common);
+    var loop_var_value: lint = 0;
+
+    if (thr.prev_node != parent) {
+        ut_ad(thr.prev_node != null);
+        thr.run_node = que.que_node_get_next(thr.prev_node.?);
+        if (thr.run_node != null) {
+            return thr;
+        }
+        loop_var_value = 1 + eval_node_get_int_val(&node.loop_var.?.common);
+    } else {
+        eval_exp(node.loop_start_limit.?);
+        eval_exp(node.loop_end_limit.?);
+        loop_var_value = eval_node_get_int_val(node.loop_start_limit.?);
+        node.loop_end_value = eval_node_get_int_val(node.loop_end_limit.?);
+    }
+
+    if (loop_var_value > node.loop_end_value) {
+        thr.run_node = parent;
+    } else {
+        eval_node_set_int_val(&node.loop_var.?.common, loop_var_value);
+        thr.run_node = node.stat_list;
+    }
+
+    return thr;
+}
+
+pub fn exit_step(thr: *que_thr_t) *que_thr_t {
+    ut_ad(thr.run_node != null);
+    const node = @as(*exit_node_t, @ptrCast(thr.run_node.?));
+    ut_ad(que.que_node_get_type(&node.common) == que.QUE_NODE_EXIT);
+
+    const loop_node = que.que_node_get_containing_loop_node(&node.common);
+    ut_a(loop_node != null);
+    thr.run_node = que.que_node_get_parent(loop_node.?);
+    return thr;
+}
+
+pub fn return_step(thr: *que_thr_t) *que_thr_t {
+    ut_ad(thr.run_node != null);
+    const node = @as(*return_node_t, @ptrCast(thr.run_node.?));
+    ut_ad(que.que_node_get_type(&node.common) == que.QUE_NODE_RETURN);
+
+    var parent: *que_node_t = @ptrCast(&node.common);
+    while (que.que_node_get_type(parent) != que.QUE_NODE_PROC) {
+        parent = que.que_node_get_parent(parent).?;
+    }
+    ut_a(parent != null);
+    thr.run_node = que.que_node_get_parent(parent);
+    return thr;
+}
+
 fn set_int_type(node: *que_node_t) void {
     node.val.type = .{
         .mtype = data.DATA_INT,
@@ -809,4 +945,92 @@ test "eval to_char and concat" {
     const out_ptr = data.dfield_get_data(out_dfield).?;
     const out = @as([*]const byte, @ptrCast(out_ptr))[0..@as(usize, @intCast(out_len))];
     try std.testing.expectEqualStrings("abcd", out);
+}
+
+test "eval procedure steps" {
+    var parent_proc = pars.proc_node_t{};
+    var cond = sym_node_t{};
+    set_bool_node(&cond.common, compat.TRUE);
+    defer eval_node_free_val_buf(&cond.common);
+
+    var stmt = sym_node_t{};
+    var if_node = if_node_t{
+        .cond = &cond.common,
+        .stat_list = &stmt.common,
+    };
+    if_node.common.parent = &parent_proc.common;
+
+    var thr = que_thr_t{
+        .run_node = &if_node.common,
+        .prev_node = &parent_proc.common,
+    };
+    _ = if_step(&thr);
+    try std.testing.expect(thr.run_node == &stmt.common);
+
+    var while_node = while_node_t{
+        .cond = &cond.common,
+        .stat_list = &stmt.common,
+    };
+    while_node.common.parent = &parent_proc.common;
+    thr = .{ .run_node = &while_node.common, .prev_node = &parent_proc.common };
+    _ = while_step(&thr);
+    try std.testing.expect(thr.run_node == &stmt.common);
+
+    var dest = sym_node_t{};
+    set_int_type(&dest.common);
+    defer eval_node_free_val_buf(&dest.common);
+    var var_node = sym_node_t{ .alias = &dest };
+
+    var value = sym_node_t{};
+    set_int_type(&value.common);
+    eval_node_set_int_val(&value.common, 7);
+    defer eval_node_free_val_buf(&value.common);
+
+    var assign = assign_node_t{
+        .@"var" = &var_node,
+        .val = &value.common,
+    };
+    assign.common.parent = &parent_proc.common;
+    thr = .{ .run_node = &assign.common, .prev_node = &parent_proc.common };
+    _ = assign_step(&thr);
+    try std.testing.expectEqual(@as(lint, 7), eval_node_get_int_val(&dest.common));
+
+    var loop_var = sym_node_t{};
+    set_int_type(&loop_var.common);
+    defer eval_node_free_val_buf(&loop_var.common);
+    var start = sym_node_t{};
+    var end = sym_node_t{};
+    set_int_type(&start.common);
+    set_int_type(&end.common);
+    eval_node_set_int_val(&start.common, 1);
+    eval_node_set_int_val(&end.common, 2);
+    defer eval_node_free_val_buf(&start.common);
+    defer eval_node_free_val_buf(&end.common);
+
+    var for_node = for_node_t{
+        .loop_var = &loop_var,
+        .loop_start_limit = &start.common,
+        .loop_end_limit = &end.common,
+        .stat_list = &stmt.common,
+    };
+    for_node.common.parent = &parent_proc.common;
+    thr = .{ .run_node = &for_node.common, .prev_node = &parent_proc.common };
+    _ = for_step(&thr);
+    try std.testing.expect(thr.run_node == &stmt.common);
+    try std.testing.expectEqual(@as(lint, 1), eval_node_get_int_val(&loop_var.common));
+
+    var loop_parent = while_node_t{};
+    loop_parent.common.parent = &parent_proc.common;
+    var exit_node = exit_node_t{};
+    exit_node.common.parent = &loop_parent.common;
+    thr = .{ .run_node = &exit_node.common, .prev_node = &loop_parent.common };
+    _ = exit_step(&thr);
+    try std.testing.expect(thr.run_node == &parent_proc.common);
+
+    var outer = pars.proc_node_t{};
+    var ret = return_node_t{};
+    ret.common.parent = &outer.common;
+    thr = .{ .run_node = &ret.common, .prev_node = &outer.common };
+    _ = return_step(&thr);
+    try std.testing.expect(thr.run_node == null);
 }
