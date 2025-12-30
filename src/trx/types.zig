@@ -26,6 +26,13 @@ pub const TrxQueState = enum(u8) {
     error = 3,
 };
 
+pub const TrxConcState = enum(u8) {
+    not_started = 0,
+    active = 1,
+    committed_in_memory = 2,
+    prepared = 3,
+};
+
 pub fn dulintZero() dulint {
     return .{ .high = 0, .low = 0 };
 }
@@ -67,6 +74,11 @@ pub const trx_undo_record_t = struct {
 
 pub const trx_t = struct {
     id: trx_id_t = 0,
+    sess: ?*que.sess_t = null,
+    conc_state: TrxConcState = .not_started,
+    is_recovered: bool = false,
+    isolation_level: ulint = 0,
+    start_time: i64 = 0,
     undo_no: undo_no_t = dulintZero(),
     roll_limit: undo_no_t = dulintZero(),
     last_sql_stat_start: trx_savept_t = .{},
@@ -79,4 +91,6 @@ pub const trx_t = struct {
     undo_stack: std.ArrayListUnmanaged(trx_undo_record_t) = .{},
     allocator: std.mem.Allocator = std.heap.page_allocator,
     error_state: errors.DbErr = .DB_SUCCESS,
+    error_key_num: ulint = 0,
+    detailed_error: [128]u8 = [_]u8{0} ** 128,
 };
