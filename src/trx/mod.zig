@@ -16,3 +16,4 @@ pub const trx_t = types.trx_t;
 pub const purge = @import("purge.zig");
 pub const rec = @import("rec.zig");
 pub const roll = @import("roll.zig");
+pub const rseg = @import("rseg.zig");
