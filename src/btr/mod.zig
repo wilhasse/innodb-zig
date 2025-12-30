@@ -50,6 +50,9 @@ pub var btr_cur_n_sea: ulint = 0;
 pub var btr_cur_n_non_sea_old: ulint = 0;
 pub var btr_cur_n_sea_old: ulint = 0;
 pub const field_ref_zero = [_]byte{0} ** BTR_EXTERN_FIELD_REF_SIZE;
+pub var btr_search_enabled: u8 = 1;
+pub var btr_search_this_is_zero: ulint = 0;
+pub var btr_search_sys: ?*btr_search_sys_t = null;
 
 pub const rec_t = struct {
     prev: ?*rec_t = null,
@@ -84,6 +87,14 @@ pub const btr_pcur_t = struct {
     btr_cur: btr_cur_t = .{},
     rel_pos: ulint = 0,
     stored: bool = false,
+};
+
+pub const btr_search_t = struct {
+    ref_count: ulint = 0,
+};
+
+pub const btr_search_sys_t = struct {
+    hash_size: ulint = 0,
 };
 
 pub const dtuple_t = struct {};
@@ -746,6 +757,106 @@ pub fn btr_pcur_move_backward_from_page(cursor: *btr_pcur_t, mtr: *mtr_t) void {
     cursor.rel_pos = BTR_PCUR_BEFORE;
 }
 
+pub fn btr_search_sys_create(hash_size: ulint) void {
+    btr_search_sys_free();
+    const sys = std.heap.page_allocator.create(btr_search_sys_t) catch {
+        btr_search_sys = null;
+        return;
+    };
+    sys.* = .{ .hash_size = hash_size };
+    btr_search_sys = sys;
+    btr_search_enabled = 1;
+}
+
+pub fn btr_search_sys_free() void {
+    if (btr_search_sys) |sys| {
+        std.heap.page_allocator.destroy(sys);
+        btr_search_sys = null;
+    }
+}
+
+pub fn btr_search_disable() void {
+    btr_search_enabled = 0;
+}
+
+pub fn btr_search_enable() void {
+    btr_search_enabled = 1;
+}
+
+pub fn btr_search_info_create(heap: *mem_heap_t) ?*btr_search_t {
+    _ = heap;
+    const info = std.heap.page_allocator.create(btr_search_t) catch return null;
+    info.* = .{};
+    return info;
+}
+
+pub fn btr_search_info_get_ref_count(info: *btr_search_t) ulint {
+    return info.ref_count;
+}
+
+pub fn btr_search_guess_on_hash(
+    index: *dict_index_t,
+    info: *btr_search_t,
+    tuple: *const dtuple_t,
+    mode: ulint,
+    latch_mode: ulint,
+    cursor: *btr_cur_t,
+    has_search_latch: ulint,
+    mtr: *mtr_t,
+) ibool {
+    _ = index;
+    _ = info;
+    _ = tuple;
+    _ = mode;
+    _ = latch_mode;
+    _ = cursor;
+    _ = has_search_latch;
+    _ = mtr;
+    return compat.FALSE;
+}
+
+pub fn btr_search_move_or_delete_hash_entries(new_block: *buf_block_t, block: *buf_block_t, index: *dict_index_t) void {
+    _ = new_block;
+    _ = block;
+    _ = index;
+}
+
+pub fn btr_search_drop_page_hash_index(block: *buf_block_t) void {
+    _ = block;
+}
+
+pub fn btr_search_drop_page_hash_when_freed(space: ulint, zip_size: ulint, page_no: ulint) void {
+    _ = space;
+    _ = zip_size;
+    _ = page_no;
+}
+
+pub fn btr_search_update_hash_node_on_insert(cursor: *btr_cur_t) void {
+    _ = cursor;
+}
+
+pub fn btr_search_update_hash_on_insert(cursor: *btr_cur_t) void {
+    _ = cursor;
+}
+
+pub fn btr_search_update_hash_on_delete(cursor: *btr_cur_t) void {
+    _ = cursor;
+}
+
+pub fn btr_search_validate() ibool {
+    return compat.TRUE;
+}
+
+pub fn btr_search_var_init() void {
+    btr_search_enabled = 1;
+    btr_search_this_is_zero = 0;
+}
+
+pub fn btr_search_sys_close() void {
+    btr_search_sys_free();
+    btr_search_enabled = 0;
+}
+
 test "btr prev and next user record stubs" {
     var a = rec_t{};
     var b = rec_t{};
@@ -845,4 +956,30 @@ test "btr persistent cursor state" {
     btr_pcur_copy_stored_position(&other, pcur);
     try std.testing.expectEqual(pcur.rel_pos, other.rel_pos);
     try std.testing.expect(other.stored);
+}
+
+test "btr search stubs" {
+    btr_search_disable();
+    try std.testing.expectEqual(@as(u8, 0), btr_search_enabled);
+    btr_search_enable();
+    try std.testing.expectEqual(@as(u8, 1), btr_search_enabled);
+
+    btr_search_sys_create(128);
+    try std.testing.expect(btr_search_sys != null);
+    btr_search_sys_free();
+    try std.testing.expect(btr_search_sys == null);
+
+    var heap = mem_heap_t{};
+    const info = btr_search_info_create(&heap) orelse return error.OutOfMemory;
+    defer std.heap.page_allocator.destroy(info);
+    try std.testing.expectEqual(@as(ulint, 0), btr_search_info_get_ref_count(info));
+
+    var index = dict_index_t{};
+    var tuple = dtuple_t{};
+    var cursor = btr_cur_t{};
+    var mtr = mtr_t{};
+    try std.testing.expect(btr_search_guess_on_hash(&index, info, &tuple, 0, 0, &cursor, 0, &mtr) == compat.FALSE);
+
+    btr_search_var_init();
+    try std.testing.expectEqual(@as(u8, 1), btr_search_enabled);
 }
