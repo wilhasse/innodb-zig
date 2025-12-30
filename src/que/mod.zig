@@ -8,6 +8,7 @@ pub const ulint = compat.ulint;
 
 pub const QUE_NODE_SYMBOL: ulint = 16;
 pub const QUE_NODE_FUNC: ulint = 18;
+pub const QUE_NODE_ORDER: ulint = 19;
 pub const QUE_NODE_FORK: ulint = 8;
 pub const QUE_NODE_ASSIGNMENT: ulint = 23;
 pub const QUE_NODE_RETURN: ulint = 28;
