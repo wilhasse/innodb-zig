@@ -88,6 +88,43 @@ pub fn cmp_dfield_dfield(cmp_ctx: ?*anyopaque, dfield1: *const data.dfield_t, df
     return cmp_data_data(cmp_ctx, type1.mtype, type1.prtype, if (ptr1) |p| @as([*]const byte, @ptrCast(p)) else null, len1, if (ptr2) |p| @as([*]const byte, @ptrCast(p)) else null, len2);
 }
 
+pub const rec_simple_t = struct {
+    data: []u8,
+    offsets: []u16,
+    n_fields: usize,
+
+    pub fn deinit(self: *rec_simple_t, allocator: std.mem.Allocator) void {
+        allocator.free(self.data);
+        allocator.free(self.offsets);
+        self.* = .{ .data = &[_]u8{}, .offsets = &[_]u16{}, .n_fields = 0 };
+    }
+};
+
+pub fn rec_simple_pack(fields: []const []const u8, allocator: std.mem.Allocator) rec_simple_t {
+    var total: usize = 0;
+    for (fields) |field| {
+        total += field.len;
+    }
+    const data_buf = allocator.alloc(u8, total) catch @panic("rec_simple_pack");
+    const offsets = allocator.alloc(u16, fields.len) catch @panic("rec_simple_pack");
+    var pos: usize = 0;
+    for (fields, 0..) |field, i| {
+        std.mem.copyForwards(u8, data_buf[pos .. pos + field.len], field);
+        pos += field.len;
+        offsets[i] = @as(u16, @intCast(pos));
+    }
+    return .{ .data = data_buf, .offsets = offsets, .n_fields = fields.len };
+}
+
+pub fn rec_simple_get_nth_field(rec: *const rec_simple_t, n: usize) []const u8 {
+    if (n >= rec.n_fields) {
+        return &[_]u8{};
+    }
+    const end = rec.offsets[n];
+    const start: u16 = if (n == 0) 0 else rec.offsets[n - 1];
+    return rec.data[@as(usize, start)..@as(usize, end)];
+}
+
 test "cmp cols are equal basic" {
     var col1 = dict.dict_col_t{ .mtype = data.DATA_INT, .prtype = 0, .len = 4 };
     var col2 = dict.dict_col_t{ .mtype = data.DATA_INT, .prtype = 0, .len = 4 };
@@ -102,4 +139,14 @@ test "cmp data data lexicographic" {
     const b = "abd";
     const res = cmp_data_data(null, data.DATA_VARCHAR, 0, a.ptr, a.len, b.ptr, b.len);
     try std.testing.expect(res < 0);
+}
+
+test "rec simple pack and unpack" {
+    const allocator = std.testing.allocator;
+    var rec = rec_simple_pack(&.{ "aa", "bbb", "" }, allocator);
+    defer rec.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), rec.n_fields);
+    try std.testing.expectEqualStrings("aa", rec_simple_get_nth_field(&rec, 0));
+    try std.testing.expectEqualStrings("bbb", rec_simple_get_nth_field(&rec, 1));
+    try std.testing.expectEqualStrings("", rec_simple_get_nth_field(&rec, 2));
 }
