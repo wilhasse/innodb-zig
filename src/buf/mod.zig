@@ -404,6 +404,64 @@ pub fn buf_page_init_for_backup_restore(space: ulint, offset: ulint, zip_size: u
     _ = block;
 }
 
+pub const buf_flush = enum(u8) {
+    BUF_FLUSH_LRU = 0,
+    BUF_FLUSH_SINGLE_PAGE = 1,
+    BUF_FLUSH_LIST = 2,
+    BUF_FLUSH_N_TYPES = 3,
+};
+
+pub const buf_flush_stat_t = struct {
+    redo: ib_uint64_t = 0,
+    n_flushed: ulint = 0,
+};
+
+pub const BUF_READ_AHEAD_AREA: ulint = 0;
+pub const BUF_FLUSH_FREE_BLOCK_MARGIN: ulint = 5 + BUF_READ_AHEAD_AREA;
+pub const BUF_FLUSH_EXTRA_MARGIN: ulint = BUF_FLUSH_FREE_BLOCK_MARGIN / 4 + 100;
+
+pub fn buf_flush_remove(bpage: *buf_page_t) void {
+    _ = bpage;
+}
+
+pub fn buf_flush_write_complete(bpage: *buf_page_t) void {
+    _ = bpage;
+}
+
+pub fn buf_flush_free_margin() void {}
+
+pub fn buf_flush_init_for_writing(page: [*]byte, page_zip_: ?*anyopaque, newest_lsn: ib_uint64_t) void {
+    _ = page;
+    _ = page_zip_;
+    _ = newest_lsn;
+}
+
+pub fn buf_flush_batch(flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
+    _ = flush_type;
+    _ = min_n;
+    _ = lsn_limit;
+    return 0;
+}
+
+pub fn buf_flush_wait_batch_end(flush_type: buf_flush) void {
+    _ = flush_type;
+}
+
+pub fn buf_flush_ready_for_replace(bpage: *buf_page_t) ibool {
+    _ = bpage;
+    return compat.TRUE;
+}
+
+pub fn buf_flush_stat_update() void {}
+
+pub fn buf_flush_get_desired_flush_rate() ulint {
+    return 0;
+}
+
+pub fn buf_flush_validate() ibool {
+    return compat.TRUE;
+}
+
 test "buf buddy slot and alloc/free" {
     buf_buddy_var_init();
     try std.testing.expectEqual(@as(ulint, 0), buf_buddy_get_slot(BUF_BUDDY_LOW));
@@ -444,4 +502,11 @@ test "buf block alloc and frame copy" {
     _ = buf_frame_copy(dst[0..].ptr, src[0..].ptr);
     try std.testing.expectEqual(@as(byte, 1), dst[0]);
     try std.testing.expectEqual(@as(byte, 4), dst[3]);
+}
+
+test "buf flush stubs" {
+    var page = buf_page_t{};
+    try std.testing.expectEqual(compat.TRUE, buf_flush_ready_for_replace(&page));
+    try std.testing.expectEqual(@as(ulint, 0), buf_flush_get_desired_flush_rate());
+    try std.testing.expectEqual(@as(ulint, 0), buf_flush_batch(.BUF_FLUSH_LRU, 0, 0));
 }
