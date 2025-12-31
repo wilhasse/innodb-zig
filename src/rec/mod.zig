@@ -549,6 +549,42 @@ pub fn cmp_dtuple_is_prefix_of_rec(cmp_ctx: ?*anyopaque, dtuple: *const data.dtu
     return compat.FALSE;
 }
 
+pub fn rec_encode_fixed(tuple: *const data.dtuple_t, field_lens: []const ulint, out: []byte) ulint {
+    std.debug.assert(tuple.n_fields == @as(ulint, @intCast(field_lens.len)));
+    var total: ulint = 0;
+    for (field_lens) |len| {
+        total += len;
+    }
+    std.debug.assert(out.len >= @as(usize, @intCast(total)));
+
+    var pos: ulint = 0;
+    for (field_lens, 0..) |len, i| {
+        const field = data.dtuple_get_nth_field(tuple, @intCast(i));
+        const field_len = data.dfield_get_len(field);
+        std.debug.assert(field_len == len or field_len == compat.UNIV_SQL_NULL);
+
+        const start = @as(usize, @intCast(pos));
+        const end = @as(usize, @intCast(pos + len));
+        const dest = out[start..end];
+
+        if (field_len == compat.UNIV_SQL_NULL) {
+            @memset(dest, 0);
+        } else {
+            const src_ptr = data.dfield_get_data(field) orelse {
+                @memset(dest, 0);
+                pos += len;
+                continue;
+            };
+            const src = @as([*]const byte, @ptrCast(src_ptr))[0..@as(usize, @intCast(len))];
+            std.mem.copyForwards(u8, dest, src);
+        }
+
+        pos += len;
+    }
+
+    return pos;
+}
+
 test "rec constants match C defaults" {
     try std.testing.expectEqual(@as(ulint, 1023), REC_MAX_N_FIELDS);
     try std.testing.expectEqual(@as(ulint, 16383), REC_MAX_HEAP_NO);
@@ -661,4 +697,31 @@ test "rec compare null and prefix" {
 
     data.dfield_set_data(&field, "ab".ptr, 2);
     try std.testing.expectEqual(compat.TRUE, cmp_dtuple_is_prefix_of_rec(null, &tuple, rec, offsets[0..]));
+}
+
+test "rec encode fixed-length tuple" {
+    var fields = [_]data.dfield_t{
+        .{ .type = .{ .mtype = data.DATA_BINARY, .prtype = data.DATA_BINARY_TYPE } },
+        .{ .type = .{ .mtype = data.DATA_CHAR, .prtype = 0 } },
+    };
+    data.dfield_set_data(&fields[0], "ab".ptr, 2);
+    data.dfield_set_data(&fields[1], "wxyz".ptr, 4);
+    var tuple = data.dtuple_t{ .n_fields = 2, .n_fields_cmp = 2, .fields = fields[0..] };
+
+    const lens = [_]ulint{ 2, 4 };
+    var rec_buf = [_]byte{0} ** 8;
+    const written = rec_encode_fixed(&tuple, &lens, rec_buf[0..]);
+    try std.testing.expectEqual(@as(ulint, 6), written);
+
+    var offsets = [_]ulint{0} ** 16;
+    rec_init_offsets_fixed(&lens, offsets[0..], true);
+
+    var len: ulint = 0;
+    const f0 = rec_get_nth_field(rec_buf[0..].ptr, offsets[0..], 0, &len);
+    try std.testing.expectEqual(@as(ulint, 2), len);
+    try std.testing.expectEqualStrings("ab", f0[0..2]);
+
+    const f1 = rec_get_nth_field(rec_buf[0..].ptr, offsets[0..], 1, &len);
+    try std.testing.expectEqual(@as(ulint, 4), len);
+    try std.testing.expectEqualStrings("wxyz", f1[0..4]);
 }
