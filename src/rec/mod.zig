@@ -21,6 +21,11 @@ pub const REC_MAX_N_OWNED: ulint = 16 - 1;
 // Maximum indexed column length (or prefix length), in bytes.
 pub const REC_MAX_INDEX_COL_LEN: ulint = 768;
 
+pub const REC_INFIMUM_EXTRA = [_]byte{ 0x01, 0x00, 0x02 };
+pub const REC_INFIMUM_DATA = [_]byte{ 'i', 'n', 'f', 'i', 'm', 'u', 'm', 0x00 };
+pub const REC_SUPREMUM_EXTRA = [_]byte{ 0x01, 0x00, 0x0b, 0x00, 0x00 };
+pub const REC_SUPREMUM_DATA = [_]byte{ 's', 'u', 'p', 'r', 'e', 'm', 'u', 'm' };
+
 // Info bits.
 pub const REC_INFO_MIN_REC_FLAG: ulint = 0x10;
 pub const REC_INFO_DELETED_FLAG: ulint = 0x20;
@@ -118,6 +123,30 @@ pub fn rec_set_bit_field_2(rec: [*]byte, val: ulint, offs: ulint, mask: ulint, s
     const ptr = rec_ptr_mut(rec, offs);
     const current = mach.mach_read_from_2(ptr);
     mach.mach_write_to_2(ptr, (current & ~mask) | (val << shift));
+}
+
+pub fn rec_get_status(rec: [*]const byte) ulint {
+    return rec_get_bit_field_1(rec, REC_NEW_STATUS, REC_NEW_STATUS_MASK, REC_NEW_STATUS_SHIFT);
+}
+
+pub fn rec_set_status(rec: [*]byte, status: ulint) void {
+    rec_set_bit_field_1(rec, status, REC_NEW_STATUS, REC_NEW_STATUS_MASK, REC_NEW_STATUS_SHIFT);
+}
+
+pub fn rec_is_infimum(rec: [*]const byte) bool {
+    return rec_get_status(rec) == REC_STATUS_INFIMUM;
+}
+
+pub fn rec_is_supremum(rec: [*]const byte) bool {
+    return rec_get_status(rec) == REC_STATUS_SUPREMUM;
+}
+
+pub fn rec_is_infimum_data(rec: [*]const byte) bool {
+    return std.mem.eql(u8, rec[0..REC_INFIMUM_DATA.len], REC_INFIMUM_DATA[0..]);
+}
+
+pub fn rec_is_supremum_data(rec: [*]const byte) bool {
+    return std.mem.eql(u8, rec[0..REC_SUPREMUM_DATA.len], REC_SUPREMUM_DATA[0..]);
 }
 
 pub fn rec_get_n_owned_old(rec: [*]const byte) ulint {
@@ -949,4 +978,24 @@ test "rec decode compact varlen/null/prefix" {
     try std.testing.expectEqualStrings("OK", @as([*]const byte, @ptrCast(f2))[0..2]);
     const f3 = data.dfield_get_data(&out_fields[3]).?;
     try std.testing.expect(std.mem.allEqual(u8, @as([*]const byte, @ptrCast(f3))[0..200], 'x'));
+}
+
+test "rec infimum/supremum templates and detection" {
+    try std.testing.expectEqualSlices(u8, REC_INFIMUM_DATA[0..], "infimum\x00");
+    try std.testing.expectEqualSlices(u8, REC_SUPREMUM_DATA[0..], "supremum");
+
+    var buf = [_]byte{0} ** 32;
+    const rec = @as([*]byte, @ptrCast(&buf[16]));
+
+    std.mem.copyForwards(u8, buf[16 .. 16 + REC_INFIMUM_DATA.len], REC_INFIMUM_DATA[0..]);
+    rec_set_status(rec, REC_STATUS_INFIMUM);
+    try std.testing.expect(rec_is_infimum(@as([*]const byte, rec)));
+    try std.testing.expect(rec_is_infimum_data(@as([*]const byte, rec)));
+    try std.testing.expect(!rec_is_supremum(@as([*]const byte, rec)));
+
+    std.mem.copyForwards(u8, buf[16 .. 16 + REC_SUPREMUM_DATA.len], REC_SUPREMUM_DATA[0..]);
+    rec_set_status(rec, REC_STATUS_SUPREMUM);
+    try std.testing.expect(rec_is_supremum(@as([*]const byte, rec)));
+    try std.testing.expect(rec_is_supremum_data(@as([*]const byte, rec)));
+    try std.testing.expect(!rec_is_infimum(@as([*]const byte, rec)));
 }
