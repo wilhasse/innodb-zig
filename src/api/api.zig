@@ -929,6 +929,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     dict.dict_var_init();
     dict.dict_init();
     dict.dict_create();
+    _ = dict.dict_sys_metadata_load();
 
     cfg_started = true;
     return .DB_SUCCESS;
@@ -939,6 +940,7 @@ pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     btr.btr_search_sys_close();
     trx_sys.trx_sys_close();
     fil.fil_close();
+    _ = dict.dict_sys_metadata_save();
     dict.dict_close();
     buf_mod.buf_close();
     buf_mod.buf_mem_free();

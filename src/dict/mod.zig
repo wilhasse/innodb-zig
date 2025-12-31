@@ -3,8 +3,13 @@ const compat = @import("../ut/compat.zig");
 const errors = @import("../ut/errors.zig");
 const data = @import("../data/mod.zig");
 const charset = @import("../ut/charset.zig");
+const fil = @import("../fil/mod.zig");
 
 pub const module_name = "dict";
+
+const SYS_META_FILE: []const u8 = "dict_sys.meta";
+const SYS_META_VERSION: u32 = 1;
+const SYS_META_MAX_SIZE: usize = 1024 * 1024;
 
 pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
@@ -448,6 +453,204 @@ pub fn dict_sys_index_count_for_table_name(name: []const u8) ulint {
         }
     }
     return count;
+}
+
+fn dict_sys_metadata_path(allocator: std.mem.Allocator) ?[]u8 {
+    const base = fil.fil_path_to_client_datadir;
+    const needs_sep = base.len > 0 and
+        !std.mem.endsWith(u8, base, "/") and
+        !std.mem.endsWith(u8, base, "\\");
+    const sep = if (needs_sep) "/" else "";
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, sep, SYS_META_FILE }) catch null;
+}
+
+pub fn dict_sys_metadata_save() ibool {
+    const allocator = std.heap.page_allocator;
+    if (dict_sys.sys_tables.items.len == 0 and dict_sys.sys_columns.items.len == 0 and dict_sys.sys_indexes.items.len == 0) {
+        const path = dict_sys_metadata_path(allocator) orelse return compat.FALSE;
+        defer allocator.free(path);
+        std.fs.cwd().deleteFile(path) catch |err| {
+            if (err != error.FileNotFound) {
+                return compat.FALSE;
+            }
+        };
+        return compat.TRUE;
+    }
+    if (fil.fil_path_to_client_datadir.len > 0) {
+        std.fs.cwd().makePath(fil.fil_path_to_client_datadir) catch {};
+    }
+    const path = dict_sys_metadata_path(allocator) orelse return compat.FALSE;
+    defer allocator.free(path);
+    var file = std.fs.cwd().createFile(path, .{ .truncate = true, .read = false }) catch return compat.FALSE;
+    defer file.close();
+
+    const header = std.fmt.allocPrint(allocator, "V {d}\n", .{SYS_META_VERSION}) catch return compat.FALSE;
+    defer allocator.free(header);
+    file.writeAll(header) catch return compat.FALSE;
+    for (dict_sys.sys_tables.items) |row| {
+        const line = std.fmt.allocPrint(
+            allocator,
+            "T {d} {d} {d} {d} {d} {s}\n",
+            .{ dulintGetHigh(row.id), dulintGetLow(row.id), row.space, row.n_cols, row.flags, row.name },
+        ) catch return compat.FALSE;
+        defer allocator.free(line);
+        file.writeAll(line) catch return compat.FALSE;
+    }
+    for (dict_sys.sys_columns.items) |row| {
+        const line = std.fmt.allocPrint(
+            allocator,
+            "C {d} {d} {d} {d} {d} {d} {s}\n",
+            .{ dulintGetHigh(row.table_id), dulintGetLow(row.table_id), row.pos, row.mtype, row.prtype, row.len, row.name },
+        ) catch return compat.FALSE;
+        defer allocator.free(line);
+        file.writeAll(line) catch return compat.FALSE;
+    }
+    for (dict_sys.sys_indexes.items) |row| {
+        const line = std.fmt.allocPrint(
+            allocator,
+            "I {d} {d} {d} {d} {d} {d} {s}\n",
+            .{
+                dulintGetHigh(row.id),
+                dulintGetLow(row.id),
+                dulintGetHigh(row.table_id),
+                dulintGetLow(row.table_id),
+                row.type,
+                row.space,
+                row.name,
+            },
+        ) catch return compat.FALSE;
+        defer allocator.free(line);
+        file.writeAll(line) catch return compat.FALSE;
+    }
+    return compat.TRUE;
+}
+
+fn dict_sys_load_cache() void {
+    var heap = mem_heap_t{};
+    for (dict_sys.sys_tables.items) |row| {
+        if (dict_table_get_low(row.name) != null) {
+            continue;
+        }
+        const table = dict_mem_table_create(row.name, row.space, row.n_cols, row.flags) orelse continue;
+        table.id = row.id;
+
+        var pos: ulint = 0;
+        while (pos < row.n_cols) : (pos += 1) {
+            for (dict_sys.sys_columns.items) |col| {
+                if (dulintEqual(col.table_id, row.id) and col.pos == pos) {
+                    dict_mem_table_add_col(table, null, col.name, col.mtype, col.prtype, col.len);
+                    break;
+                }
+            }
+        }
+
+        dict_table_add_system_columns(table, &heap);
+        dict_table_add_to_cache(table, &heap);
+    }
+
+    for (dict_sys.sys_indexes.items) |row| {
+        const table = dict_table_get_on_id_low(0, row.table_id) orelse continue;
+        const index = dict_mem_index_create(table.name, row.name, row.space, row.type, 1) orelse continue;
+        if (table.cols.items.len > 0) {
+            dict_index_add_col(index, table, &table.cols.items[0], 0);
+        }
+        index.id = row.id;
+        _ = dict_index_add_to_cache(table, index, 0, compat.FALSE);
+    }
+}
+
+pub fn dict_sys_metadata_load() ibool {
+    const allocator = std.heap.page_allocator;
+    const path = dict_sys_metadata_path(allocator) orelse return compat.FALSE;
+    defer allocator.free(path);
+    var file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        return if (err == error.FileNotFound) compat.TRUE else compat.FALSE;
+    };
+    defer file.close();
+    const file_data = file.readToEndAlloc(allocator, SYS_META_MAX_SIZE) catch return compat.FALSE;
+    defer allocator.free(file_data);
+
+    dict_sys_metadata_clear();
+    dict_sys.sys_tables = .{};
+    dict_sys.sys_columns = .{};
+    dict_sys.sys_indexes = .{};
+
+    var lines = std.mem.splitScalar(u8, file_data, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) {
+            continue;
+        }
+        var tok = std.mem.tokenizeScalar(u8, line, ' ');
+        const kind = tok.next() orelse continue;
+        if (std.mem.eql(u8, kind, "V")) {
+            _ = tok.next();
+            continue;
+        }
+        if (std.mem.eql(u8, kind, "T")) {
+            const high_txt = tok.next() orelse continue;
+            const low_txt = tok.next() orelse continue;
+            const space_txt = tok.next() orelse continue;
+            const cols_txt = tok.next() orelse continue;
+            const flags_txt = tok.next() orelse continue;
+            const name_txt = tok.next() orelse continue;
+            const high = std.fmt.parseInt(ulint, high_txt, 10) catch continue;
+            const low = std.fmt.parseInt(ulint, low_txt, 10) catch continue;
+            const space = std.fmt.parseInt(ulint, space_txt, 10) catch continue;
+            const n_cols = std.fmt.parseInt(ulint, cols_txt, 10) catch continue;
+            const flags = std.fmt.parseInt(ulint, flags_txt, 10) catch continue;
+            if (dict_sys_table_insert(name_txt, dulintCreate(high, low), space, n_cols, flags) == compat.FALSE) {
+                return compat.FALSE;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, kind, "C")) {
+            const high_txt = tok.next() orelse continue;
+            const low_txt = tok.next() orelse continue;
+            const pos_txt = tok.next() orelse continue;
+            const mtype_txt = tok.next() orelse continue;
+            const prtype_txt = tok.next() orelse continue;
+            const len_txt = tok.next() orelse continue;
+            const name_txt = tok.next() orelse continue;
+            const high = std.fmt.parseInt(ulint, high_txt, 10) catch continue;
+            const low = std.fmt.parseInt(ulint, low_txt, 10) catch continue;
+            const pos = std.fmt.parseInt(ulint, pos_txt, 10) catch continue;
+            const mtype = std.fmt.parseInt(ulint, mtype_txt, 10) catch continue;
+            const prtype = std.fmt.parseInt(ulint, prtype_txt, 10) catch continue;
+            const len = std.fmt.parseInt(ulint, len_txt, 10) catch continue;
+            if (dict_sys_column_insert(dulintCreate(high, low), name_txt, pos, mtype, prtype, len) == compat.FALSE) {
+                return compat.FALSE;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, kind, "I")) {
+            const idx_high_txt = tok.next() orelse continue;
+            const idx_low_txt = tok.next() orelse continue;
+            const tbl_high_txt = tok.next() orelse continue;
+            const tbl_low_txt = tok.next() orelse continue;
+            const type_txt = tok.next() orelse continue;
+            const space_txt = tok.next() orelse continue;
+            const name_txt = tok.next() orelse continue;
+            const idx_high = std.fmt.parseInt(ulint, idx_high_txt, 10) catch continue;
+            const idx_low = std.fmt.parseInt(ulint, idx_low_txt, 10) catch continue;
+            const tbl_high = std.fmt.parseInt(ulint, tbl_high_txt, 10) catch continue;
+            const tbl_low = std.fmt.parseInt(ulint, tbl_low_txt, 10) catch continue;
+            const type_val = std.fmt.parseInt(ulint, type_txt, 10) catch continue;
+            const space = std.fmt.parseInt(ulint, space_txt, 10) catch continue;
+            if (dict_sys_index_insert(
+                dulintCreate(tbl_high, tbl_low),
+                dulintCreate(idx_high, idx_low),
+                name_txt,
+                type_val,
+                space,
+            ) == compat.FALSE) {
+                return compat.FALSE;
+            }
+            continue;
+        }
+    }
+
+    dict_sys_load_cache();
+    return compat.TRUE;
 }
 
 pub fn tab_create_graph_create(table: *dict_table_t, heap: *mem_heap_t, commit: ibool) ?*tab_node_t {
