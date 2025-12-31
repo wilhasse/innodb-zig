@@ -56,6 +56,11 @@ pub const dict_index_t = dict.dict_index_t;
 pub const dtuple_t = data.dtuple_t;
 pub const mtr_t = struct {};
 
+pub const extern_field_t = struct {
+    field_no: ulint = 0,
+    data: []u8 = &[_]u8{},
+};
+
 pub const rec_t = struct {
     prev: ?*rec_t = null,
     next: ?*rec_t = null,
@@ -67,6 +72,7 @@ pub const rec_t = struct {
     key: i64 = 0,
     child_page_no: ulint = 0,
     child_block: ?*buf_block_t = null,
+    extern_fields: []extern_field_t = &[_]extern_field_t{},
 };
 
 pub const PageHeader = struct {

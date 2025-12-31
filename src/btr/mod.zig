@@ -3,6 +3,7 @@ const compat = @import("../ut/compat.zig");
 const page = @import("../page/mod.zig");
 const dict = @import("../dict/mod.zig");
 const data = @import("../data/mod.zig");
+const mem = @import("../mem/mod.zig");
 
 pub const module_name = "btr";
 
@@ -77,8 +78,9 @@ pub const upd_t = struct {
     size_change: bool = false,
 };
 pub const que_thr_t = struct {};
-pub const big_rec_t = struct {};
-pub const mem_heap_t = struct {};
+pub const big_rec_field_t = data.big_rec_field_t;
+pub const big_rec_t = data.big_rec_t;
+pub const mem_heap_t = mem.mem_heap_t;
 pub const trx_t = struct {};
 pub const page_cur_t = page.page_cur_t;
 pub const trx_rb_ctx = enum(u8) {
@@ -1329,6 +1331,28 @@ pub fn btr_estimate_number_of_different_key_vals(index: *dict_index_t) ib_int64_
     return count;
 }
 
+fn rec_clear_extern_fields(rec: *rec_t) void {
+    const allocator = std.heap.page_allocator;
+    for (rec.extern_fields) |field| {
+        if (field.data.len > 0) {
+            allocator.free(field.data);
+        }
+    }
+    if (rec.extern_fields.len > 0) {
+        allocator.free(rec.extern_fields);
+    }
+    rec.extern_fields = &[_]page.extern_field_t{};
+}
+
+fn rec_find_extern_field_index(rec: *const rec_t, field_no: ulint) ?usize {
+    for (rec.extern_fields, 0..) |field, idx| {
+        if (field.field_no == field_no) {
+            return idx;
+        }
+    }
+    return null;
+}
+
 pub fn btr_cur_mark_extern_inherited_fields(
     page_zip: ?*page_zip_des_t,
     rec: *rec_t,
@@ -1370,11 +1394,55 @@ pub fn btr_store_big_rec_extern_fields(
     local_mtr: ?*mtr_t,
 ) ulint {
     _ = index;
-    _ = rec_block;
-    _ = rec;
     _ = offsets;
-    _ = big_rec_vec;
     _ = local_mtr;
+    if (big_rec_vec.n_fields == 0) {
+        return 0;
+    }
+
+    rec_clear_extern_fields(rec);
+
+    const allocator = std.heap.page_allocator;
+    const field_count = @as(usize, @intCast(big_rec_vec.n_fields));
+    var valid_count: usize = 0;
+    for (big_rec_vec.fields[0..field_count]) |field| {
+        if (field.len == 0 or field.data == null) {
+            continue;
+        }
+        valid_count += 1;
+    }
+
+    if (valid_count == 0) {
+        return 0;
+    }
+
+    var fields = allocator.alloc(page.extern_field_t, valid_count) catch return 1;
+    var stored: usize = 0;
+
+    for (big_rec_vec.fields[0..field_count]) |field| {
+        if (field.len == 0 or field.data == null) {
+            continue;
+        }
+        const len = @as(usize, @intCast(field.len));
+        const src = @as([*]const u8, @ptrCast(field.data.?))[0..len];
+        const buf = allocator.alloc(u8, len) catch {
+            for (fields[0..stored]) |stored_field| {
+                if (stored_field.data.len > 0) {
+                    allocator.free(stored_field.data);
+                }
+            }
+            allocator.free(fields);
+            return 1;
+        };
+        std.mem.copyForwards(u8, buf, src);
+        fields[stored] = .{ .field_no = field.field_no, .data = buf };
+        stored += 1;
+    }
+
+    rec.extern_fields = fields[0..stored];
+    if (rec_block.page_zip) |zip| {
+        zip.n_blobs = @as(u16, @intCast(rec.extern_fields.len));
+    }
     return 0;
 }
 
@@ -1390,12 +1458,27 @@ pub fn btr_free_externally_stored_field(
 ) void {
     _ = index;
     _ = field_ref;
-    _ = rec;
     _ = offsets;
     _ = page_zip;
-    _ = i;
     _ = rb_ctx;
     _ = local_mtr;
+    const rec_ptr = rec orelse return;
+    const idx = rec_find_extern_field_index(rec_ptr, i) orelse return;
+    const allocator = std.heap.page_allocator;
+    var fields = rec_ptr.extern_fields;
+    if (fields[idx].data.len > 0) {
+        allocator.free(fields[idx].data);
+    }
+    const last = fields.len - 1;
+    if (idx != last) {
+        fields[idx] = fields[last];
+    }
+    if (last == 0) {
+        allocator.free(fields);
+        @constCast(rec_ptr).extern_fields = &[_]page.extern_field_t{};
+    } else {
+        @constCast(rec_ptr).extern_fields = fields[0..last];
+    }
 }
 
 pub fn btr_copy_externally_stored_field_prefix(
@@ -1422,13 +1505,24 @@ pub fn btr_rec_copy_externally_stored_field(
     len: *ulint,
     heap: *mem_heap_t,
 ) ?[*]byte {
-    _ = rec;
     _ = offsets;
     _ = zip_size;
-    _ = no;
-    _ = heap;
-    len.* = 0;
-    return null;
+    const idx = rec_find_extern_field_index(rec, no) orelse {
+        len.* = 0;
+        return null;
+    };
+    const field = rec.extern_fields[idx];
+    if (field.data.len == 0) {
+        len.* = 0;
+        return null;
+    }
+    const buf = mem.mem_heap_alloc(heap, @as(ulint, @intCast(field.data.len))) orelse {
+        len.* = 0;
+        return null;
+    };
+    std.mem.copyForwards(u8, buf, field.data);
+    len.* = @as(ulint, @intCast(field.data.len));
+    return buf.ptr;
 }
 
 pub fn btr_pcur_create() ?*btr_pcur_t {
@@ -2442,6 +2536,45 @@ test "btr external field prefix copy" {
     const copied = btr_copy_externally_stored_field_prefix(buf[0..].ptr, 5, 0, payload[0..].ptr, 3);
     try std.testing.expectEqual(@as(ulint, 3), copied);
     try std.testing.expectEqualStrings("abc", buf[0..3]);
+}
+
+test "btr external field store copy free" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var page_obj = page_t{};
+    page.page_init(&page_obj);
+    var block = buf_block_t{ .frame = &page_obj };
+
+    var rec = rec_t{};
+    const blob1 = "blob-one";
+    const blob2 = "longer-blob-two";
+    var big_fields = [_]big_rec_field_t{
+        .{ .field_no = 1, .len = @intCast(blob1.len), .data = blob1.ptr },
+        .{ .field_no = 3, .len = @intCast(blob2.len), .data = blob2.ptr },
+    };
+    var big_rec = big_rec_t{ .heap = null, .n_fields = big_fields.len, .fields = big_fields[0..] };
+
+    var offsets: ulint = 0;
+    try std.testing.expectEqual(@as(ulint, 0), btr_store_big_rec_extern_fields(index, &block, &rec, &offsets, &big_rec, null));
+    try std.testing.expectEqual(@as(usize, 2), rec.extern_fields.len);
+
+    const heap = mem.mem_heap_create_func(0, mem.MEM_HEAP_DYNAMIC) orelse return error.OutOfMemory;
+    defer mem.mem_heap_free_func(heap);
+
+    var len: ulint = 0;
+    const out_ptr = btr_rec_copy_externally_stored_field(&rec, &offsets, 0, 3, &len, heap) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, blob2.len), len);
+    try std.testing.expect(std.mem.eql(u8, out_ptr[0..@as(usize, @intCast(len))], blob2));
+
+    var ref_buf = [_]byte{0};
+    btr_free_externally_stored_field(index, ref_buf[0..].ptr, &rec, &offsets, null, 1, .TRX_RB_NONE, null);
+    try std.testing.expectEqual(@as(usize, 1), rec.extern_fields.len);
+
+    btr_free_externally_stored_field(index, ref_buf[0..].ptr, &rec, &offsets, null, 3, .TRX_RB_NONE, null);
+    try std.testing.expectEqual(@as(usize, 0), rec.extern_fields.len);
 }
 
 test "btr persistent cursor store restore" {
