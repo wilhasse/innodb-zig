@@ -364,6 +364,32 @@ fn encode_tuple_compact_bytes(tuple: *const dtuple_t) ?RecBytes {
     return .{ .buf = buf, .header_len = header_len };
 }
 
+fn encode_node_ptr_bytes(key: i64, child_page_no: ulint) ?RecBytes {
+    const allocator = std.heap.page_allocator;
+    var key_copy = key;
+    var child_no: u32 = @intCast(child_page_no);
+    var fields = [_]data.dfield_t{
+        .{ .data = &key_copy, .len = @intCast(@sizeOf(i64)) },
+        .{ .data = &child_no, .len = @intCast(@sizeOf(u32)) },
+    };
+    var tuple = data.dtuple_t{
+        .n_fields = 2,
+        .n_fields_cmp = 2,
+        .fields = fields[0..],
+    };
+    const meta = [_]rec_mod.FieldMeta{
+        .{ .fixed_len = @sizeOf(i64), .nullable = false },
+        .{ .fixed_len = @sizeOf(u32), .nullable = false },
+    };
+    const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1;
+    const total = header_len + @sizeOf(i64) + @sizeOf(u32);
+    const buf = allocator.alloc(u8, @as(usize, @intCast(total))) catch return null;
+    const rec_ptr = @as([*]byte, @ptrCast(buf[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple);
+    rec_mod.rec_set_status(rec_ptr, rec_mod.REC_STATUS_NODE_PTR);
+    return .{ .buf = buf, .header_len = header_len };
+}
+
 fn leafEntryLessThan(_: void, lhs: LeafEntry, rhs: LeafEntry) bool {
     if (lhs.key != rhs.key) {
         return lhs.key < rhs.key;
@@ -519,11 +545,41 @@ fn insert_node_ptr_with_key(parent_block: *buf_block_t, child_block: *buf_block_
     node_ptr.* = .{ .key = key };
     node_ptr.child_block = child_block;
     btr_node_ptr_set_child_page_no(node_ptr, child_block.frame.page_no);
+    const rec_bytes = encode_node_ptr_bytes(key, child_block.frame.page_no) orelse {
+        allocator.destroy(node_ptr);
+        return;
+    };
 
     var page_cursor = page.page_cur_t{ .block = parent_block, .rec = insert_after };
     var offsets: ulint = 0;
     if (page.page_cur_rec_insert(&page_cursor, node_ptr, index, &offsets, mtr) == null) {
         allocator.destroy(node_ptr);
+        allocator.free(rec_bytes.buf);
+        return;
+    }
+    const bytes = btr_block_bytes_ensure(parent_block) orelse {
+        var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
+        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+        allocator.destroy(node_ptr);
+        allocator.free(rec_bytes.buf);
+        return;
+    };
+    const rec_head = page.page_bytes_insert_append(bytes, rec_bytes.buf) orelse {
+        var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
+        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+        allocator.destroy(node_ptr);
+        allocator.free(rec_bytes.buf);
+        return;
+    };
+    node_ptr.rec_bytes = rec_bytes.buf;
+    node_ptr.rec_offset = rec_bytes.header_len;
+    node_ptr.rec_page_offset = rec_head + rec_bytes.header_len;
+    const dir_pos = page.page_rec_get_n_recs_before(parent_block.frame, node_ptr);
+    if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, node_ptr.rec_page_offset)) {
+        var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
+        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+        allocator.destroy(node_ptr);
+        allocator.free(rec_bytes.buf);
         return;
     }
     child_block.frame.parent_block = parent_block;
@@ -2661,6 +2717,72 @@ test "btr leaf split preserves rec bytes" {
         try std.testing.expectEqual(expected, val);
         expected += 1;
     }
+
+    index_state_remove(index);
+}
+
+test "btr node pointer bytes link child pages" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 402 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const new_root = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    const left_ptr = page_first_user_rec(new_root.frame) orelse return error.OutOfMemory;
+    const right_ptr = btr_get_next_user_rec(left_ptr, null) orelse return error.OutOfMemory;
+
+    const meta = [_]rec_mod.FieldMeta{
+        .{ .fixed_len = @sizeOf(i64), .nullable = false },
+        .{ .fixed_len = @sizeOf(u32), .nullable = false },
+    };
+    const expected_ptrs = [_]*rec_t{ left_ptr, right_ptr };
+    var byte_cur = page.page_cur_bytes_t{};
+    page.page_cur_bytes_set_before_first(new_root.bytes, &byte_cur);
+
+    var i: usize = 0;
+    while (i < expected_ptrs.len) : (i += 1) {
+        page.page_cur_bytes_move_to_next(&byte_cur);
+        const rec_ptr = page.page_cur_bytes_get_rec_ptr(&byte_cur) orelse return error.TestExpectedEqual;
+        var offsets = [_]ulint{0} ** 16;
+        rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+
+        var len: ulint = 0;
+        const key_ptr = rec_mod.rec_get_nth_field(rec_ptr, offsets[0..], 0, &len);
+        try std.testing.expectEqual(@as(ulint, @sizeOf(i64)), len);
+        const key_buf = @as(*const [@sizeOf(i64)]u8, @ptrCast(key_ptr));
+        const key = std.mem.readInt(i64, key_buf, .little);
+
+        len = 0;
+        const child_ptr = rec_mod.rec_get_nth_field(rec_ptr, offsets[0..], 1, &len);
+        try std.testing.expectEqual(@as(ulint, @sizeOf(u32)), len);
+        const child_buf = @as(*const [@sizeOf(u32)]u8, @ptrCast(child_ptr));
+        const child_page_no = std.mem.readInt(u32, child_buf, .little);
+
+        try std.testing.expectEqual(expected_ptrs[i].key, key);
+        try std.testing.expectEqual(expected_ptrs[i].child_page_no, @as(ulint, @intCast(child_page_no)));
+    }
+    page.page_cur_bytes_move_to_next(&byte_cur);
+    try std.testing.expect(page.page_cur_bytes_is_after_last(&byte_cur));
 
     index_state_remove(index);
 }
