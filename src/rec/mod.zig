@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("../ut/compat.zig");
+const data = @import("../data/mod.zig");
 const mach = @import("../mach/mod.zig");
 
 pub const module_name = "rec";
@@ -238,6 +239,70 @@ fn rec_offs_base(offsets: []ulint) []ulint {
     return offsets[REC_OFFS_HEADER_SIZE..];
 }
 
+fn rec_offs_base_const(offsets: []const ulint) []const ulint {
+    return offsets[REC_OFFS_HEADER_SIZE..];
+}
+
+pub fn rec_get_nth_field_offs(offsets: []const ulint, n: ulint, len: *ulint) ulint {
+    std.debug.assert(n < rec_offs_n_fields(offsets));
+    const base = rec_offs_base_const(offsets);
+    const offs = if (n == 0) 0 else base[@as(usize, @intCast(n))] & REC_OFFS_MASK;
+    var length = base[@as(usize, @intCast(n + 1))];
+    if ((length & REC_OFFS_SQL_NULL) != 0) {
+        length = compat.UNIV_SQL_NULL;
+    } else {
+        length = (length & REC_OFFS_MASK) - offs;
+    }
+    len.* = length;
+    return offs;
+}
+
+pub fn rec_get_nth_field(rec: [*]const byte, offsets: []const ulint, n: ulint, len: *ulint) [*]const byte {
+    const offs = rec_get_nth_field_offs(offsets, n, len);
+    return @as([*]const byte, @ptrFromInt(@intFromPtr(rec) + @as(usize, @intCast(offs))));
+}
+
+pub fn rec_offs_comp(offsets: []const ulint) ulint {
+    return rec_offs_base_const(offsets)[0] & REC_OFFS_COMPACT;
+}
+
+pub fn rec_offs_any_extern(offsets: []const ulint) ulint {
+    return rec_offs_base_const(offsets)[0] & REC_OFFS_EXTERNAL;
+}
+
+pub fn rec_offs_nth_extern(offsets: []const ulint, n: ulint) ulint {
+    std.debug.assert(n < rec_offs_n_fields(offsets));
+    return rec_offs_base_const(offsets)[@as(usize, @intCast(1 + n))] & REC_OFFS_EXTERNAL;
+}
+
+pub fn rec_offs_nth_sql_null(offsets: []const ulint, n: ulint) ulint {
+    std.debug.assert(n < rec_offs_n_fields(offsets));
+    return rec_offs_base_const(offsets)[@as(usize, @intCast(1 + n))] & REC_OFFS_SQL_NULL;
+}
+
+pub fn rec_offs_nth_size(offsets: []const ulint, n: ulint) ulint {
+    std.debug.assert(n < rec_offs_n_fields(offsets));
+    const base = rec_offs_base_const(offsets);
+    if (n == 0) {
+        return base[1] & REC_OFFS_MASK;
+    }
+    return (base[@as(usize, @intCast(1 + n))] - base[@as(usize, @intCast(n))]) & REC_OFFS_MASK;
+}
+
+pub fn rec_offs_n_extern(offsets: []const ulint) ulint {
+    var n: ulint = 0;
+    if (rec_offs_any_extern(offsets) != 0) {
+        var i = rec_offs_n_fields(offsets);
+        while (i > 0) {
+            i -= 1;
+            if (rec_offs_nth_extern(offsets, i) != 0) {
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
 pub fn rec_init_offsets_fixed(field_lens: []const ulint, offsets: []ulint, compact: bool) void {
     const needed = @as(usize, @intCast(REC_OFFS_HEADER_SIZE + 1 + field_lens.len));
     std.debug.assert(offsets.len >= needed);
@@ -331,6 +396,159 @@ pub fn rec_init_offsets_compact(rec: [*]const byte, extra: ulint, fields: []cons
     base[0] = extra_size | REC_OFFS_COMPACT | any_ext;
 }
 
+fn rec_cmp_collate(code: ulint) ulint {
+    return code;
+}
+
+pub fn cmp_dtuple_rec_with_match(
+    cmp_ctx: ?*anyopaque,
+    dtuple: *const data.dtuple_t,
+    rec: [*]const byte,
+    offsets: []const ulint,
+    matched_fields: *ulint,
+    matched_bytes: *ulint,
+) i32 {
+    _ = cmp_ctx;
+    var cur_field = matched_fields.*;
+    var cur_bytes = matched_bytes.*;
+    const n_cmp = data.dtuple_get_n_fields_cmp(dtuple);
+
+    if (cur_bytes == 0 and cur_field == 0) {
+        const rec_info = rec_get_info_bits(rec, rec_offs_comp(offsets) != 0);
+        const tup_info = data.dtuple_get_info_bits(dtuple);
+        if ((rec_info & REC_INFO_MIN_REC_FLAG) != 0) {
+            const ret = if ((tup_info & REC_INFO_MIN_REC_FLAG) == 0) 1 else 0;
+            matched_fields.* = cur_field;
+            matched_bytes.* = cur_bytes;
+            return ret;
+        }
+        if ((tup_info & REC_INFO_MIN_REC_FLAG) != 0) {
+            matched_fields.* = cur_field;
+            matched_bytes.* = cur_bytes;
+            return -1;
+        }
+    }
+
+    outer: while (cur_field < n_cmp) {
+        const dtuple_field = data.dtuple_get_nth_field(dtuple, cur_field);
+        const type_ = data.dfield_get_type(dtuple_field);
+        const mtype = type_.mtype;
+        const prtype = type_.prtype;
+        const dtuple_f_len = data.dfield_get_len(dtuple_field);
+
+        var rec_f_len: ulint = 0;
+        const rec_b_ptr = rec_get_nth_field(rec, offsets, cur_field, &rec_f_len);
+
+        if (cur_bytes == 0) {
+            if (rec_offs_nth_extern(offsets, cur_field) != 0) {
+                matched_fields.* = cur_field;
+                matched_bytes.* = cur_bytes;
+                return 0;
+            }
+
+            if (dtuple_f_len == compat.UNIV_SQL_NULL) {
+                if (rec_f_len == compat.UNIV_SQL_NULL) {
+                    cur_field += 1;
+                    continue :outer;
+                }
+                matched_fields.* = cur_field;
+                matched_bytes.* = cur_bytes;
+                return -1;
+            } else if (rec_f_len == compat.UNIV_SQL_NULL) {
+                matched_fields.* = cur_field;
+                matched_bytes.* = cur_bytes;
+                return 1;
+            }
+        }
+
+        const dtuple_data = data.dfield_get_data(dtuple_field);
+        var dtuple_b_ptr: [*]const byte = if (dtuple_data) |ptr| @ptrCast(ptr) else rec;
+        var rec_byte_ptr = rec_b_ptr + @as(usize, @intCast(cur_bytes));
+        dtuple_b_ptr += @as(usize, @intCast(cur_bytes));
+
+        while (true) {
+            var rec_byte: ulint = 0;
+            var dtuple_byte: ulint = 0;
+            if (rec_f_len <= cur_bytes) {
+                if (dtuple_f_len <= cur_bytes) {
+                    cur_field += 1;
+                    cur_bytes = 0;
+                    continue :outer;
+                }
+                rec_byte = data.dtype_get_pad_char(mtype, prtype);
+                if (rec_byte == compat.ULINT_UNDEFINED) {
+                    matched_fields.* = cur_field;
+                    matched_bytes.* = cur_bytes;
+                    return 1;
+                }
+            } else {
+                rec_byte = rec_byte_ptr[0];
+            }
+
+            if (dtuple_f_len <= cur_bytes) {
+                dtuple_byte = data.dtype_get_pad_char(mtype, prtype);
+                if (dtuple_byte == compat.ULINT_UNDEFINED) {
+                    matched_fields.* = cur_field;
+                    matched_bytes.* = cur_bytes;
+                    return -1;
+                }
+            } else {
+                dtuple_byte = dtuple_b_ptr[0];
+            }
+
+            if (dtuple_byte == rec_byte) {
+                cur_bytes += 1;
+                rec_byte_ptr += 1;
+                dtuple_b_ptr += 1;
+                continue;
+            }
+
+            if (mtype <= data.DATA_CHAR or (mtype == data.DATA_BLOB and (prtype & data.DATA_BINARY_TYPE) == 0)) {
+                rec_byte = rec_cmp_collate(rec_byte);
+                dtuple_byte = rec_cmp_collate(dtuple_byte);
+            }
+
+            matched_fields.* = cur_field;
+            matched_bytes.* = cur_bytes;
+            return if (dtuple_byte < rec_byte) -1 else 1;
+        }
+    }
+
+    matched_fields.* = cur_field;
+    matched_bytes.* = cur_bytes;
+    return 0;
+}
+
+pub fn cmp_dtuple_rec(cmp_ctx: ?*anyopaque, dtuple: *const data.dtuple_t, rec: [*]const byte, offsets: []const ulint) i32 {
+    var matched_fields: ulint = 0;
+    var matched_bytes: ulint = 0;
+    return cmp_dtuple_rec_with_match(cmp_ctx, dtuple, rec, offsets, &matched_fields, &matched_bytes);
+}
+
+pub fn cmp_dtuple_is_prefix_of_rec(cmp_ctx: ?*anyopaque, dtuple: *const data.dtuple_t, rec: [*]const byte, offsets: []const ulint) ibool {
+    const n_fields = data.dtuple_get_n_fields(dtuple);
+    if (n_fields > rec_offs_n_fields(offsets)) {
+        return compat.FALSE;
+    }
+
+    var matched_fields: ulint = 0;
+    var matched_bytes: ulint = 0;
+    _ = cmp_dtuple_rec_with_match(cmp_ctx, dtuple, rec, offsets, &matched_fields, &matched_bytes);
+
+    if (matched_fields == n_fields) {
+        return compat.TRUE;
+    }
+
+    if (matched_fields + 1 == n_fields) {
+        const last_field = data.dtuple_get_nth_field(dtuple, n_fields - 1);
+        if (matched_bytes == data.dfield_get_len(last_field)) {
+            return compat.TRUE;
+        }
+    }
+
+    return compat.FALSE;
+}
+
 test "rec constants match C defaults" {
     try std.testing.expectEqual(@as(ulint, 1023), REC_MAX_N_FIELDS);
     try std.testing.expectEqual(@as(ulint, 16383), REC_MAX_HEAP_NO);
@@ -402,4 +620,45 @@ test "rec offsets varlen + nulls (compact)" {
     try std.testing.expect((base[2] & REC_OFFS_SQL_NULL) != 0);
     try std.testing.expectEqual(@as(ulint, 3), base[2] & REC_OFFS_MASK);
     try std.testing.expectEqual(@as(ulint, 5), base[3]);
+}
+
+test "rec compare dtuple vs record ordering" {
+    var buf = [_]byte{0} ** 32;
+    const rec = @as([*]const byte, @ptrCast(&buf[16]));
+    std.mem.copyForwards(u8, buf[16..20], "abCD");
+
+    const lens = [_]ulint{ 2, 2 };
+    var offsets = [_]ulint{0} ** 16;
+    rec_init_offsets_fixed(&lens, offsets[0..], true);
+
+    var fields = [_]data.dfield_t{
+        .{ .type = .{ .mtype = data.DATA_VARCHAR, .prtype = 0 } },
+        .{ .type = .{ .mtype = data.DATA_VARCHAR, .prtype = 0 } },
+    };
+    data.dfield_set_data(&fields[0], "ab".ptr, 2);
+    data.dfield_set_data(&fields[1], "CD".ptr, 2);
+    var tuple = data.dtuple_t{ .n_fields = 2, .n_fields_cmp = 2, .fields = fields[0..] };
+
+    try std.testing.expectEqual(@as(i32, 0), cmp_dtuple_rec(null, &tuple, rec, offsets[0..]));
+
+    data.dfield_set_data(&fields[1], "CE".ptr, 2);
+    try std.testing.expect(cmp_dtuple_rec(null, &tuple, rec, offsets[0..]) > 0);
+}
+
+test "rec compare null and prefix" {
+    var buf = [_]byte{0} ** 32;
+    const rec = @as([*]const byte, @ptrCast(&buf[16]));
+    std.mem.copyForwards(u8, buf[16..20], "abcd");
+
+    const lens = [_]ulint{ 4 };
+    var offsets = [_]ulint{0} ** 16;
+    rec_init_offsets_fixed(&lens, offsets[0..], true);
+
+    var field = data.dfield_t{ .type = .{ .mtype = data.DATA_VARCHAR, .prtype = 0 } };
+    data.dfield_set_null(&field);
+    var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field)[0..1] };
+    try std.testing.expect(cmp_dtuple_rec(null, &tuple, rec, offsets[0..]) < 0);
+
+    data.dfield_set_data(&field, "ab".ptr, 2);
+    try std.testing.expectEqual(compat.TRUE, cmp_dtuple_is_prefix_of_rec(null, &tuple, rec, offsets[0..]));
 }
