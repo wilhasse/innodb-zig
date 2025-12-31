@@ -106,8 +106,19 @@ pub const btr_search_t = struct {
     ref_count: ulint = 0,
 };
 
+const HashKey = struct {
+    index: *dict_index_t,
+    key: i64,
+};
+
+const HashEntry = struct {
+    rec: *rec_t,
+    block: *buf_block_t,
+};
+
 pub const btr_search_sys_t = struct {
     hash_size: ulint = 0,
+    entries: std.AutoHashMap(HashKey, HashEntry),
 };
 
 pub const dtuple_t = page.dtuple_t;
@@ -562,6 +573,7 @@ pub fn btr_get_size(index: *dict_index_t, flag: ulint) ulint {
 pub fn btr_page_free_low(index: *dict_index_t, block: *buf_block_t, level: ulint, mtr: *mtr_t) void {
     _ = level;
     _ = mtr;
+    btr_search_drop_page_hash_index(block);
     const state = index_states.get(index) orelse return;
     const page_no = block.frame.page_no;
     if (state.pages.fetchRemove(page_no)) |entry| {
@@ -1064,11 +1076,13 @@ pub fn btr_cur_optimistic_insert(
 
     if (btr_cur_insert_if_possible(cursor, entry, n_ext, mtr)) |inserted| {
         rec.* = inserted;
+        btr_search_update_hash_on_insert(cursor);
         return 0;
     }
 
     const split_rec = btr_page_split_and_insert(cursor, entry, n_ext, mtr) orelse return 1;
     rec.* = split_rec;
+    btr_search_update_hash_on_insert(cursor);
     return 0;
 }
 
@@ -1140,6 +1154,12 @@ pub fn btr_cur_update_in_place(
     }
     if (update.size_change) {
         return 1;
+    }
+    if (rec.key != update.new_key) {
+        btr_search_update_hash_on_delete(cursor);
+        rec.key = update.new_key;
+        btr_search_update_hash_on_insert(cursor);
+        return 0;
     }
     rec.key = update.new_key;
     return 0;
@@ -1274,6 +1294,7 @@ pub fn btr_cur_optimistic_delete(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
         return compat.FALSE;
     }
     const index = cursor.index orelse return compat.FALSE;
+    btr_search_update_hash_on_delete(cursor);
     var page_cursor = page.page_cur_t{ .block = block, .rec = rec };
     var offsets: ulint = 0;
     page.page_cur_delete_rec(&page_cursor, index, &offsets, mtr);
@@ -1647,13 +1668,17 @@ pub fn btr_search_sys_create(hash_size: ulint) void {
         btr_search_sys = null;
         return;
     };
-    sys.* = .{ .hash_size = hash_size };
+    sys.* = .{
+        .hash_size = hash_size,
+        .entries = std.AutoHashMap(HashKey, HashEntry).init(std.heap.page_allocator),
+    };
     btr_search_sys = sys;
     btr_search_enabled = 1;
 }
 
 pub fn btr_search_sys_free() void {
     if (btr_search_sys) |sys| {
+        sys.entries.deinit();
         std.heap.page_allocator.destroy(sys);
         btr_search_sys = null;
     }
@@ -1678,6 +1703,46 @@ pub fn btr_search_info_get_ref_count(info: *btr_search_t) ulint {
     return info.ref_count;
 }
 
+fn btr_search_put(index: *dict_index_t, block: *buf_block_t, rec: *rec_t) void {
+    if (btr_search_enabled == 0) {
+        return;
+    }
+    const sys = btr_search_sys orelse return;
+    if (rec.is_infimum or rec.is_supremum or rec.deleted) {
+        return;
+    }
+    _ = sys.entries.put(.{ .index = index, .key = rec.key }, .{ .rec = rec, .block = block }) catch {};
+}
+
+fn btr_search_remove(index: *dict_index_t, block: ?*buf_block_t, key: i64) void {
+    if (btr_search_enabled == 0) {
+        return;
+    }
+    const sys = btr_search_sys orelse return;
+    const hash_key = HashKey{ .index = index, .key = key };
+    if (block) |blk| {
+        if (sys.entries.getEntry(hash_key)) |entry| {
+            if (entry.value_ptr.block == blk) {
+                _ = sys.entries.remove(hash_key);
+            }
+        }
+        return;
+    }
+    _ = sys.entries.remove(hash_key);
+}
+
+pub fn btr_search_build_page_hash_index(index: *dict_index_t, block: *buf_block_t) void {
+    if (btr_search_enabled == 0) {
+        return;
+    }
+    _ = btr_search_sys orelse return;
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+    while (rec_opt) |rec| {
+        btr_search_put(index, block, rec);
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+}
+
 pub fn btr_search_guess_on_hash(
     index: *dict_index_t,
     info: *btr_search_t,
@@ -1688,46 +1753,106 @@ pub fn btr_search_guess_on_hash(
     has_search_latch: ulint,
     mtr: *mtr_t,
 ) ibool {
-    _ = index;
     _ = info;
-    _ = tuple;
     _ = mode;
     _ = latch_mode;
-    _ = cursor;
     _ = has_search_latch;
     _ = mtr;
-    return compat.FALSE;
+    if (btr_search_enabled == 0) {
+        return compat.FALSE;
+    }
+    const sys = btr_search_sys orelse return compat.FALSE;
+    const key = dtuple_to_key(tuple);
+    const entry = sys.entries.getEntry(.{ .index = index, .key = key }) orelse return compat.FALSE;
+    const rec = entry.value_ptr.rec;
+    if (rec.deleted or rec.is_infimum or rec.is_supremum) {
+        _ = sys.entries.remove(entry.key_ptr.*);
+        return compat.FALSE;
+    }
+    cursor.index = index;
+    cursor.block = entry.value_ptr.block;
+    cursor.rec = rec;
+    cursor.opened = true;
+    btr_cur_n_sea += 1;
+    return compat.TRUE;
 }
 
 pub fn btr_search_move_or_delete_hash_entries(new_block: *buf_block_t, block: *buf_block_t, index: *dict_index_t) void {
-    _ = new_block;
-    _ = block;
     _ = index;
+    btr_search_drop_page_hash_index(block);
+    btr_search_drop_page_hash_index(new_block);
 }
 
 pub fn btr_search_drop_page_hash_index(block: *buf_block_t) void {
-    _ = block;
+    if (btr_search_enabled == 0) {
+        return;
+    }
+    const sys = btr_search_sys orelse return;
+    var remove_keys = std.ArrayList(HashKey).init(std.heap.page_allocator);
+    defer remove_keys.deinit();
+    var it = sys.entries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.block == block) {
+            remove_keys.append(entry.key_ptr.*) catch {};
+        }
+    }
+    for (remove_keys.items) |key| {
+        _ = sys.entries.remove(key);
+    }
 }
 
 pub fn btr_search_drop_page_hash_when_freed(space: ulint, zip_size: ulint, page_no: ulint) void {
     _ = space;
     _ = zip_size;
-    _ = page_no;
+    if (btr_search_enabled == 0) {
+        return;
+    }
+    const sys = btr_search_sys orelse return;
+    var remove_keys = std.ArrayList(HashKey).init(std.heap.page_allocator);
+    defer remove_keys.deinit();
+    var it = sys.entries.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.block.frame.page_no == page_no) {
+            remove_keys.append(entry.key_ptr.*) catch {};
+        }
+    }
+    for (remove_keys.items) |key| {
+        _ = sys.entries.remove(key);
+    }
 }
 
 pub fn btr_search_update_hash_node_on_insert(cursor: *btr_cur_t) void {
-    _ = cursor;
+    btr_search_update_hash_on_insert(cursor);
 }
 
 pub fn btr_search_update_hash_on_insert(cursor: *btr_cur_t) void {
-    _ = cursor;
+    const rec = cursor.rec orelse return;
+    const block = cursor.block orelse return;
+    const index = cursor.index orelse return;
+    btr_search_put(index, block, rec);
 }
 
 pub fn btr_search_update_hash_on_delete(cursor: *btr_cur_t) void {
-    _ = cursor;
+    const rec = cursor.rec orelse return;
+    const block = cursor.block orelse return;
+    const index = cursor.index orelse return;
+    btr_search_remove(index, block, rec.key);
 }
 
 pub fn btr_search_validate() ibool {
+    const sys = btr_search_sys orelse return compat.TRUE;
+    var it = sys.entries.iterator();
+    while (it.next()) |entry| {
+        const rec = entry.value_ptr.rec;
+        if (rec.deleted) {
+            return compat.FALSE;
+        }
+        if (rec.page) |page_ptr| {
+            if (page_ptr != entry.value_ptr.block.frame) {
+                return compat.FALSE;
+            }
+        }
+    }
     return compat.TRUE;
 }
 
@@ -2695,20 +2820,60 @@ test "btr search stubs" {
 
     btr_search_sys_create(128);
     try std.testing.expect(btr_search_sys != null);
-    btr_search_sys_free();
-    try std.testing.expect(btr_search_sys == null);
 
     var heap = mem_heap_t{};
     const info = btr_search_info_create(&heap) orelse return error.OutOfMemory;
     defer std.heap.page_allocator.destroy(info);
     try std.testing.expectEqual(@as(ulint, 0), btr_search_info_get_ref_count(info));
 
-    var index = dict_index_t{};
-    var tuple = dtuple_t{};
-    var cursor = btr_cur_t{};
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
     var mtr = mtr_t{};
-    try std.testing.expect(btr_search_guess_on_hash(&index, info, &tuple, 0, 0, &cursor, 0, &mtr) == compat.FALSE);
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1300 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    btr_search_disable();
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= 3) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    var tuple = dtuple_t{};
+    var search_key: i64 = 2;
+    var search_fields = [_]data.dfield_t{.{ .data = &search_key, .len = @intCast(@sizeOf(i64)) }};
+    tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = search_fields[0..] };
+
+    btr_search_enable();
+    try std.testing.expect(btr_search_guess_on_hash(index, info, &tuple, 0, 0, &cursor, 0, &mtr) == compat.FALSE);
+
+    btr_search_build_page_hash_index(index, root_block);
+    try std.testing.expect(btr_search_guess_on_hash(index, info, &tuple, 0, 0, &cursor, 0, &mtr) == compat.TRUE);
+    try std.testing.expectEqual(@as(i64, 2), cursor.rec.?.key);
+
+    const found = btr_find_rec_by_key(index, 2) orelse return error.OutOfMemory;
+    try std.testing.expect(found == cursor.rec.?);
+
+    _ = btr_cur_optimistic_delete(&cursor, &mtr);
+    try std.testing.expect(btr_search_guess_on_hash(index, info, &tuple, 0, 0, &cursor, 0, &mtr) == compat.FALSE);
+
+    index_state_remove(index);
 
     btr_search_var_init();
     try std.testing.expectEqual(@as(u8, 1), btr_search_enabled);
+
+    btr_search_sys_free();
+    try std.testing.expect(btr_search_sys == null);
 }
