@@ -96,6 +96,8 @@ pub const btr_pcur_t = struct {
     btr_cur: btr_cur_t = .{},
     rel_pos: ulint = 0,
     stored: bool = false,
+    stored_key: ?i64 = null,
+    stored_block: ?*buf_block_t = null,
 };
 
 pub const btr_search_t = struct {
@@ -370,6 +372,18 @@ fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index:
     const child_min = page_first_user_rec(child_block.frame);
     const key = if (child_min) |rec| rec.key else 0;
     insert_node_ptr_with_key(parent_block, child_block, key, index, mtr);
+}
+
+fn btr_find_rec_by_key(index: *dict_index_t, key: i64) ?*rec_t {
+    const block = descend_to_level(index, 0, true) orelse return null;
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+    while (rec_opt) |rec| {
+        if (rec.key == key) {
+            return rec;
+        }
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    return null;
 }
 
 fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
@@ -1410,6 +1424,8 @@ pub fn btr_pcur_free(cursor: ?*btr_pcur_t) void {
 pub fn btr_pcur_copy_stored_position(pcur_receive: *btr_pcur_t, pcur_donate: *btr_pcur_t) void {
     pcur_receive.rel_pos = pcur_donate.rel_pos;
     pcur_receive.stored = pcur_donate.stored;
+    pcur_receive.stored_key = pcur_donate.stored_key;
+    pcur_receive.stored_block = pcur_donate.stored_block;
 }
 
 pub fn btr_pcur_open_on_user_rec_func(
@@ -1422,24 +1438,27 @@ pub fn btr_pcur_open_on_user_rec_func(
     line: ulint,
     mtr: *mtr_t,
 ) void {
-    _ = tuple;
-    _ = mode;
-    _ = latch_mode;
-    _ = file;
-    _ = line;
-    _ = mtr;
-    cursor.btr_cur.index = index;
-    cursor.btr_cur.rec = null;
-    cursor.btr_cur.block = null;
-    cursor.btr_cur.opened = true;
+    btr_cur_search_to_nth_level(index, 0, tuple, mode, latch_mode, &cursor.btr_cur, 0, file, line, mtr);
     cursor.rel_pos = BTR_PCUR_ON;
     cursor.stored = false;
+    cursor.stored_key = null;
+    cursor.stored_block = null;
 }
 
 pub fn btr_pcur_store_position(cursor: *btr_pcur_t, mtr: *mtr_t) void {
     _ = mtr;
     cursor.rel_pos = BTR_PCUR_ON;
     cursor.stored = true;
+    cursor.stored_block = cursor.btr_cur.block;
+    if (cursor.btr_cur.rec) |rec| {
+        if (rec.is_infimum or rec.is_supremum) {
+            cursor.stored_key = null;
+        } else {
+            cursor.stored_key = rec.key;
+        }
+    } else {
+        cursor.stored_key = null;
+    }
 }
 
 pub fn btr_pcur_restore_position_func(
@@ -1453,8 +1472,22 @@ pub fn btr_pcur_restore_position_func(
     _ = file;
     _ = line;
     _ = mtr;
+    if (!cursor.stored) {
+        return compat.FALSE;
+    }
+    const index = cursor.btr_cur.index orelse return compat.FALSE;
+    const key = cursor.stored_key orelse return compat.FALSE;
+    const rec = btr_find_rec_by_key(index, key) orelse {
+        cursor.btr_cur.rec = null;
+        cursor.btr_cur.block = null;
+        cursor.rel_pos = BTR_PCUR_BEFORE;
+        return compat.FALSE;
+    };
+    cursor.btr_cur.rec = rec;
+    cursor.btr_cur.block = rec.page;
     cursor.btr_cur.opened = true;
-    return if (cursor.stored) compat.TRUE else compat.FALSE;
+    cursor.rel_pos = BTR_PCUR_ON;
+    return compat.TRUE;
 }
 
 pub fn btr_pcur_release_leaf(cursor: *btr_pcur_t, mtr: *mtr_t) void {
@@ -1464,11 +1497,31 @@ pub fn btr_pcur_release_leaf(cursor: *btr_pcur_t, mtr: *mtr_t) void {
 
 pub fn btr_pcur_move_to_next_page(cursor: *btr_pcur_t, mtr: *mtr_t) void {
     _ = mtr;
+    const block = cursor.btr_cur.block orelse {
+        cursor.rel_pos = BTR_PCUR_AFTER;
+        return;
+    };
+    const next_block = block.frame.next_block orelse {
+        cursor.rel_pos = BTR_PCUR_AFTER;
+        return;
+    };
+    cursor.btr_cur.block = next_block;
+    cursor.btr_cur.rec = page.page_get_infimum_rec(next_block.frame);
     cursor.rel_pos = BTR_PCUR_AFTER;
 }
 
 pub fn btr_pcur_move_backward_from_page(cursor: *btr_pcur_t, mtr: *mtr_t) void {
     _ = mtr;
+    const block = cursor.btr_cur.block orelse {
+        cursor.rel_pos = BTR_PCUR_BEFORE;
+        return;
+    };
+    const prev_block = block.frame.prev_block orelse {
+        cursor.rel_pos = BTR_PCUR_BEFORE;
+        return;
+    };
+    cursor.btr_cur.block = prev_block;
+    cursor.btr_cur.rec = page.page_get_supremum_rec(prev_block.frame);
     cursor.rel_pos = BTR_PCUR_BEFORE;
 }
 
@@ -2327,36 +2380,114 @@ test "btr external field prefix copy" {
     try std.testing.expectEqualStrings("abc", buf[0..3]);
 }
 
-test "btr persistent cursor state" {
+test "btr persistent cursor store restore" {
     const pcur = btr_pcur_create() orelse return error.OutOfMemory;
     defer btr_pcur_free(pcur);
 
     try std.testing.expect(!pcur.stored);
 
-    var index = dict_index_t{};
-    var tuple = dtuple_t{};
-    var mtr = mtr_t{};
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
 
-    btr_pcur_open_on_user_rec_func(&index, &tuple, 0, 0, pcur, "file", 1, &mtr);
-    try std.testing.expect(pcur.btr_cur.opened);
-    try std.testing.expectEqual(@as(ulint, BTR_PCUR_ON), pcur.rel_pos);
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1100 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= 3) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const rec1 = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    const rec2 = btr_get_next_user_rec(rec1, null) orelse return error.OutOfMemory;
+
+    pcur.btr_cur.index = index;
+    pcur.btr_cur.block = root_block;
+    pcur.btr_cur.rec = rec2;
+    pcur.btr_cur.opened = true;
+    pcur.rel_pos = BTR_PCUR_ON;
 
     btr_pcur_store_position(pcur, &mtr);
     try std.testing.expect(pcur.stored);
 
+    var insert_key: i64 = 4;
+    var insert_fields = [_]data.dfield_t{.{ .data = &insert_key, .len = @intCast(@sizeOf(i64)) }};
+    var insert_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = insert_fields[0..] };
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &insert_tuple, &rec_out, &big_rec, 0, null, &mtr));
+
     const restored = btr_pcur_restore_position_func(0, pcur, "file", 2, &mtr);
     try std.testing.expectEqual(compat.TRUE, restored);
+    try std.testing.expectEqual(@as(i64, 2), pcur.btr_cur.rec.?.key);
 
-    btr_pcur_move_to_next_page(pcur, &mtr);
-    try std.testing.expectEqual(@as(ulint, BTR_PCUR_AFTER), pcur.rel_pos);
-
-    btr_pcur_move_backward_from_page(pcur, &mtr);
-    try std.testing.expectEqual(@as(ulint, BTR_PCUR_BEFORE), pcur.rel_pos);
+    cursor.rec = rec2;
+    _ = btr_cur_optimistic_delete(&cursor, &mtr);
+    const restored_after_delete = btr_pcur_restore_position_func(0, pcur, "file", 3, &mtr);
+    try std.testing.expectEqual(compat.FALSE, restored_after_delete);
 
     var other = btr_pcur_t{};
     btr_pcur_copy_stored_position(&other, pcur);
     try std.testing.expectEqual(pcur.rel_pos, other.rel_pos);
     try std.testing.expect(other.stored);
+
+    index_state_remove(index);
+}
+
+test "btr persistent cursor page moves" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1200 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const new_root = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    const left_ptr = page_first_user_rec(new_root.frame) orelse return error.OutOfMemory;
+    const right_ptr = btr_get_next_user_rec(left_ptr, null) orelse return error.OutOfMemory;
+    const left_block = left_ptr.child_block orelse return error.OutOfMemory;
+    const right_block = right_ptr.child_block orelse return error.OutOfMemory;
+
+    var pcur = btr_pcur_t{};
+    pcur.btr_cur.index = index;
+    pcur.btr_cur.block = left_block;
+    pcur.btr_cur.rec = page.page_get_infimum_rec(left_block.frame);
+    pcur.btr_cur.opened = true;
+
+    btr_pcur_move_to_next_page(&pcur, &mtr);
+    try std.testing.expect(pcur.btr_cur.block == right_block);
+
+    btr_pcur_move_backward_from_page(&pcur, &mtr);
+    try std.testing.expect(pcur.btr_cur.block == left_block);
+
+    index_state_remove(index);
 }
 
 test "btr search stubs" {
