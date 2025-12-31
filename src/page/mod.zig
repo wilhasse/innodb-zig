@@ -58,6 +58,7 @@ pub const mtr_t = struct {};
 pub const rec_t = struct {
     prev: ?*rec_t = null,
     next: ?*rec_t = null,
+    page: ?*page_t = null,
     is_infimum: bool = false,
     is_supremum: bool = false,
     deleted: bool = false,
@@ -87,6 +88,8 @@ pub const page_t = struct {
     supremum: rec_t = .{ .is_supremum = true },
     page_no: ulint = 0,
     parent_block: ?*buf_block_t = null,
+    prev_block: ?*buf_block_t = null,
+    next_block: ?*buf_block_t = null,
 };
 
 pub const buf_block_t = struct {
@@ -102,10 +105,14 @@ pub const page_cur_t = struct {
 pub fn page_init(page: *page_t) void {
     const page_no = page.page_no;
     const parent = page.parent_block;
+    const prev = page.prev_block;
+    const next = page.next_block;
     page.header = .{};
     page.header.n_heap = PAGE_HEAP_NO_USER_LOW;
     page.infimum = .{ .is_infimum = true };
     page.supremum = .{ .is_supremum = true };
+    page.infimum.page = page;
+    page.supremum.page = page;
     page.infimum.prev = null;
     page.infimum.next = &page.supremum;
     page.supremum.prev = &page.infimum;
@@ -113,6 +120,8 @@ pub fn page_init(page: *page_t) void {
     page.header.n_recs = 0;
     page.page_no = page_no;
     page.parent_block = parent;
+    page.prev_block = prev;
+    page.next_block = next;
 }
 
 pub fn buf_block_get_frame(block: *const buf_block_t) *page_t {
@@ -298,6 +307,9 @@ pub fn page_cur_rec_insert(cursor: *page_cur_t, rec: *rec_t, index: *dict_index_
     }
     if (cursor.block) |block| {
         block.frame.header.n_recs += 1;
+        rec.page = block.frame;
+    } else {
+        rec.page = insert_after.page;
     }
     return rec;
 }
@@ -313,6 +325,7 @@ pub fn page_cur_insert_rec_low(current_rec: *rec_t, index: *dict_index_t, rec: *
     if (next) |nxt| {
         nxt.prev = rec;
     }
+    rec.page = current_rec.page;
     return rec;
 }
 
@@ -334,6 +347,7 @@ pub fn page_copy_rec_list_end_to_created_page(new_page: *page_t, rec: *rec_t, in
         }
         const copy = std.heap.page_allocator.create(rec_t) catch return;
         copy.* = .{ .key = node.key };
+        copy.page = new_page;
         const sup = &new_page.supremum;
         const prev = sup.prev orelse &new_page.infimum;
         copy.prev = prev;
@@ -491,6 +505,7 @@ pub fn page_copy_rec_list_start(new_block: *buf_block_t, block: *buf_block_t, re
         }
         const copy = std.heap.page_allocator.create(rec_t) catch break;
         copy.* = .{ .key = node.key };
+        copy.page = new_block.frame;
         const sup = &new_block.frame.supremum;
         const prev = sup.prev orelse &new_block.frame.infimum;
         copy.prev = prev;

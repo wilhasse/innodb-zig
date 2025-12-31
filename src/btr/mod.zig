@@ -286,27 +286,33 @@ pub fn btr_page_get_father(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_
 pub fn btr_get_prev_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
     _ = mtr;
     const current = rec orelse return null;
-    if (current.is_infimum) {
-        return null;
+    if (!current.is_infimum) {
+        const prev = current.prev orelse return null;
+        if (!prev.is_infimum) {
+            return prev;
+        }
     }
-    const prev = current.prev orelse return null;
-    if (prev.is_infimum) {
-        return null;
-    }
-    return prev;
+    const page_obj = current.page orelse return null;
+    const prev_block = page_obj.prev_block orelse return null;
+    const prev_page = prev_block.frame;
+    const prev_rec = prev_page.supremum.prev orelse return null;
+    return if (prev_rec.is_infimum) null else prev_rec;
 }
 
 pub fn btr_get_next_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
     _ = mtr;
     const current = rec orelse return null;
-    if (current.is_supremum) {
-        return null;
+    if (!current.is_supremum) {
+        const next = current.next orelse return null;
+        if (!next.is_supremum) {
+            return next;
+        }
     }
-    const next = current.next orelse return null;
-    if (next.is_supremum) {
-        return null;
-    }
-    return next;
+    const page_obj = current.page orelse return null;
+    const next_block = page_obj.next_block orelse return null;
+    const next_page = next_block.frame;
+    const next_rec = next_page.infimum.next orelse return null;
+    return if (next_rec.is_supremum) null else next_rec;
 }
 
 pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction: byte, level: ulint, mtr: *mtr_t) ?*buf_block_t {
@@ -1147,6 +1153,41 @@ test "btr prev and next user record stubs" {
 
     var sup = rec_t{ .is_supremum = true };
     try std.testing.expect(btr_get_next_user_rec(&sup, null) == null);
+}
+
+test "btr user record navigation across pages" {
+    var page1 = page.page_t{};
+    var page2 = page.page_t{};
+    var block1 = page.buf_block_t{ .frame = &page1, .page_zip = null };
+    var block2 = page.buf_block_t{ .frame = &page2, .page_zip = null };
+
+    page1.next_block = &block2;
+    page2.prev_block = &block1;
+    page.page_init(&page1);
+    page.page_init(&page2);
+    page1.next_block = &block2;
+    page2.prev_block = &block1;
+
+    var index = dict_index_t{};
+    var mtr = mtr_t{};
+    var offsets: ulint = 0;
+    var cursor = page.page_cur_t{};
+
+    page.page_cur_set_before_first(&block1, &cursor);
+    var rec1 = page.rec_t{ .key = 1 };
+    _ = page.page_cur_rec_insert(&cursor, &rec1, &index, &offsets, &mtr);
+    cursor.rec = &rec1;
+    var rec2 = page.rec_t{ .key = 2 };
+    _ = page.page_cur_rec_insert(&cursor, &rec2, &index, &offsets, &mtr);
+
+    page.page_cur_set_before_first(&block2, &cursor);
+    var rec3 = page.rec_t{ .key = 3 };
+    _ = page.page_cur_rec_insert(&cursor, &rec3, &index, &offsets, &mtr);
+
+    try std.testing.expect(btr_get_next_user_rec(&rec2, null) == &rec3);
+    try std.testing.expect(btr_get_prev_user_rec(&rec3, null) == &rec2);
+    try std.testing.expect(btr_get_next_user_rec(&page1.supremum, null) == &rec3);
+    try std.testing.expect(btr_get_prev_user_rec(&page2.infimum, null) == &rec2);
 }
 
 test "btr split rec helpers default" {
