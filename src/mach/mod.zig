@@ -29,8 +29,8 @@ pub fn mach_read_from_4(b: [*]const byte) ulint {
 
 pub fn mach_write_to_2(b: [*]byte, n: ulint) void {
     std.debug.assert(n <= 0xFFFF);
-    b[0] = @as(byte, @intCast(n >> 8));
-    b[1] = @as(byte, @intCast(n));
+    b[0] = @as(byte, @intCast((n >> 8) & 0xFF));
+    b[1] = @as(byte, @intCast(n & 0xFF));
 }
 
 pub fn mach_read_from_2(b: [*]const byte) ulint {
@@ -49,9 +49,9 @@ pub fn mach_decode_2(n: ib_uint16_t) ulint {
 
 pub fn mach_write_to_3(b: [*]byte, n: ulint) void {
     std.debug.assert(n <= 0xFFFFFF);
-    b[0] = @as(byte, @intCast(n >> 16));
-    b[1] = @as(byte, @intCast(n >> 8));
-    b[2] = @as(byte, @intCast(n));
+    b[0] = @as(byte, @intCast((n >> 16) & 0xFF));
+    b[1] = @as(byte, @intCast((n >> 8) & 0xFF));
+    b[2] = @as(byte, @intCast(n & 0xFF));
 }
 
 pub fn mach_read_from_3(b: [*]const byte) ulint {
@@ -221,17 +221,18 @@ pub fn mach_dulint_parse_compressed(ptr: [*]byte, end_ptr: [*]byte, val: *dulint
 test "mach compressed roundtrip and parse" {
     var buf = [_]byte{0} ** 8;
     var out: ulint = 0;
+    const ptr = buf[0..].ptr;
 
-    _ = mach_write_compressed(&buf, 0x7F);
-    try std.testing.expect(mach_parse_compressed(&buf, &buf + 8, &out) == &buf + 1);
+    _ = mach_write_compressed(ptr, 0x7F);
+    try std.testing.expect(mach_parse_compressed(ptr, ptr + buf.len, &out) == ptr + 1);
     try std.testing.expect(out == 0x7F);
 
-    _ = mach_write_compressed(&buf, 0x4000);
-    try std.testing.expect(mach_parse_compressed(&buf, &buf + 8, &out) == &buf + 3);
+    _ = mach_write_compressed(ptr, 0x4000);
+    try std.testing.expect(mach_parse_compressed(ptr, ptr + buf.len, &out) == ptr + 3);
     try std.testing.expect(out == 0x4000);
 
-    _ = mach_write_compressed(&buf, 0x10000000);
-    try std.testing.expect(mach_parse_compressed(&buf, &buf + 8, &out) == &buf + 5);
+    _ = mach_write_compressed(ptr, 0x10000000);
+    try std.testing.expect(mach_parse_compressed(ptr, ptr + buf.len, &out) == ptr + 5);
     try std.testing.expect(out == 0x10000000);
 }
 
@@ -239,11 +240,11 @@ test "mach dulint parse compressed" {
     var buf = [_]byte{0} ** 16;
     const high: ulint = 0x1234;
     const low: ulint = 0x89ABCDEF;
-    const size = mach_write_compressed(&buf, high);
-    mach_write_to_4(&buf[size], low);
+    const size = mach_write_compressed(buf[0..].ptr, high);
+    mach_write_to_4(buf[size..].ptr, low);
 
     var value: dulint = .{ .high = 0, .low = 0 };
-    const end_ptr = mach_dulint_parse_compressed(&buf, &buf + buf.len, &value);
+    const end_ptr = mach_dulint_parse_compressed(buf[0..].ptr, buf[0..].ptr + buf.len, &value);
     try std.testing.expect(end_ptr != null);
     try std.testing.expect(value.high == high);
     try std.testing.expect(value.low == low);
@@ -252,8 +253,8 @@ test "mach dulint parse compressed" {
 test "mach dulint compressed roundtrip" {
     var buf = [_]byte{0} ** 16;
     const input: dulint = .{ .high = 0x2, .low = 0x11223344 };
-    const size = mach_dulint_write_compressed(&buf, input);
-    const out = mach_dulint_read_compressed(&buf);
+    const size = mach_dulint_write_compressed(buf[0..].ptr, input);
+    const out = mach_dulint_read_compressed(buf[0..].ptr);
     try std.testing.expectEqual(input.high, out.high);
     try std.testing.expectEqual(input.low, out.low);
     try std.testing.expectEqual(size, mach_dulint_get_compressed_size(input));

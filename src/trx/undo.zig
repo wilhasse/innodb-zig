@@ -48,10 +48,10 @@ pub fn trx_undo_mem_free(undo: *trx_undo_t) void {
 }
 
 pub fn trx_undo_append_record(undo: *trx_undo_t, record: types.trx_undo_record_t) void {
-    const data_copy = if (record.data.len > 0)
-        undo.allocator.alloc(u8, record.data.len) catch @panic("trx_undo_append_record")
-    else
-        &[_]u8{};
+    var data_copy: []u8 = &[_]u8{};
+    if (record.data.len > 0) {
+        data_copy = undo.allocator.alloc(u8, record.data.len) catch @panic("trx_undo_append_record");
+    }
     if (record.data.len > 0) {
         std.mem.copyForwards(u8, data_copy, record.data);
     }
@@ -103,7 +103,7 @@ pub fn trx_undo_truncate_end(undo: *trx_undo_t, limit: undo_no_t) void {
 }
 
 test "trx undo append, prev, pop" {
-    var undo = trx_undo_mem_create(1, TRX_UNDO_UPDATE, 11, std.testing.allocator);
+    const undo = trx_undo_mem_create(1, TRX_UNDO_UPDATE, 11, std.testing.allocator);
     defer trx_undo_mem_free(undo);
 
     trx_undo_append_record(undo, .{ .undo_no = .{ .high = 0, .low = 1 }, .data = "a" });
@@ -117,7 +117,7 @@ test "trx undo append, prev, pop" {
 }
 
 test "trx undo truncate end" {
-    var undo = trx_undo_mem_create(2, TRX_UNDO_INSERT, 12, std.testing.allocator);
+    const undo = trx_undo_mem_create(2, TRX_UNDO_INSERT, 12, std.testing.allocator);
     defer trx_undo_mem_free(undo);
 
     trx_undo_append_record(undo, .{ .undo_no = .{ .high = 0, .low = 3 }, .data = "c" });

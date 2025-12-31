@@ -272,6 +272,12 @@ fn page_find_insert_after(page_obj: *page_t, key: i64) *rec_t {
 
 const SplitEntry = struct {
     key: i64,
+    payload: ?*anyopaque,
+    deleted: bool,
+    min_rec_mark: bool,
+    extern_fields: []page.extern_field_t,
+    child_block: ?*buf_block_t,
+    child_page_no: ulint,
     is_new: bool,
 };
 
@@ -302,7 +308,15 @@ fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict
     const allocator = std.heap.page_allocator;
     for (entries) |entry| {
         const rec = allocator.create(rec_t) catch return inserted;
-        rec.* = .{ .key = entry.key };
+        rec.* = .{
+            .key = entry.key,
+            .payload = entry.payload,
+            .deleted = entry.deleted,
+            .min_rec_mark = entry.min_rec_mark,
+            .extern_fields = entry.extern_fields,
+            .child_block = entry.child_block,
+            .child_page_no = entry.child_page_no,
+        };
         if (page.page_cur_rec_insert(&cursor, rec, index, &offsets, mtr) == null) {
             allocator.destroy(rec);
             return inserted;
@@ -328,14 +342,41 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
             break;
         }
         if (!inserted and new_key < node.key) {
-            entries.append(.{ .key = new_key, .is_new = true }) catch return null;
+            entries.append(.{
+                .key = new_key,
+                .payload = null,
+                .deleted = false,
+                .min_rec_mark = false,
+                .extern_fields = &[_]page.extern_field_t{},
+                .child_block = null,
+                .child_page_no = 0,
+                .is_new = true,
+            }) catch return null;
             inserted = true;
         }
-        entries.append(.{ .key = node.key, .is_new = false }) catch return null;
+        entries.append(.{
+            .key = node.key,
+            .payload = node.payload,
+            .deleted = node.deleted,
+            .min_rec_mark = node.min_rec_mark,
+            .extern_fields = node.extern_fields,
+            .child_block = node.child_block,
+            .child_page_no = node.child_page_no,
+            .is_new = false,
+        }) catch return null;
         current = node.next;
     }
     if (!inserted) {
-        entries.append(.{ .key = new_key, .is_new = true }) catch return null;
+        entries.append(.{
+            .key = new_key,
+            .payload = null,
+            .deleted = false,
+            .min_rec_mark = false,
+            .extern_fields = &[_]page.extern_field_t{},
+            .child_block = null,
+            .child_page_no = 0,
+            .is_new = true,
+        }) catch return null;
     }
 
     if (entries.items.len < 2) {
@@ -399,7 +440,7 @@ fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index:
     insert_node_ptr_with_key(parent_block, child_block, key, index, mtr);
 }
 
-fn btr_find_rec_by_key(index: *dict_index_t, key: i64) ?*rec_t {
+pub fn btr_find_rec_by_key(index: *dict_index_t, key: i64) ?*rec_t {
     var block_opt: ?*buf_block_t = descend_to_level(index, 0, true) orelse return null;
     while (block_opt) |block| {
         var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
@@ -743,6 +784,21 @@ pub fn btr_free_root(space: ulint, zip_size: ulint, root_page_no: ulint, mtr: *m
     }
 }
 
+pub fn btr_free_index(index: *dict_index_t) void {
+    if (index_states.fetchRemove(index)) |entry| {
+        var it = entry.value.pages.valueIterator();
+        while (it.next()) |block_ptr| {
+            const block = block_ptr.*;
+            std.heap.page_allocator.destroy(block.frame);
+            std.heap.page_allocator.destroy(block);
+        }
+        entry.value.pages.deinit();
+        std.heap.page_allocator.destroy(entry.value);
+        index.page = 0;
+        index.root_level = 0;
+    }
+}
+
 fn btr_page_reorganize_low(block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) ibool {
     var cursor = page.page_cur_t{};
     cursor.block = block;
@@ -1066,7 +1122,7 @@ fn btr_validate_subtree(index: *dict_index_t, block: *buf_block_t) bool {
     return true;
 }
 
-fn btr_find_leaf_for_key(index: *dict_index_t, key: i64) ?*buf_block_t {
+pub fn btr_find_leaf_for_key(index: *dict_index_t, key: i64) ?*buf_block_t {
     var block = descend_to_level(index, 0, true) orelse return null;
     while (true) {
         const last = page_last_user_rec(block.frame);
@@ -1077,7 +1133,7 @@ fn btr_find_leaf_for_key(index: *dict_index_t, key: i64) ?*buf_block_t {
     }
 }
 
-fn btr_block_for_rec(index: *dict_index_t, rec: *rec_t) ?*buf_block_t {
+pub fn btr_block_for_rec(index: *dict_index_t, rec: *rec_t) ?*buf_block_t {
     const page_ptr = rec.page orelse return null;
     const state = index_states.get(index) orelse return null;
     return state.pages.get(page_ptr.page_no);

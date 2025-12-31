@@ -208,7 +208,7 @@ test "fsp header fields" {
     try std.testing.expect(fsp_header_get_space_id(&page) == 7);
     try std.testing.expect(fsp_header_get_flags(&page) == 0x12);
 
-    mach.mach_write_to_4(&page + FSP_HEADER_OFFSET + FSP_SIZE, 99);
+    mach.mach_write_to_4(page[0..].ptr + FSP_HEADER_OFFSET + FSP_SIZE, 99);
     try std.testing.expect(fsp_get_size_low(&page) == 99);
 }
 

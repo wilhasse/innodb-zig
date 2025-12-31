@@ -51,6 +51,7 @@ comptime {
         _ = @import("tests/ib_shared_storage.zig");
         _ = @import("tests/ib_status.zig");
         _ = @import("tests/ib_tablename.zig");
+        _ = @import("tests/ib_tablespace_io.zig");
         _ = @import("tests/ib_test1.zig");
         _ = @import("tests/ib_test2.zig");
         _ = @import("tests/ib_test3.zig");

@@ -23,7 +23,7 @@ pub const TRX_SIG_OTHER_SESS: ulint = 1;
 pub const TrxQueState = enum(u8) {
     running = 1,
     rolling_back = 2,
-    error = 3,
+    errored = 3,
 };
 
 pub const TrxConcState = enum(u8) {

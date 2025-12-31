@@ -24,7 +24,7 @@ pub var buf_buddy_stat = [_]buf_buddy_stat_t{.{}} ** (BUF_BUDDY_SIZES + 1);
 
 fn buddyBlockSize(slot: ulint) ulint {
     const capped = if (slot > BUF_BUDDY_SIZES) BUF_BUDDY_SIZES else slot;
-    return BUF_BUDDY_LOW << @as(usize, @intCast(capped));
+    return BUF_BUDDY_LOW << @as(u6, @intCast(capped));
 }
 
 pub fn buf_buddy_get_slot(size: ulint) ulint {

@@ -1,7 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const types = @import("types.zig");
-const undo = @import("undo.zig");
+const undo_mod = @import("undo.zig");
 
 pub const module_name = "trx.rseg";
 
@@ -22,10 +22,10 @@ pub const trx_rseg_t = struct {
     page_no: ulint = 0,
     max_size: ulint = 0,
     curr_size: ulint = 0,
-    update_undo_list: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
-    update_undo_cached: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
-    insert_undo_list: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
-    insert_undo_cached: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
+    update_undo_list: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
+    update_undo_cached: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
+    insert_undo_list: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
+    insert_undo_cached: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
     last_page_no: ulint = FIL_NULL,
     last_offset: ulint = 0,
     last_trx_no: trx_id_t = 0,
@@ -48,8 +48,8 @@ pub fn trx_sys_init(allocator: std.mem.Allocator) void {
         for (trx_sys.rsegs) |*slot| {
             slot.* = null;
         }
+        trx_sys.allocator = allocator;
     }
-    trx_sys.allocator = allocator;
     trx_sys.rseg_list.clearRetainingCapacity();
     trx_sys.rseg_history_len = 0;
 }
@@ -58,9 +58,14 @@ pub fn trx_sys_deinit() void {
     if (trx_sys.rsegs.len == 0) {
         return;
     }
+    while (trx_sys.rseg_list.items.len > 0) {
+        const last = trx_sys.rseg_list.items[trx_sys.rseg_list.items.len - 1];
+        trx_rseg_mem_free(last);
+    }
     trx_sys.allocator.free(trx_sys.rsegs);
     trx_sys.rsegs = &[_]?*trx_rseg_t{};
     trx_sys.rseg_list.deinit(trx_sys.allocator);
+    trx_sys.rseg_list = .{};
 }
 
 pub fn trx_sys_set_nth_rseg(id: ulint, rseg: ?*trx_rseg_t) void {
@@ -114,7 +119,7 @@ pub fn trx_rseg_header_create(
 pub fn trx_rseg_mem_free(rseg: *trx_rseg_t) void {
     for (trx_sys.rseg_list.items, 0..) |item, idx| {
         if (item == rseg) {
-            _ = trx_sys.rseg_list.orderedRemove(trx_sys.allocator, idx);
+            _ = trx_sys.rseg_list.orderedRemove(idx);
             break;
         }
     }
@@ -125,14 +130,14 @@ pub fn trx_rseg_mem_free(rseg: *trx_rseg_t) void {
     while (rseg.update_undo_cached.items.len > 0) {
         const undo = rseg.update_undo_cached.items[rseg.update_undo_cached.items.len - 1];
         rseg.update_undo_cached.items.len -= 1;
-        undo.trx_undo_mem_free(undo);
+        undo_mod.trx_undo_mem_free(undo);
     }
     rseg.update_undo_cached.deinit(trx_sys.allocator);
 
     while (rseg.insert_undo_cached.items.len > 0) {
         const undo = rseg.insert_undo_cached.items[rseg.insert_undo_cached.items.len - 1];
         rseg.insert_undo_cached.items.len -= 1;
-        undo.trx_undo_mem_free(undo);
+        undo_mod.trx_undo_mem_free(undo);
     }
     rseg.insert_undo_cached.deinit(trx_sys.allocator);
 

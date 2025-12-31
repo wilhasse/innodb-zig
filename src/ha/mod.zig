@@ -404,11 +404,11 @@ pub fn ha_storage_put_memlim(
     memlim: ulint,
 ) ?*const anyopaque {
     const bytes = @as([*]const u8, @ptrCast(data));
-    if (ha_storage_get(storage, bytes, data_len)) |found| {
-        return found;
-    }
     if (memlim > 0 and storage.size_bytes + data_len > memlim) {
         return null;
+    }
+    if (ha_storage_get(storage, bytes, data_len)) |found| {
+        return found;
     }
     const n = @as(usize, @intCast(data_len));
     const buf = std.heap.page_allocator.alloc(u8, n) catch return null;

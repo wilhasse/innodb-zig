@@ -158,8 +158,7 @@ pub fn existsAt(dir: std.fs.Dir, path: []const u8) bool {
 
 fn openFlags(access: Access) std.fs.File.OpenFlags {
     return .{
-        .read = true,
-        .write = access == .read_write,
+        .mode = if (access == .read_write) .read_write else .read_only,
     };
 }
 

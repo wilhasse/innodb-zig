@@ -2,7 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const errors = @import("../ut/errors.zig");
 const data = @import("../data/mod.zig");
-const api = @import("../api/mod.zig").impl;
+const charset = @import("../ut/charset.zig");
 
 pub const module_name = "dict";
 
@@ -301,7 +301,7 @@ pub fn dict_create_add_foreigns_to_dictionary(start_id: ulint, table: *dict_tabl
 }
 
 pub fn dict_casedn_str(a: []u8) void {
-    api.ib_utf8_casedown(a);
+    charset.utf8_casedown(a);
 }
 
 pub fn dict_tables_have_same_db(name1: []const u8, name2: []const u8) ibool {

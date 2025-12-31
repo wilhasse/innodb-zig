@@ -1,6 +1,9 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const mach = @import("../mach/mod.zig");
+const os_file = @import("../os/file.zig");
+const buf_mod = @import("../buf/mod.zig");
+const fsp = @import("../fsp/mod.zig");
 const sync = @import("../sync/mod.zig");
 
 pub const module_name = "fil";
@@ -61,12 +64,29 @@ pub const FIL_LOG: ulint = 502;
 
 pub const DB_SUCCESS: ulint = 0;
 pub const DB_TABLESPACE_DELETED: ulint = 1;
+pub const DB_TABLESPACE_ALREADY_EXISTS: ulint = 2;
+pub const DB_OUT_OF_FILE_SPACE: ulint = 3;
+pub const DB_ERROR: ulint = 4;
 
 pub var fil_n_log_flushes: ulint = 0;
 pub var fil_n_pending_log_flushes: ulint = 0;
 pub var fil_n_pending_tablespace_flushes: ulint = 0;
 
 pub var fil_path_to_client_datadir: []const u8 = ".";
+
+fn fil_make_ibd_name(tablename: []const u8) ?[]u8 {
+    const allocator = std.heap.page_allocator;
+    const needs_sep = fil_path_to_client_datadir.len > 0 and
+        !std.mem.endsWith(u8, fil_path_to_client_datadir, "/") and
+        !std.mem.endsWith(u8, fil_path_to_client_datadir, "\\");
+    const sep = if (needs_sep) "/" else "";
+    const suffix = ".ibd";
+    const needs_suffix = !std.mem.endsWith(u8, tablename, suffix);
+    if (needs_suffix) {
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ fil_path_to_client_datadir, sep, tablename, suffix }) catch null;
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ fil_path_to_client_datadir, sep, tablename }) catch null;
+}
 
 pub const rw_lock_t = sync.RwLock;
 pub const os_file_t = ?*anyopaque;
@@ -336,9 +356,15 @@ pub fn fil_op_log_parse_or_replay(
 pub fn fil_delete_tablespace(id: ulint) ibool {
     const sys = ensureSystem();
     if (sys.spaces.fetchRemove(id)) |entry| {
+        var ok = compat.TRUE;
+        for (entry.value.nodes.items) |node| {
+            if (os_file.os_file_delete_if_exists(node.name) == compat.FALSE) {
+                ok = compat.FALSE;
+            }
+        }
         _ = sys.spaces_by_name.remove(entry.value.name);
         freeSpace(entry.value);
-        return compat.TRUE;
+        return ok;
     }
     return compat.FALSE;
 }
@@ -351,15 +377,27 @@ pub fn fil_rename_tablespace(old_name: ?[]const u8, id: ulint, new_name: []const
     _ = old_name;
     const sys = ensureSystem();
     if (findSpace(id)) |space| {
-        if (sys.spaces_by_name.contains(new_name)) {
+        const new_path = fil_make_ibd_name(new_name) orelse return compat.FALSE;
+        if (sys.spaces_by_name.contains(new_path)) {
+            std.heap.page_allocator.free(new_path);
             return compat.FALSE;
         }
+        if (!std.mem.eql(u8, space.name, new_path)) {
+            if (os_file.os_file_rename(space.name, new_path) == compat.FALSE) {
+                std.heap.page_allocator.free(new_path);
+                return compat.FALSE;
+            }
+        }
         _ = sys.spaces_by_name.remove(space.name);
-        const buf = std.heap.page_allocator.alloc(u8, new_name.len) catch return compat.FALSE;
-        std.mem.copyForwards(u8, buf, new_name);
         std.heap.page_allocator.free(space.name);
-        space.name = buf;
-        _ = sys.spaces_by_name.put(space.name, space);
+        space.name = new_path;
+        _ = sys.spaces_by_name.put(space.name, space) catch return compat.FALSE;
+        for (space.nodes.items) |*node| {
+            std.heap.page_allocator.free(node.name);
+            const buf = std.heap.page_allocator.alloc(u8, new_path.len) catch return compat.FALSE;
+            std.mem.copyForwards(u8, buf, new_path);
+            node.name = buf;
+        }
         return compat.TRUE;
     }
     return compat.FALSE;
@@ -375,19 +413,72 @@ pub fn fil_create_new_single_table_tablespace(
     _ = is_temp;
     const sys = ensureSystem();
     if (size < FIL_IBD_FILE_INITIAL_SIZE) {
-        return 1;
+        return DB_ERROR;
+    }
+    const path = fil_make_ibd_name(tablename) orelse return DB_ERROR;
+    defer std.heap.page_allocator.free(path);
+
+    var success: ibool = compat.FALSE;
+    var file = os_file.os_file_create_simple(path, os_file.OS_FILE_CREATE_PATH, os_file.OS_FILE_READ_WRITE, &success);
+    if (success == compat.FALSE or file == null) {
+        const err = os_file.os_file_get_last_error(compat.TRUE);
+        if (err == os_file.OS_FILE_ALREADY_EXISTS) {
+            _ = os_file.os_file_delete(path);
+            file = os_file.os_file_create_simple(path, os_file.OS_FILE_CREATE_PATH, os_file.OS_FILE_READ_WRITE, &success);
+        }
+    }
+    if (success == compat.FALSE or file == null) {
+        const err = os_file.os_file_get_last_error(compat.TRUE);
+        if (err == os_file.OS_FILE_ALREADY_EXISTS) {
+            return DB_TABLESPACE_ALREADY_EXISTS;
+        }
+        if (err == os_file.OS_FILE_DISK_FULL) {
+            return DB_OUT_OF_FILE_SPACE;
+        }
+        return DB_ERROR;
+    }
+    defer _ = os_file.os_file_close(file);
+
+    const desired_bytes = @as(ulint, @intCast(size * compat.UNIV_PAGE_SIZE));
+    if (os_file.os_file_set_size(path, file, desired_bytes, 0) == compat.FALSE) {
+        _ = os_file.os_file_delete(path);
+        return DB_OUT_OF_FILE_SPACE;
     }
     if (space_id.* == 0) {
         sys.max_space_id += 1;
         space_id.* = sys.max_space_id;
     }
-    if (fil_space_create(tablename, space_id.*, 0, FIL_TABLESPACE) == compat.FALSE) {
-        return 1;
+    if (space_id.* == FIL_NULL or space_id.* == compat.ULINT_UNDEFINED) {
+        _ = os_file.os_file_delete(path);
+        return DB_ERROR;
+    }
+
+    const page_buf = std.heap.page_allocator.alloc(byte, compat.UNIV_PAGE_SIZE) catch {
+        _ = os_file.os_file_delete(path);
+        return DB_ERROR;
+    };
+    defer std.heap.page_allocator.free(page_buf);
+    @memset(page_buf, 0);
+    fsp.fsp_header_init_fields(page_buf.ptr, space_id.*, flags);
+    mach.mach_write_to_4(page_buf.ptr + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, space_id.*);
+    buf_mod.buf_flush_init_for_writing(page_buf.ptr, null, 0);
+    if (os_file.os_file_write(path, file, page_buf.ptr, 0, 0, compat.UNIV_PAGE_SIZE) == compat.FALSE) {
+        _ = os_file.os_file_delete(path);
+        return DB_ERROR;
+    }
+    if (os_file.os_file_flush(file) == compat.FALSE) {
+        _ = os_file.os_file_delete(path);
+        return DB_ERROR;
+    }
+
+    if (fil_space_create(path, space_id.*, 0, FIL_TABLESPACE) == compat.FALSE) {
+        _ = os_file.os_file_delete(path);
+        return DB_ERROR;
     }
     if (findSpace(space_id.*)) |space| {
         space.flags = flags;
     }
-    fil_node_create(tablename, size, space_id.*, compat.FALSE);
+    fil_node_create(path, size, space_id.*, compat.FALSE);
     return DB_SUCCESS;
 }
 

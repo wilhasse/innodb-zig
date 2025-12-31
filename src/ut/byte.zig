@@ -123,15 +123,17 @@ pub fn ut_align_offset(ptr: anytype, align_no: ulint) ulint {
 
 pub fn ut_bit_get_nth(a: ulint, n: ulint) ibool {
     std.debug.assert(n < 8 * @sizeOf(ulint));
-    return @as(ibool, @intCast((a >> @as(usize, @intCast(n))) & 1));
+    const shift = @as(u6, @intCast(n));
+    return @as(ibool, @intCast((a >> shift) & 1));
 }
 
 pub fn ut_bit_set_nth(a: ulint, n: ulint, val: ibool) ulint {
     std.debug.assert(n < 8 * @sizeOf(ulint));
+    const shift = @as(u6, @intCast(n));
     if (val != 0) {
-        return (@as(ulint, 1) << @as(usize, @intCast(n))) | a;
+        return (@as(ulint, 1) << shift) | a;
     }
-    return ~(@as(ulint, 1) << @as(usize, @intCast(n))) & a;
+    return ~(@as(ulint, 1) << shift) & a;
 }
 
 test "ut dulint basics" {
@@ -174,7 +176,7 @@ test "ut uint64 align helpers" {
 }
 
 test "ut pointer align helpers" {
-    var buf = [_]u8{0} ** 32;
+    var buf: [32]u8 align(8) = [_]u8{0} ** 32;
     const ptr = &buf[3];
     const up = ut_align(ptr, 8);
     const down = ut_align_down(ptr, 8);

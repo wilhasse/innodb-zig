@@ -70,6 +70,7 @@ pub const rec_t = struct {
     deleted: bool = false,
     min_rec_mark: bool = false,
     key: i64 = 0,
+    payload: ?*anyopaque = null,
     child_page_no: ulint = 0,
     child_block: ?*buf_block_t = null,
     extern_fields: []extern_field_t = &[_]extern_field_t{},
@@ -354,7 +355,15 @@ pub fn page_copy_rec_list_end_to_created_page(new_page: *page_t, rec: *rec_t, in
             break;
         }
         const copy = std.heap.page_allocator.create(rec_t) catch return;
-        copy.* = .{ .key = node.key };
+        copy.* = .{
+            .key = node.key,
+            .payload = node.payload,
+            .deleted = node.deleted,
+            .min_rec_mark = node.min_rec_mark,
+            .extern_fields = node.extern_fields,
+            .child_block = node.child_block,
+            .child_page_no = node.child_page_no,
+        };
         copy.page = new_page;
         const sup = &new_page.supremum;
         const prev = sup.prev orelse &new_page.infimum;
@@ -512,7 +521,15 @@ pub fn page_copy_rec_list_start(new_block: *buf_block_t, block: *buf_block_t, re
             break;
         }
         const copy = std.heap.page_allocator.create(rec_t) catch break;
-        copy.* = .{ .key = node.key };
+        copy.* = .{
+            .key = node.key,
+            .payload = node.payload,
+            .deleted = node.deleted,
+            .min_rec_mark = node.min_rec_mark,
+            .extern_fields = node.extern_fields,
+            .child_block = node.child_block,
+            .child_page_no = node.child_page_no,
+        };
         copy.page = new_block.frame;
         const sup = &new_block.frame.supremum;
         const prev = sup.prev orelse &new_block.frame.infimum;
