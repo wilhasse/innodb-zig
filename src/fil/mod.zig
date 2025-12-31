@@ -650,7 +650,10 @@ pub fn fil_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint
         return DB_TABLESPACE_DELETED;
     }
     if (!fil_page_in_space(space, page_no)) {
-        return DB_ERROR;
+        var actual_size: ulint = 0;
+        if (fil_extend_space_to_desired_size(&actual_size, space_id, page_no + 1) == compat.FALSE) {
+            return DB_ERROR;
+        }
     }
     const node = fil_first_node(space) orelse return DB_ERROR;
     var success: ibool = compat.FALSE;

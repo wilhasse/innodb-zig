@@ -321,9 +321,26 @@ fn dict_sys_metadata_clear() void {
     dict_sys.sys_tables.deinit(std.heap.page_allocator);
     dict_sys.sys_columns.deinit(std.heap.page_allocator);
     dict_sys.sys_indexes.deinit(std.heap.page_allocator);
+    dict_sys.sys_tables = .empty;
+    dict_sys.sys_columns = .empty;
+    dict_sys.sys_indexes = .empty;
 }
 
 pub fn dict_sys_table_insert(name: []const u8, table_id: dulint, space: ulint, n_cols: ulint, flags: ulint) ibool {
+    for (dict_sys.sys_tables.items, 0..) |row, idx| {
+        if (dulintEqual(row.id, table_id) or std.mem.eql(u8, row.name, name)) {
+            if (!std.mem.eql(u8, row.name, name)) {
+                const name_copy = dupSysName(name) orelse return compat.FALSE;
+                freeSysName(row.name);
+                dict_sys.sys_tables.items[idx].name = name_copy;
+            }
+            dict_sys.sys_tables.items[idx].id = table_id;
+            dict_sys.sys_tables.items[idx].space = space;
+            dict_sys.sys_tables.items[idx].n_cols = n_cols;
+            dict_sys.sys_tables.items[idx].flags = flags;
+            return compat.TRUE;
+        }
+    }
     const name_copy = dupSysName(name) orelse return compat.FALSE;
     errdefer freeSysName(name_copy);
     dict_sys.sys_tables.append(std.heap.page_allocator, .{
@@ -337,6 +354,19 @@ pub fn dict_sys_table_insert(name: []const u8, table_id: dulint, space: ulint, n
 }
 
 pub fn dict_sys_column_insert(table_id: dulint, name: []const u8, pos: ulint, mtype: ulint, prtype: ulint, len: ulint) ibool {
+    for (dict_sys.sys_columns.items, 0..) |row, idx| {
+        if (dulintEqual(row.table_id, table_id) and row.pos == pos) {
+            if (!std.mem.eql(u8, row.name, name)) {
+                const name_copy = dupSysName(name) orelse return compat.FALSE;
+                freeSysName(row.name);
+                dict_sys.sys_columns.items[idx].name = name_copy;
+            }
+            dict_sys.sys_columns.items[idx].mtype = mtype;
+            dict_sys.sys_columns.items[idx].prtype = prtype;
+            dict_sys.sys_columns.items[idx].len = len;
+            return compat.TRUE;
+        }
+    }
     const name_copy = dupSysName(name) orelse return compat.FALSE;
     errdefer freeSysName(name_copy);
     dict_sys.sys_columns.append(std.heap.page_allocator, .{
@@ -351,6 +381,20 @@ pub fn dict_sys_column_insert(table_id: dulint, name: []const u8, pos: ulint, mt
 }
 
 pub fn dict_sys_index_insert(table_id: dulint, index_id: dulint, name: []const u8, type_: ulint, space: ulint) ibool {
+    for (dict_sys.sys_indexes.items, 0..) |row, idx| {
+        if (dulintEqual(row.id, index_id) or (dulintEqual(row.table_id, table_id) and std.mem.eql(u8, row.name, name))) {
+            if (!std.mem.eql(u8, row.name, name)) {
+                const name_copy = dupSysName(name) orelse return compat.FALSE;
+                freeSysName(row.name);
+                dict_sys.sys_indexes.items[idx].name = name_copy;
+            }
+            dict_sys.sys_indexes.items[idx].id = index_id;
+            dict_sys.sys_indexes.items[idx].table_id = table_id;
+            dict_sys.sys_indexes.items[idx].type = type_;
+            dict_sys.sys_indexes.items[idx].space = space;
+            return compat.TRUE;
+        }
+    }
     const name_copy = dupSysName(name) orelse return compat.FALSE;
     errdefer freeSysName(name_copy);
     dict_sys.sys_indexes.append(std.heap.page_allocator, .{
@@ -395,7 +439,7 @@ pub fn dict_sys_table_remove(table_id: dulint) void {
         if (dulintEqual(dict_sys.sys_tables.items[idx].id, table_id)) {
             freeSysName(dict_sys.sys_tables.items[idx].name);
             _ = dict_sys.sys_tables.orderedRemove(idx);
-            break;
+            continue;
         }
         idx += 1;
     }
@@ -407,7 +451,7 @@ pub fn dict_sys_index_remove(index_id: dulint) void {
         if (dulintEqual(dict_sys.sys_indexes.items[idx].id, index_id)) {
             freeSysName(dict_sys.sys_indexes.items[idx].name);
             _ = dict_sys.sys_indexes.orderedRemove(idx);
-            break;
+            continue;
         }
         idx += 1;
     }

@@ -48,6 +48,10 @@ fn dropTable() !void {
 }
 
 test "shared table storage across cursors" {
+    try expectOk(api.ib_init());
+    try expectOk(api.ib_startup("barracuda"));
+    defer _ = api.ib_shutdown(.IB_SHUTDOWN_NORMAL);
+
     try createTable();
     defer dropTable() catch {};
 

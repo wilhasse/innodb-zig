@@ -937,6 +937,18 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
 
 pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
+    if (!cfg_started) {
+        buf_mod.buf_close();
+        buf_mod.buf_mem_free();
+        fil.fil_close();
+        _ = ib_cfg_shutdown();
+        db_format.id = 0;
+        db_format.name = null;
+        catalogClear();
+        next_table_id = 1;
+        next_index_id = 1;
+        return .DB_SUCCESS;
+    }
     btr.btr_search_sys_close();
     trx_sys.trx_sys_close();
     fil.fil_close();
@@ -950,6 +962,7 @@ pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     catalogClear();
     next_table_id = 1;
     next_index_id = 1;
+    cfg_started = false;
     return .DB_SUCCESS;
 }
 
