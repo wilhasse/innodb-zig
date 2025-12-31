@@ -154,8 +154,63 @@ pub fn btr_root_get(index: *dict_index_t, mtr: *mtr_t) ?*page_t {
 
 pub fn btr_root_block_get(index: *dict_index_t, mtr: *mtr_t) ?*buf_block_t {
     _ = mtr;
-    const state = index_states.get(index) orelse return null;
-    return state.pages.get(index.page);
+    const state = index_state_get(index) orelse return null;
+    if (state.pages.get(index.page)) |block| {
+        return block;
+    }
+    return btr_page_load_from_disk(index, index.page);
+}
+
+fn btr_page_load_from_disk(index: *dict_index_t, page_no: ulint) ?*buf_block_t {
+    if (fil.fil_tablespace_exists_in_mem(index.space) == compat.FALSE) {
+        return null;
+    }
+    if (buf_mod.buf_read_page(index.space, index.zip_size, page_no) == compat.FALSE) {
+        return null;
+    }
+    var buf_mtr = buf_mod.mtr_t{};
+    const buf_block = buf_mod.buf_page_get_gen(
+        index.space,
+        index.zip_size,
+        page_no,
+        0,
+        null,
+        buf_mod.BUF_GET,
+        "",
+        0,
+        &buf_mtr,
+    ) orelse return null;
+
+    const allocator = std.heap.page_allocator;
+    const page_obj = allocator.create(page_t) catch return null;
+    page_obj.* = .{};
+    page_obj.page_no = page_no;
+    page.page_init(page_obj);
+
+    const block = allocator.create(buf_block_t) catch {
+        allocator.destroy(page_obj);
+        return null;
+    };
+    block.* = .{ .frame = page_obj, .page_zip = null };
+
+    const bytes = btr_block_bytes_ensure(block) orelse {
+        btr_block_destroy(block);
+        return null;
+    };
+    std.mem.copyForwards(u8, bytes, buf_block.frame);
+
+    const state = index_state_get(index) orelse {
+        btr_block_destroy(block);
+        return null;
+    };
+    state.pages.put(page_no, block) catch {
+        btr_block_destroy(block);
+        return null;
+    };
+    if (page_no >= state.next_page_no) {
+        state.next_page_no = page_no + 1;
+    }
+    return block;
 }
 
 fn btr_page_set_index_id(page_obj: *page_t, page_zip: ?*page_zip_des_t, id: dulint, mtr: *mtr_t) void {
@@ -3568,6 +3623,67 @@ test "btr page alloc writes to disk" {
 
     try std.testing.expectEqual(@as(usize, compat.UNIV_PAGE_SIZE), block.bytes.len);
     try std.testing.expect(std.mem.eql(u8, read_buf[0..], block.bytes));
+}
+
+test "btr page fetch reads from disk via buf" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const prev_path = fil.fil_path_to_client_datadir;
+    fil.fil_path_to_client_datadir = base;
+    defer fil.fil_path_to_client_datadir = prev_path;
+
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+
+    var space_id: ulint = 0;
+    const create_err = fil.fil_create_new_single_table_tablespace(&space_id, "btrfetch", compat.FALSE, 0, 4);
+    try std.testing.expectEqual(fil.DB_SUCCESS, create_err);
+
+    var page_no: ulint = 0;
+
+    {
+        const allocator = std.heap.page_allocator;
+        const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+        index.* = .{};
+        index.space = space_id;
+        defer allocator.destroy(index);
+        defer index_state_remove(index);
+
+        var mtr = mtr_t{};
+        const block = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+        defer btr_page_free(index, block, &mtr);
+
+        page_no = block.frame.page_no;
+        index.page = page_no;
+
+        try std.testing.expectEqual(@as(usize, compat.UNIV_PAGE_SIZE), block.bytes.len);
+        block.bytes[0] = 0x5A;
+        block.bytes[1] = 0xA5;
+        try std.testing.expectEqual(fil.DB_SUCCESS, fil.fil_write_page(space_id, page_no, block.bytes.ptr));
+    }
+
+    buf_mod.buf_mem_free();
+
+    {
+        const allocator = std.heap.page_allocator;
+        const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+        index.* = .{};
+        index.space = space_id;
+        index.page = page_no;
+        defer allocator.destroy(index);
+        defer index_state_remove(index);
+
+        var mtr = mtr_t{};
+        const loaded = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+        defer btr_page_free(index, loaded, &mtr);
+
+        try std.testing.expectEqual(@as(usize, compat.UNIV_PAGE_SIZE), loaded.bytes.len);
+        try std.testing.expectEqual(@as(u8, 0x5A), loaded.bytes[0]);
+        try std.testing.expectEqual(@as(u8, 0xA5), loaded.bytes[1]);
+    }
 }
 
 test "btr create root and free" {

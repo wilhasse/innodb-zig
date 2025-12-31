@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
+const fil = @import("../fil/mod.zig");
 
 pub const module_name = "buf";
 
@@ -676,9 +677,32 @@ pub fn buf_LRU_validate() ibool {
 pub fn buf_LRU_print() void {}
 
 pub fn buf_read_page(space: ulint, zip_size: ulint, offset: ulint) ibool {
-    _ = space;
-    _ = zip_size;
-    _ = offset;
+    const pool = buf_pool_init() orelse return compat.FALSE;
+    const key = BufPageKey{ .space = space, .page_no = offset };
+    var block: *buf_block_t = undefined;
+    if (pool.pages.get(key)) |existing| {
+        block = existing;
+    } else {
+        block = buf_block_alloc(zip_size) orelse return compat.FALSE;
+        block.page = .{
+            .state = .BUF_BLOCK_FILE_PAGE,
+            .space = space,
+            .page_no = offset,
+        };
+        pool.pages.put(key, block) catch {
+            buf_block_free(block);
+            return compat.FALSE;
+        };
+        pool.curr_size += 1;
+    }
+
+    if (fil.fil_tablespace_exists_in_mem(space) == compat.FALSE) {
+        return compat.FALSE;
+    }
+    if (fil.fil_read_page(space, offset, block.frame.ptr) != fil.DB_SUCCESS) {
+        return compat.FALSE;
+    }
+    block.page.dirty = compat.FALSE;
     return compat.TRUE;
 }
 
@@ -788,6 +812,6 @@ test "buf LRU stubs" {
 }
 
 test "buf read stubs" {
-    try std.testing.expectEqual(compat.TRUE, buf_read_page(0, 0, 0));
+    try std.testing.expectEqual(compat.FALSE, buf_read_page(0, 0, 0));
     try std.testing.expectEqual(@as(ulint, 0), buf_read_ahead_linear(0, 0, 0));
 }
