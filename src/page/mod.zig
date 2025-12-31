@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
+const dict = @import("../dict/mod.zig");
 
 pub const module_name = "page";
 
@@ -50,7 +51,7 @@ pub const page_zip_des_t = struct {
     n_blobs: u16 = 0,
     ssize: u8 = 0,
 };
-pub const dict_index_t = struct {};
+pub const dict_index_t = dict.dict_index_t;
 pub const dtuple_t = struct {};
 pub const mtr_t = struct {};
 
@@ -96,8 +97,9 @@ pub const page_cur_t = struct {
 
 pub fn page_init(page: *page_t) void {
     page.header = .{};
-    page.infimum.is_infimum = true;
-    page.supremum.is_supremum = true;
+    page.header.n_heap = PAGE_HEAP_NO_USER_LOW;
+    page.infimum = .{ .is_infimum = true };
+    page.supremum = .{ .is_supremum = true };
     page.infimum.prev = null;
     page.infimum.next = &page.supremum;
     page.supremum.prev = &page.infimum;

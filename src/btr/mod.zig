@@ -1,5 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
+const page = @import("../page/mod.zig");
+const dict = @import("../dict/mod.zig");
 
 pub const module_name = "btr";
 
@@ -54,29 +56,18 @@ pub var btr_search_enabled: u8 = 1;
 pub var btr_search_this_is_zero: ulint = 0;
 pub var btr_search_sys: ?*btr_search_sys_t = null;
 
-pub const rec_t = struct {
-    prev: ?*rec_t = null,
-    next: ?*rec_t = null,
-    is_infimum: bool = false,
-    is_supremum: bool = false,
-};
-
-pub const dict_index_t = struct {
-    space: ulint = 0,
-    page: ulint = 0,
-    zip_size: ulint = 0,
-    root_level: ulint = 0,
-};
-pub const mtr_t = struct {};
-pub const buf_block_t = struct {};
-pub const page_t = struct {};
-pub const page_zip_des_t = struct {};
+pub const rec_t = page.rec_t;
+pub const dict_index_t = dict.dict_index_t;
+pub const mtr_t = page.mtr_t;
+pub const buf_block_t = page.buf_block_t;
+pub const page_t = page.page_t;
+pub const page_zip_des_t = page.page_zip_des_t;
 pub const upd_t = struct {};
 pub const que_thr_t = struct {};
 pub const big_rec_t = struct {};
 pub const mem_heap_t = struct {};
 pub const trx_t = struct {};
-pub const page_cur_t = struct {};
+pub const page_cur_t = page.page_cur_t;
 pub const trx_rb_ctx = enum(u8) {
     TRX_RB_NONE = 0,
 };
@@ -108,6 +99,48 @@ pub fn btr_root_get(index: *dict_index_t, mtr: *mtr_t) ?*page_t {
     _ = index;
     _ = mtr;
     return null;
+}
+
+fn btr_page_set_index_id(page_obj: *page_t, page_zip: ?*page_zip_des_t, id: dulint, mtr: *mtr_t) void {
+    _ = page_zip;
+    _ = mtr;
+    page_obj.header.index_id = id;
+}
+
+fn btr_page_get_index_id(page_obj: *const page_t) dulint {
+    return page_obj.header.index_id;
+}
+
+fn btr_page_set_level(page_obj: *page_t, page_zip: ?*page_zip_des_t, level: ulint, mtr: *mtr_t) void {
+    _ = page_zip;
+    _ = mtr;
+    page_obj.header.level = level;
+}
+
+fn btr_page_get_level(page_obj: *const page_t, mtr: *mtr_t) ulint {
+    _ = mtr;
+    return page_obj.header.level;
+}
+
+fn btr_page_create(block: *buf_block_t, page_zip: ?*page_zip_des_t, index: *dict_index_t, level: ulint, mtr: *mtr_t) void {
+    if (page_zip != null) {
+        _ = page.page_create_zip(block, index, level, mtr);
+    } else {
+        _ = page.page_create(block, mtr, 0);
+        btr_page_set_level(block.frame, null, level, mtr);
+    }
+    btr_page_set_index_id(block.frame, page_zip, index.id, mtr);
+}
+
+fn btr_page_empty(block: *buf_block_t, page_zip: ?*page_zip_des_t, index: *dict_index_t, level: ulint, mtr: *mtr_t) void {
+    btr_search_drop_page_hash_index(block);
+    if (page_zip != null) {
+        _ = page.page_create_zip(block, index, level, mtr);
+    } else {
+        _ = page.page_create(block, mtr, 0);
+        btr_page_set_level(block.frame, null, level, mtr);
+    }
+    btr_page_set_index_id(block.frame, page_zip, index.id, mtr);
 }
 
 pub fn btr_get_prev_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
@@ -239,10 +272,10 @@ pub fn btr_page_split_and_insert(cursor: *btr_cur_t, tuple: *const dtuple_t, n_e
     return null;
 }
 
-pub fn btr_parse_set_min_rec_mark(ptr: [*]byte, end_ptr: [*]byte, comp: ulint, page: ?*page_t, mtr: ?*mtr_t) [*]byte {
+pub fn btr_parse_set_min_rec_mark(ptr: [*]byte, end_ptr: [*]byte, comp: ulint, page_ptr: ?*page_t, mtr: ?*mtr_t) [*]byte {
     _ = end_ptr;
     _ = comp;
-    _ = page;
+    _ = page_ptr;
     _ = mtr;
     return ptr;
 }
@@ -415,12 +448,12 @@ pub fn btr_cur_pessimistic_insert(
 pub fn btr_cur_parse_update_in_place(
     ptr: [*]byte,
     end_ptr: [*]byte,
-    page: ?*page_t,
+    page_ptr: ?*page_t,
     page_zip: ?*page_zip_des_t,
     index: *dict_index_t,
 ) [*]byte {
     _ = end_ptr;
-    _ = page;
+    _ = page_ptr;
     _ = page_zip;
     _ = index;
     return ptr;
@@ -484,12 +517,12 @@ pub fn btr_cur_pessimistic_update(
 pub fn btr_cur_parse_del_mark_set_clust_rec(
     ptr: [*]byte,
     end_ptr: [*]byte,
-    page: ?*page_t,
+    page_ptr: ?*page_t,
     page_zip: ?*page_zip_des_t,
     index: *dict_index_t,
 ) [*]byte {
     _ = end_ptr;
-    _ = page;
+    _ = page_ptr;
     _ = page_zip;
     _ = index;
     return ptr;
@@ -513,11 +546,11 @@ pub fn btr_cur_del_mark_set_clust_rec(
 pub fn btr_cur_parse_del_mark_set_sec_rec(
     ptr: [*]byte,
     end_ptr: [*]byte,
-    page: ?*page_t,
+    page_ptr: ?*page_t,
     page_zip: ?*page_zip_des_t,
 ) [*]byte {
     _ = end_ptr;
-    _ = page;
+    _ = page_ptr;
     _ = page_zip;
     return ptr;
 }
@@ -920,6 +953,39 @@ test "btr cursor open and search stubs" {
     btr_cur_open_at_index_side_func(compat.TRUE, &index, 0, &cursor2, "file", 2, &mtr);
     try std.testing.expect(cursor2.index == &index);
     try std.testing.expect(cursor2.opened);
+}
+
+test "btr page create and empty base records" {
+    var page_obj = page.page_t{};
+    var block = page.buf_block_t{ .frame = &page_obj, .page_zip = null };
+    var index = dict_index_t{};
+    index.id = .{ .high = 1, .low = 2 };
+    var mtr = mtr_t{};
+
+    btr_page_create(&block, null, &index, 3, &mtr);
+    try std.testing.expectEqual(@as(ulint, 3), btr_page_get_level(block.frame, &mtr));
+    const idx_id = btr_page_get_index_id(block.frame);
+    try std.testing.expectEqual(index.id.high, idx_id.high);
+    try std.testing.expectEqual(index.id.low, idx_id.low);
+    try std.testing.expectEqual(page.PAGE_HEAP_NO_USER_LOW, block.frame.header.n_heap);
+    try std.testing.expectEqual(@as(ulint, 0), block.frame.header.n_recs);
+    try std.testing.expect(block.frame.infimum.next == &block.frame.supremum);
+    try std.testing.expect(block.frame.supremum.prev == &block.frame.infimum);
+
+    var cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(&block, &cursor);
+    var offsets: ulint = 0;
+    var rec = page.rec_t{ .key = 42 };
+    _ = page.page_cur_rec_insert(&cursor, &rec, &index, &offsets, &mtr);
+    try std.testing.expectEqual(@as(ulint, 1), block.frame.header.n_recs);
+    try std.testing.expect(block.frame.infimum.next == &rec);
+    try std.testing.expect(rec.prev == &block.frame.infimum);
+
+    btr_page_empty(&block, null, &index, 0, &mtr);
+    try std.testing.expectEqual(@as(ulint, 0), block.frame.header.n_recs);
+    try std.testing.expectEqual(page.PAGE_HEAP_NO_USER_LOW, block.frame.header.n_heap);
+    try std.testing.expect(block.frame.infimum.next == &block.frame.supremum);
+    try std.testing.expect(block.frame.supremum.prev == &block.frame.infimum);
 }
 
 test "btr external field prefix copy" {
