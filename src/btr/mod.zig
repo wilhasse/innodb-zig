@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const page = @import("../page/mod.zig");
 const dict = @import("../dict/mod.zig");
+const data = @import("../data/mod.zig");
 
 pub const module_name = "btr";
 
@@ -202,6 +203,40 @@ fn page_first_user_rec(page_obj: *page_t) ?*rec_t {
 fn page_last_user_rec(page_obj: *page_t) ?*rec_t {
     const last = page_obj.supremum.prev orelse return null;
     return if (last.is_infimum) null else last;
+}
+
+fn dtuple_to_key(entry: *const dtuple_t) i64 {
+    if (entry.n_fields == 0) {
+        return 0;
+    }
+    const field = entry.fields[0];
+    const data_ptr = field.data orelse return 0;
+    if (field.len == data.UNIV_SQL_NULL_U32) {
+        return 0;
+    }
+    return switch (field.len) {
+        @sizeOf(i32) => @as(i64, @intCast(@as(*const i32, @ptrCast(data_ptr)).*)),
+        @sizeOf(u32) => @as(i64, @intCast(@as(*const u32, @ptrCast(data_ptr)).*)),
+        @sizeOf(i64) => @as(*const i64, @ptrCast(data_ptr)).*,
+        @sizeOf(u64) => @as(i64, @intCast(@as(*const u64, @ptrCast(data_ptr)).*)),
+        else => 0,
+    };
+}
+
+fn page_find_insert_after(page_obj: *page_t, key: i64) *rec_t {
+    var prev = &page_obj.infimum;
+    var current = page_obj.infimum.next;
+    while (current) |node| {
+        if (node.is_supremum) {
+            break;
+        }
+        if (key < node.key) {
+            break;
+        }
+        prev = node;
+        current = node.next;
+    }
+    return prev;
 }
 
 fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
@@ -643,6 +678,50 @@ pub fn btr_cur_open_at_rnd_pos_func(
     cursor.rec = leaf_cursor.rec;
 }
 
+fn btr_cur_insert_if_possible(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext: ulint, mtr: *mtr_t) ?*rec_t {
+    _ = n_ext;
+    const block = cursor.block orelse return null;
+    const index = cursor.index orelse return null;
+    const key = dtuple_to_key(tuple);
+    const insert_after = page_find_insert_after(block.frame, key);
+    const allocator = std.heap.page_allocator;
+    const new_rec = allocator.create(rec_t) catch return null;
+    new_rec.* = .{ .key = key };
+    var page_cursor = page.page_cur_t{ .block = block, .rec = insert_after };
+    var offsets: ulint = 0;
+    if (page.page_cur_rec_insert(&page_cursor, new_rec, index, &offsets, mtr) == null) {
+        allocator.destroy(new_rec);
+        return null;
+    }
+    cursor.rec = new_rec;
+    cursor.block = block;
+    cursor.opened = true;
+    return new_rec;
+}
+
+fn btr_cur_ins_lock_and_undo(
+    flags: ulint,
+    cursor: *btr_cur_t,
+    entry: *const dtuple_t,
+    thr: ?*que_thr_t,
+    mtr: *mtr_t,
+    inherit: *ibool,
+) ulint {
+    _ = flags;
+    _ = cursor;
+    _ = entry;
+    _ = thr;
+    _ = mtr;
+    inherit.* = compat.FALSE;
+    return 0;
+}
+
+fn btr_cur_trx_report(trx: ?*trx_t, index: *const dict_index_t, op: []const u8) void {
+    _ = trx;
+    _ = index;
+    _ = op;
+}
+
 pub fn btr_cur_optimistic_insert(
     flags: ulint,
     cursor: *btr_cur_t,
@@ -653,14 +732,17 @@ pub fn btr_cur_optimistic_insert(
     thr: ?*que_thr_t,
     mtr: *mtr_t,
 ) ulint {
-    _ = flags;
-    _ = cursor;
-    _ = entry;
-    _ = n_ext;
-    _ = thr;
-    _ = mtr;
-    rec.* = null;
     big_rec.* = null;
+    rec.* = null;
+
+    var inherit: ibool = compat.FALSE;
+    const lock_err = btr_cur_ins_lock_and_undo(flags, cursor, entry, thr, mtr, &inherit);
+    if (lock_err != 0) {
+        return lock_err;
+    }
+
+    const inserted = btr_cur_insert_if_possible(cursor, entry, n_ext, mtr) orelse return 1;
+    rec.* = inserted;
     return 0;
 }
 
@@ -929,14 +1011,14 @@ pub fn btr_copy_externally_stored_field_prefix(
     buf: [*]byte,
     len: ulint,
     zip_size: ulint,
-    data: [*]const byte,
+    data_ptr: [*]const byte,
     local_len: ulint,
 ) ulint {
     _ = zip_size;
     const max = @min(len, local_len);
     const count = @as(usize, @intCast(max));
     if (count > 0) {
-        std.mem.copyForwards(byte, buf[0..count], data[0..count]);
+        std.mem.copyForwards(byte, buf[0..count], data_ptr[0..count]);
     }
     return max;
 }
@@ -1297,6 +1379,56 @@ test "btr cursor search and open at index sides" {
     index_state_remove(index);
 }
 
+test "btr optimistic insert leaf order and duplicates" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 300 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+
+    var key_a: i64 = 2;
+    var fields_a = [_]data.dfield_t{.{ .data = &key_a, .len = @intCast(@sizeOf(i64)) }};
+    var tuple_a = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields_a[0..] };
+
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple_a, &rec_out, &big_rec, 0, null, &mtr));
+    try std.testing.expect(rec_out != null);
+    try std.testing.expect(big_rec == null);
+
+    var key_b: i64 = 1;
+    var fields_b = [_]data.dfield_t{.{ .data = &key_b, .len = @intCast(@sizeOf(i64)) }};
+    var tuple_b = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields_b[0..] };
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple_b, &rec_out, &big_rec, 0, null, &mtr));
+
+    var key_c: i64 = 2;
+    var fields_c = [_]data.dfield_t{.{ .data = &key_c, .len = @intCast(@sizeOf(i64)) }};
+    var tuple_c = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields_c[0..] };
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple_c, &rec_out, &big_rec, 0, null, &mtr));
+
+    const first = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    const second = btr_get_next_user_rec(first, null) orelse return error.OutOfMemory;
+    const third = btr_get_next_user_rec(second, null) orelse return error.OutOfMemory;
+
+    try std.testing.expectEqual(@as(i64, 1), first.key);
+    try std.testing.expectEqual(@as(i64, 2), second.key);
+    try std.testing.expectEqual(@as(i64, 2), third.key);
+    try std.testing.expect(btr_get_next_user_rec(third, null) == null);
+    try std.testing.expectEqual(@as(ulint, 3), root_block.frame.header.n_recs);
+
+    index_state_remove(index);
+}
+
 test "btr page create and empty base records" {
     var page_obj = page.page_t{};
     var block = page.buf_block_t{ .frame = &page_obj, .page_zip = null };
@@ -1421,9 +1553,9 @@ test "btr create root and free" {
 
 test "btr external field prefix copy" {
     var buf = [_]byte{0} ** 5;
-    const data = [_]byte{ 'a', 'b', 'c', 'd' };
+    const payload = [_]byte{ 'a', 'b', 'c', 'd' };
 
-    const copied = btr_copy_externally_stored_field_prefix(buf[0..].ptr, 5, 0, data[0..].ptr, 3);
+    const copied = btr_copy_externally_stored_field_prefix(buf[0..].ptr, 5, 0, payload[0..].ptr, 3);
     try std.testing.expectEqual(@as(ulint, 3), copied);
     try std.testing.expectEqualStrings("abc", buf[0..3]);
 }

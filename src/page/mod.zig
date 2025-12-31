@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const dict = @import("../dict/mod.zig");
+const data = @import("../data/mod.zig");
 
 pub const module_name = "page";
 
@@ -52,7 +53,7 @@ pub const page_zip_des_t = struct {
     ssize: u8 = 0,
 };
 pub const dict_index_t = dict.dict_index_t;
-pub const dtuple_t = struct {};
+pub const dtuple_t = data.dtuple_t;
 pub const mtr_t = struct {};
 
 pub const rec_t = struct {
