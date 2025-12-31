@@ -23,6 +23,7 @@ pub const BTR_CUR_PAGE_REORGANIZE_LIMIT: ulint = compat.UNIV_PAGE_SIZE / 32;
 pub const BTR_BLOB_HDR_PART_LEN: ulint = 0;
 pub const BTR_BLOB_HDR_NEXT_PAGE_NO: ulint = 4;
 pub const BTR_BLOB_HDR_SIZE: ulint = 8;
+pub const BTR_DUPLICATE_KEY: ulint = 2;
 
 const BTR_MAX_RECS_PER_PAGE: ulint = 4;
 
@@ -327,6 +328,101 @@ const LeafEntry = struct {
 
 fn bitsInBytes(n: ulint) ulint {
     return (n + 7) / 8;
+}
+
+fn build_tuple_meta(entry: *const dtuple_t, allocator: std.mem.Allocator) ?[]rec_mod.FieldMeta {
+    const n_fields = @as(usize, @intCast(entry.n_fields));
+    if (n_fields == 0) {
+        return null;
+    }
+    const metas = allocator.alloc(rec_mod.FieldMeta, n_fields) catch return null;
+    var i: usize = 0;
+    while (i < n_fields) : (i += 1) {
+        const field = data.dtuple_get_nth_field(entry, @intCast(i));
+        const len = data.dfield_get_len(field);
+        if (len == compat.UNIV_SQL_NULL) {
+            metas[i] = .{ .fixed_len = 0, .max_len = 0, .nullable = true };
+        } else {
+            metas[i] = .{ .fixed_len = len, .max_len = 0, .nullable = false };
+        }
+    }
+    return metas;
+}
+
+fn rec_ptr_for_compare(index: *dict_index_t, rec: *const rec_t) ?[*]const byte {
+    if (rec.rec_bytes) |bytes| {
+        if (rec.rec_offset != 0 and rec.rec_offset <= bytes.len) {
+            const start = @as(usize, @intCast(rec.rec_offset));
+            return @as([*]const byte, @ptrCast(bytes[start..].ptr));
+        }
+    }
+    if (rec.rec_page_offset != 0) {
+        if (btr_block_for_rec(index, @constCast(rec))) |block| {
+            if (block.bytes.len != 0) {
+                const off = @as(usize, @intCast(rec.rec_page_offset));
+                if (off < block.bytes.len) {
+                    return @as([*]const byte, @ptrCast(block.bytes[off..].ptr));
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn compare_entry_rec(
+    index: *dict_index_t,
+    entry: *const dtuple_t,
+    rec: *const rec_t,
+    meta: []const rec_mod.FieldMeta,
+    allocator: std.mem.Allocator,
+) i32 {
+    const rec_ptr = rec_ptr_for_compare(index, rec) orelse {
+        const key = dtuple_to_key(entry);
+        if (key < rec.key) {
+            return -1;
+        }
+        if (key > rec.key) {
+            return 1;
+        }
+        return 0;
+    };
+
+    const needed = @as(usize, @intCast(rec_mod.REC_OFFS_HEADER_SIZE + 1 + @as(ulint, @intCast(meta.len))));
+    var offsets_buf = [_]ulint{0} ** rec_mod.REC_OFFS_NORMAL_SIZE;
+    var offsets: []ulint = offsets_buf[0..];
+    var heap_offsets: ?[]ulint = null;
+    if (needed > offsets_buf.len) {
+        heap_offsets = allocator.alloc(ulint, needed) catch return 0;
+        offsets = heap_offsets.?;
+    } else {
+        offsets = offsets_buf[0..needed];
+    }
+    defer if (heap_offsets) |offs| allocator.free(offs);
+
+    rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, meta, offsets);
+    return rec_mod.cmp_dtuple_rec(null, entry, rec_ptr, offsets);
+}
+
+fn btr_entry_has_duplicate(index: *dict_index_t, entry: *const dtuple_t) bool {
+    if (dict.dict_index_is_unique(index) == 0) {
+        return false;
+    }
+    if (data.dtuple_get_n_fields_cmp(entry) == 0) {
+        return false;
+    }
+    const allocator = std.heap.page_allocator;
+    const meta = build_tuple_meta(entry, allocator) orelse return false;
+    defer allocator.free(meta);
+
+    const leftmost = descend_to_level(index, 0, true) orelse return false;
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(leftmost.frame), null);
+    while (rec_opt) |rec| {
+        if (compare_entry_rec(index, entry, rec, meta, allocator) == 0) {
+            return true;
+        }
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    return false;
 }
 
 fn encode_tuple_compact_bytes(tuple: *const dtuple_t) ?RecBytes {
@@ -1555,6 +1651,10 @@ pub fn btr_cur_optimistic_insert(
     if (lock_err != 0) {
         return lock_err;
     }
+    const index = cursor.index orelse return 1;
+    if ((flags & BTR_IGNORE_SEC_UNIQUE) == 0 and btr_entry_has_duplicate(index, entry)) {
+        return BTR_DUPLICATE_KEY;
+    }
 
     if (btr_cur_insert_if_possible(cursor, entry, n_ext, mtr)) |inserted| {
         rec.* = inserted;
@@ -2583,6 +2683,44 @@ test "btr optimistic insert leaf order and duplicates" {
     try std.testing.expectEqual(@as(i64, 2), third.key);
     try std.testing.expect(btr_get_next_user_rec(third, null) == null);
     try std.testing.expectEqual(@as(ulint, 3), root_block.frame.header.n_recs);
+
+    index_state_remove(index);
+}
+
+test "btr unique duplicate detection uses rec compare" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{ .type = dict.DICT_UNIQUE };
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 310 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+
+    var key_a: i64 = 1;
+    var fields_a = [_]data.dfield_t{.{ .data = &key_a, .len = @intCast(@sizeOf(i64)) }};
+    var tuple_a = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields_a[0..] };
+
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple_a, &rec_out, &big_rec, 0, null, &mtr));
+
+    const first = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    first.key = 999;
+
+    var key_dup: i64 = 1;
+    var fields_dup = [_]data.dfield_t{.{ .data = &key_dup, .len = @intCast(@sizeOf(i64)) }};
+    var tuple_dup = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields_dup[0..] };
+    const dup_err = btr_cur_optimistic_insert(0, &cursor, &tuple_dup, &rec_out, &big_rec, 0, null, &mtr);
+    try std.testing.expectEqual(BTR_DUPLICATE_KEY, dup_err);
+    try std.testing.expectEqual(@as(ulint, 1), root_block.frame.header.n_recs);
 
     index_state_remove(index);
 }
