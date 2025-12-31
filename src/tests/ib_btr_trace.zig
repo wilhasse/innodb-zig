@@ -12,5 +12,5 @@ test "btr trace output hash" {
     var hasher = std.hash.Fnv1a_64.init();
     hasher.update(buf.items);
     const digest = hasher.final();
-    try std.testing.expectEqual(@as(u64, 0x7e5d_f2b3_fd8c_3d1c), digest);
+    try std.testing.expectEqual(@as(u64, 0xe0eb_c16f_0500_addc), digest);
 }

@@ -307,7 +307,7 @@ int main(int argc, char **argv) {
             int res = 0;
 
             OK(ib_tuple_write_i32(key_tpl, 0, (int)key));
-            ib_cursor_set_match_mode(crsr, IB_EXACT_MATCH);
+            ib_cursor_set_match_mode(crsr, IB_CLOSEST_MATCH);
             ib_err_t err = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
             if (err != DB_SUCCESS || res != 0) {
                 fprintf(stderr, "Delete lookup failed for key %" PRId64 "\n", key);
@@ -337,7 +337,7 @@ int main(int argc, char **argv) {
             }
 
             OK(ib_tuple_write_i32(key_tpl, 0, (int)search_key));
-            ib_cursor_set_match_mode(crsr, IB_EXACT_MATCH);
+            ib_cursor_set_match_mode(crsr, IB_CLOSEST_MATCH);
             ib_err_t err = ib_cursor_moveto(crsr, key_tpl, IB_CUR_GE, &res);
             if (err != DB_SUCCESS && err != DB_END_OF_INDEX) {
                 fprintf(stderr, "Search failed for key %" PRId64 ": %s\n", search_key, ib_strerror(err));

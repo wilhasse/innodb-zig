@@ -2997,14 +2997,10 @@ test "btr search stubs" {
 fn btr_collect_keys(index: *dict_index_t, list: *ArrayList(i64)) !void {
     list.clearRetainingCapacity();
     const leftmost = descend_to_level(index, 0, true) orelse return;
-    var block_opt: ?*buf_block_t = leftmost;
-    while (block_opt) |block| {
-        var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
-        while (rec_opt) |rec| {
-            try list.append(rec.key);
-            rec_opt = btr_get_next_user_rec(rec, null);
-        }
-        block_opt = block.frame.next_block;
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(leftmost.frame), null);
+    while (rec_opt) |rec| {
+        try list.append(rec.key);
+        rec_opt = btr_get_next_user_rec(rec, null);
     }
 }
 
