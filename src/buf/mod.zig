@@ -95,8 +95,17 @@ pub const buf_page_state = enum(u8) {
     BUF_BLOCK_REMOVE_HASH = 7,
 };
 
+const BufPageKey = struct {
+    space: ulint,
+    page_no: ulint,
+};
+
 pub const buf_page_t = struct {
     state: buf_page_state = .BUF_BLOCK_NOT_USED,
+    space: ulint = 0,
+    page_no: ulint = 0,
+    dirty: ibool = compat.FALSE,
+    modification: ib_uint64_t = 0,
 };
 
 pub const buf_block_t = struct {
@@ -109,6 +118,9 @@ pub const buf_pool_t = struct {
     curr_size: ulint = 0,
     oldest_modification: ib_uint64_t = 0,
     free_list_len: ulint = 0,
+    dirty_pages: ulint = 0,
+    next_modification: ib_uint64_t = 1,
+    pages: std.AutoHashMap(BufPageKey, *buf_block_t) = undefined,
 };
 
 pub const buf_frame_t = byte;
@@ -149,12 +161,40 @@ pub fn buf_pool_contains_zip(data: ?*const anyopaque) ?*buf_block_t {
     return null;
 }
 
+fn buf_pool_clear_pages(pool: *buf_pool_t) void {
+    var it = pool.pages.valueIterator();
+    while (it.next()) |block| {
+        buf_block_free(block.*);
+    }
+    pool.pages.clearRetainingCapacity();
+    pool.curr_size = 0;
+    pool.dirty_pages = 0;
+    pool.oldest_modification = 0;
+    pool.next_modification = 1;
+}
+
+fn buf_pool_recompute_oldest(pool: *buf_pool_t) void {
+    var oldest: ib_uint64_t = 0;
+    var it = pool.pages.valueIterator();
+    while (it.next()) |block| {
+        const page = &block.*.page;
+        if (page.dirty == compat.TRUE) {
+            if (oldest == 0 or page.modification < oldest) {
+                oldest = page.modification;
+            }
+        }
+    }
+    pool.oldest_modification = oldest;
+}
+
 pub fn buf_pool_init() ?*buf_pool_t {
     if (buf_pool != null) {
         return buf_pool;
     }
     const pool = std.heap.page_allocator.create(buf_pool_t) catch return null;
-    pool.* = .{};
+    pool.* = .{
+        .pages = std.AutoHashMap(BufPageKey, *buf_block_t).init(std.heap.page_allocator),
+    };
     buf_pool = pool;
     return pool;
 }
@@ -163,12 +203,18 @@ pub fn buf_close() void {}
 
 pub fn buf_mem_free() void {
     if (buf_pool) |pool| {
+        buf_pool_clear_pages(pool);
+        pool.pages.deinit();
         std.heap.page_allocator.destroy(pool);
         buf_pool = null;
     }
 }
 
-pub fn buf_pool_drop_hash_index() void {}
+pub fn buf_pool_drop_hash_index() void {
+    if (buf_pool) |pool| {
+        buf_pool_clear_pages(pool);
+    }
+}
 
 pub fn buf_relocate(bpage: *buf_page_t, dpage: *buf_page_t) void {
     dpage.* = bpage.*;
@@ -211,6 +257,32 @@ pub fn buf_page_make_young(bpage: *buf_page_t) void {
     _ = bpage;
 }
 
+pub fn buf_page_set_dirty(bpage: *buf_page_t) void {
+    if (buf_pool) |pool| {
+        if (bpage.dirty == compat.FALSE) {
+            bpage.dirty = compat.TRUE;
+            bpage.modification = pool.next_modification;
+            pool.next_modification += 1;
+            pool.dirty_pages += 1;
+            if (pool.oldest_modification == 0 or bpage.modification < pool.oldest_modification) {
+                pool.oldest_modification = bpage.modification;
+            }
+        }
+    }
+}
+
+fn buf_page_clear_dirty(bpage: *buf_page_t) void {
+    if (bpage.dirty == compat.TRUE) {
+        bpage.dirty = compat.FALSE;
+        bpage.modification = 0;
+        if (buf_pool) |pool| {
+            if (pool.dirty_pages > 0) {
+                pool.dirty_pages -= 1;
+            }
+        }
+    }
+}
+
 pub fn buf_reset_check_index_page_at_flush(space: ulint, offset: ulint) void {
     _ = space;
     _ = offset;
@@ -223,21 +295,33 @@ pub fn buf_page_peek_if_search_hashed(space: ulint, offset: ulint) ibool {
 }
 
 pub fn buf_page_set_file_page_was_freed(space: ulint, offset: ulint) ?*buf_page_t {
-    _ = space;
-    _ = offset;
+    if (buf_pool) |pool| {
+        const key = BufPageKey{ .space = space, .page_no = offset };
+        if (pool.pages.get(key)) |block| {
+            return &block.page;
+        }
+    }
     return null;
 }
 
 pub fn buf_page_reset_file_page_was_freed(space: ulint, offset: ulint) ?*buf_page_t {
-    _ = space;
-    _ = offset;
+    if (buf_pool) |pool| {
+        const key = BufPageKey{ .space = space, .page_no = offset };
+        if (pool.pages.get(key)) |block| {
+            return &block.page;
+        }
+    }
     return null;
 }
 
 pub fn buf_page_get_zip(space: ulint, zip_size: ulint, offset: ulint) ?*buf_page_t {
-    _ = space;
     _ = zip_size;
-    _ = offset;
+    if (buf_pool) |pool| {
+        const key = BufPageKey{ .space = space, .page_no = offset };
+        if (pool.pages.get(key)) |block| {
+            return &block.page;
+        }
+    }
     return null;
 }
 
@@ -268,16 +352,31 @@ pub fn buf_page_get_gen(
     line: ulint,
     mtr: *mtr_t,
 ) ?*buf_block_t {
-    _ = space;
-    _ = zip_size;
-    _ = offset;
     _ = rw_latch;
     _ = guess;
-    _ = mode;
     _ = file;
     _ = line;
     _ = mtr;
-    return null;
+    const pool = buf_pool_init() orelse return null;
+    const key = BufPageKey{ .space = space, .page_no = offset };
+    if (pool.pages.get(key)) |block| {
+        return block;
+    }
+    if (mode == BUF_GET_IF_IN_POOL) {
+        return null;
+    }
+    const block = buf_block_alloc(zip_size) orelse return null;
+    block.page = .{
+        .state = .BUF_BLOCK_FILE_PAGE,
+        .space = space,
+        .page_no = offset,
+    };
+    pool.pages.put(key, block) catch {
+        buf_block_free(block);
+        return null;
+    };
+    pool.curr_size += 1;
+    return block;
 }
 
 pub fn buf_page_optimistic_get(
@@ -289,12 +388,11 @@ pub fn buf_page_optimistic_get(
     mtr: *mtr_t,
 ) ibool {
     _ = rw_latch;
-    _ = block;
     _ = modify_clock;
     _ = file;
     _ = line;
     _ = mtr;
-    return compat.FALSE;
+    return if (block.page.state == .BUF_BLOCK_FILE_PAGE) compat.TRUE else compat.FALSE;
 }
 
 pub fn buf_page_get_known_nowait(
@@ -306,12 +404,11 @@ pub fn buf_page_get_known_nowait(
     mtr: *mtr_t,
 ) ibool {
     _ = rw_latch;
-    _ = block;
     _ = mode;
     _ = file;
     _ = line;
     _ = mtr;
-    return compat.FALSE;
+    return if (block.page.state == .BUF_BLOCK_FILE_PAGE) compat.TRUE else compat.FALSE;
 }
 
 pub fn buf_page_try_get_func(
@@ -321,11 +418,15 @@ pub fn buf_page_try_get_func(
     line: ulint,
     mtr: *mtr_t,
 ) ?*const buf_block_t {
-    _ = space_id;
-    _ = page_no;
     _ = file;
     _ = line;
     _ = mtr;
+    if (buf_pool) |pool| {
+        const key = BufPageKey{ .space = space_id, .page_no = page_no };
+        if (pool.pages.get(key)) |block| {
+            return block;
+        }
+    }
     return null;
 }
 
@@ -349,17 +450,20 @@ pub fn buf_page_init_for_read(
 }
 
 pub fn buf_page_create(space: ulint, offset: ulint, zip_size: ulint, mtr: *mtr_t) ?*buf_block_t {
-    _ = space;
-    _ = offset;
-    _ = mtr;
-    return buf_block_alloc(zip_size);
+    const block = buf_page_get_gen(space, zip_size, offset, 0, null, BUF_GET, "", 0, mtr) orelse return null;
+    buf_page_set_dirty(&block.page);
+    return block;
 }
 
 pub fn buf_page_io_complete(bpage: *buf_page_t) void {
     _ = bpage;
 }
 
-pub fn buf_pool_invalidate() void {}
+pub fn buf_pool_invalidate() void {
+    if (buf_pool) |pool| {
+        buf_pool_clear_pages(pool);
+    }
+}
 
 pub fn buf_validate() ibool {
     return compat.TRUE;
@@ -423,11 +527,17 @@ pub const BUF_READ_IBUF_PAGES_ONLY: ulint = 131;
 pub const BUF_READ_ANY_PAGE: ulint = 132;
 
 pub fn buf_flush_remove(bpage: *buf_page_t) void {
-    _ = bpage;
+    buf_page_clear_dirty(bpage);
+    if (buf_pool) |pool| {
+        buf_pool_recompute_oldest(pool);
+    }
 }
 
 pub fn buf_flush_write_complete(bpage: *buf_page_t) void {
-    _ = bpage;
+    buf_page_clear_dirty(bpage);
+    if (buf_pool) |pool| {
+        buf_pool_recompute_oldest(pool);
+    }
 }
 
 pub fn buf_flush_free_margin() void {}
@@ -440,8 +550,24 @@ pub fn buf_flush_init_for_writing(page: [*]byte, page_zip_: ?*anyopaque, newest_
 
 pub fn buf_flush_batch(flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
     _ = flush_type;
-    _ = min_n;
     _ = lsn_limit;
+    if (buf_pool) |pool| {
+        var flushed: ulint = 0;
+        var it = pool.pages.valueIterator();
+        while (it.next()) |block| {
+            if (block.*.page.dirty == compat.TRUE) {
+                buf_page_clear_dirty(&block.*.page);
+                flushed += 1;
+                if (min_n != 0 and flushed >= min_n) {
+                    break;
+                }
+            }
+        }
+        if (flushed > 0) {
+            buf_pool_recompute_oldest(pool);
+        }
+        return flushed;
+    }
     return 0;
 }
 
@@ -450,8 +576,7 @@ pub fn buf_flush_wait_batch_end(flush_type: buf_flush) void {
 }
 
 pub fn buf_flush_ready_for_replace(bpage: *buf_page_t) ibool {
-    _ = bpage;
-    return compat.TRUE;
+    return if (bpage.dirty == compat.TRUE) compat.FALSE else compat.TRUE;
 }
 
 pub fn buf_flush_stat_update() void {}
@@ -602,6 +727,25 @@ test "buf pool basics" {
     try std.testing.expectEqual(compat.FALSE, buf_all_freed());
     buf_mem_free();
     try std.testing.expectEqual(compat.TRUE, buf_all_freed());
+}
+
+test "buf dirty tracking and flush" {
+    defer buf_mem_free();
+    _ = buf_pool_init() orelse return error.OutOfMemory;
+
+    var mtr = mtr_t{};
+    const block = buf_page_get_gen(1, 0, 7, 0, null, BUF_GET, "test", 0, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, 1), buf_pool_get_curr_size());
+    try std.testing.expectEqual(compat.FALSE, block.page.dirty);
+
+    buf_page_set_dirty(&block.page);
+    try std.testing.expectEqual(compat.TRUE, block.page.dirty);
+    try std.testing.expect(buf_pool_get_oldest_modification() != 0);
+
+    const flushed = buf_flush_batch(.BUF_FLUSH_SINGLE_PAGE, 0, 0);
+    try std.testing.expectEqual(@as(ulint, 1), flushed);
+    try std.testing.expectEqual(compat.FALSE, block.page.dirty);
+    try std.testing.expectEqual(@as(ib_uint64_t, 0), buf_pool_get_oldest_modification());
 }
 
 test "buf block alloc and frame copy" {
