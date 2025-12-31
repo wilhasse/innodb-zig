@@ -25,6 +25,7 @@ pub const modules = [_]Module{
     .{ .name = "fut", .c_dir = "fut", .zig_path = "src/fut", .depends_on = &[_][]const u8{ "page", "buf", "mtr", "ut" } },
     .{ .name = "ibuf", .c_dir = "ibuf", .zig_path = "src/ibuf", .depends_on = &[_][]const u8{ "buf", "btr", "mtr", "page", "ut" } },
     .{ .name = "rem", .c_dir = "rem", .zig_path = "src/rem", .depends_on = &[_][]const u8{ "page", "mach", "mem", "ut" } },
+    .{ .name = "rec", .c_dir = "rec", .zig_path = "src/rec", .depends_on = &[_][]const u8{ "ut" } },
     .{ .name = "btr", .c_dir = "btr", .zig_path = "src/btr", .depends_on = &[_][]const u8{ "page", "buf", "mtr", "rem", "mem", "ut" } },
     .{ .name = "dict", .c_dir = "dict", .zig_path = "src/dict", .depends_on = &[_][]const u8{ "btr", "buf", "data", "mem", "ut" } },
     .{ .name = "lock", .c_dir = "lock", .zig_path = "src/lock", .depends_on = &[_][]const u8{ "dict", "mem", "ut" } },
