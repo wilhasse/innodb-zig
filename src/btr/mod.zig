@@ -626,11 +626,28 @@ pub fn btr_free_root(space: ulint, zip_size: ulint, root_page_no: ulint, mtr: *m
     }
 }
 
+fn btr_page_reorganize_low(block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) ibool {
+    var cursor = page.page_cur_t{};
+    cursor.block = block;
+    cursor.rec = page_first_user_rec(block.frame);
+    var offsets: ulint = 0;
+    var changed = false;
+    while (cursor.rec) |rec| {
+        if (rec.is_supremum) {
+            break;
+        }
+        if (rec.deleted) {
+            page.page_cur_delete_rec(&cursor, index, &offsets, mtr);
+            changed = true;
+            continue;
+        }
+        cursor.rec = rec.next;
+    }
+    return if (changed) compat.TRUE else compat.FALSE;
+}
+
 pub fn btr_page_reorganize(block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) ibool {
-    _ = block;
-    _ = index;
-    _ = mtr;
-    return compat.FALSE;
+    return btr_page_reorganize_low(block, index, mtr);
 }
 
 pub fn btr_parse_page_reorganize(ptr: [*]byte, end_ptr: [*]byte, index: ?*dict_index_t, block: ?*buf_block_t, mtr: ?*mtr_t) [*]byte {
@@ -756,8 +773,8 @@ pub fn btr_parse_set_min_rec_mark(ptr: [*]byte, end_ptr: [*]byte, comp: ulint, p
 }
 
 pub fn btr_set_min_rec_mark(rec: *rec_t, mtr: *mtr_t) void {
-    _ = rec;
     _ = mtr;
+    rec.min_rec_mark = true;
 }
 
 pub fn btr_node_ptr_delete(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) void {
@@ -787,14 +804,51 @@ pub fn btr_lift_page_up(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) 
 }
 
 pub fn btr_compress(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
-    _ = cursor;
-    _ = mtr;
-    return compat.FALSE;
+    const block = cursor.block orelse return compat.FALSE;
+    const index = cursor.index orelse return compat.FALSE;
+    return btr_page_reorganize(block, index, mtr);
 }
 
 pub fn btr_discard_page(cursor: *btr_cur_t, mtr: *mtr_t) void {
-    _ = cursor;
+    const block = cursor.block orelse return;
+    const index = cursor.index orelse return;
+    if (block.frame.parent_block == null) {
+        return;
+    }
+    if (block.frame.header.n_recs != 0) {
+        return;
+    }
+    btr_level_list_remove(block, mtr);
+    btr_node_ptr_delete(index, block, mtr);
+    if (index_states.get(index)) |state| {
+        if (state.pages.fetchRemove(block.frame.page_no)) |removed| {
+            std.heap.page_allocator.destroy(removed.value.frame);
+            std.heap.page_allocator.destroy(removed.value);
+        }
+    }
+}
+
+pub fn btr_discard_only_page_on_level(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) void {
+    if (block.frame.prev_block != null or block.frame.next_block != null) {
+        return;
+    }
+    if (block.frame.parent_block != null) {
+        btr_lift_page_up(index, block, mtr);
+    }
+}
+
+pub fn btr_level_list_remove(block: *buf_block_t, mtr: *mtr_t) void {
     _ = mtr;
+    const prev = block.frame.prev_block;
+    const next = block.frame.next_block;
+    if (prev) |prev_block| {
+        prev_block.frame.next_block = next;
+    }
+    if (next) |next_block| {
+        next_block.frame.prev_block = prev;
+    }
+    block.frame.prev_block = null;
+    block.frame.next_block = null;
 }
 
 pub fn btr_print_size(index: *dict_index_t) void {
@@ -2035,6 +2089,111 @@ test "btr update paths" {
     try std.testing.expectEqualSlices(i64, expected[0..], values.items);
 
     index_state_remove(index);
+}
+
+test "btr page reorganize removes deleted records" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 900 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= 4) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const rec1 = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    const rec2 = btr_get_next_user_rec(rec1, null) orelse return error.OutOfMemory;
+    const rec3 = btr_get_next_user_rec(rec2, null) orelse return error.OutOfMemory;
+    btr_rec_set_deleted_flag(rec2, compat.TRUE);
+    btr_rec_set_deleted_flag(rec3, compat.TRUE);
+
+    try std.testing.expectEqual(compat.TRUE, btr_page_reorganize(root_block, index, &mtr));
+    try std.testing.expectEqual(@as(ulint, 2), root_block.frame.header.n_recs);
+
+    var values = std.ArrayList(i64).init(allocator);
+    defer values.deinit();
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
+    while (rec_opt) |rec| {
+        values.append(rec.key) catch return error.OutOfMemory;
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    const expected = [_]i64{ 1, 4 };
+    try std.testing.expectEqualSlices(i64, expected[0..], values.items);
+
+    index_state_remove(index);
+}
+
+test "btr discard empty page updates links" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1000 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const new_root = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    const left_ptr = page_first_user_rec(new_root.frame) orelse return error.OutOfMemory;
+    const right_ptr = btr_get_next_user_rec(left_ptr, null) orelse return error.OutOfMemory;
+    const left_block = left_ptr.child_block orelse return error.OutOfMemory;
+    const right_block = right_ptr.child_block orelse return error.OutOfMemory;
+
+    var rec_opt = page_first_user_rec(right_block.frame);
+    while (rec_opt) |rec| {
+        if (rec.is_supremum) {
+            break;
+        }
+        rec.deleted = true;
+        rec_opt = rec.next;
+    }
+    _ = btr_page_reorganize(right_block, index, &mtr);
+
+    var discard_cursor = btr_cur_t{ .index = index, .block = right_block, .rec = page.page_get_infimum_rec(right_block.frame), .opened = true };
+    btr_discard_page(&discard_cursor, &mtr);
+
+    try std.testing.expectEqual(@as(ulint, 2), btr_get_size(index, 0));
+    try std.testing.expectEqual(@as(ulint, 1), new_root.frame.header.n_recs);
+    try std.testing.expect(left_block.frame.next_block == null);
+
+    index_state_remove(index);
+}
+
+test "btr min rec mark" {
+    var rec = rec_t{};
+    var mtr = mtr_t{};
+    btr_set_min_rec_mark(&rec, &mtr);
+    try std.testing.expect(rec.min_rec_mark);
 }
 
 test "btr page create and empty base records" {

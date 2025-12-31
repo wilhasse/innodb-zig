@@ -63,6 +63,7 @@ pub const rec_t = struct {
     is_infimum: bool = false,
     is_supremum: bool = false,
     deleted: bool = false,
+    min_rec_mark: bool = false,
     key: i64 = 0,
     child_page_no: ulint = 0,
     child_block: ?*buf_block_t = null,
