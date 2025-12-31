@@ -3484,6 +3484,48 @@ fn catalogRemoveByName(name: []const u8) bool {
     return false;
 }
 
+fn dictSysRegisterTable(table: *CatalogTable) bool {
+    const table_id = dulintFromId(table.id);
+    if (dict.dict_sys_table_insert(
+        table.name,
+        table_id,
+        @as(dict.ulint, @intCast(table.space_id)),
+        @as(dict.ulint, @intCast(table.columns.items.len)),
+        @as(dict.ulint, @intCast(@intFromEnum(table.format))),
+    ) == compat.FALSE) {
+        return false;
+    }
+
+    for (table.columns.items, 0..) |col, idx| {
+        if (dict.dict_sys_column_insert(
+            table_id,
+            col.name,
+            @as(dict.ulint, @intCast(idx)),
+            @as(dict.ulint, @intCast(@intFromEnum(col.col_type))),
+            @as(dict.ulint, @intCast(@intFromEnum(col.attr))),
+            @as(dict.ulint, @intCast(col.len)),
+        ) == compat.FALSE) {
+            dict.dict_sys_table_remove(table_id);
+            return false;
+        }
+    }
+
+    for (table.indexes.items) |idx| {
+        if (dict.dict_sys_index_insert(
+            table_id,
+            dulintFromId(idx.id),
+            idx.name,
+            idx.btr_index.type,
+            @as(dict.ulint, @intCast(table.space_id)),
+        ) == compat.FALSE) {
+            dict.dict_sys_table_remove(table_id);
+            return false;
+        }
+    }
+
+    return true;
+}
+
 fn catalogCreateFromSchema(schema: *const TableSchema, id: ib_id_t, space_id: ib_ulint_t) !*CatalogTable {
     const allocator = std.heap.page_allocator;
     const table = try allocator.create(CatalogTable);
@@ -4099,7 +4141,12 @@ pub fn ib_table_create(ib_trx: ib_trx_t, ib_tbl_sch: ib_tbl_sch_t, id: *ib_id_t)
         }
     }
     const catalog = catalogCreateFromSchema(schema, new_id, space_id) catch return .DB_OUT_OF_MEMORY;
+    if (!dictSysRegisterTable(catalog)) {
+        catalogDestroy(catalog);
+        return .DB_OUT_OF_MEMORY;
+    }
     table_registry.append(catalog) catch {
+        dict.dict_sys_table_remove(dulintFromId(catalog.id));
         catalogDestroy(catalog);
         if (space_id != 0) {
             _ = fil.fil_delete_tablespace(space_id);
@@ -4168,6 +4215,23 @@ pub fn ib_index_create(ib_idx_sch: ib_idx_sch_t, index_id: *ib_id_t) ib_err_t {
     if (index.schema_owner == null) {
         const table = catalogFindByName(index.table_name) orelse return .DB_TABLE_NOT_FOUND;
         catalogAppendIndex(table, index, index_id.*) catch return .DB_OUT_OF_MEMORY;
+        const catalog_index = catalogFindIndexById(table, index_id.*) orelse return .DB_ERROR;
+        if (dict.dict_sys_index_insert(
+            dulintFromId(table.id),
+            dulintFromId(catalog_index.id),
+            catalog_index.name,
+            catalog_index.btr_index.type,
+            @as(dict.ulint, @intCast(table.space_id)),
+        ) == compat.FALSE) {
+            for (table.indexes.items, 0..) |idx, idx_pos| {
+                if (idx.id == index_id.*) {
+                    catalogIndexDestroy(&table.indexes.items[idx_pos], table.allocator);
+                    _ = table.indexes.orderedRemove(idx_pos);
+                    break;
+                }
+            }
+            return .DB_OUT_OF_MEMORY;
+        }
     }
 
     return .DB_SUCCESS;
@@ -4182,6 +4246,7 @@ pub fn ib_table_drop(ib_trx: ib_trx_t, name: []const u8) ib_err_t {
     }
     const table = catalogFindByName(name) orelse return .DB_TABLE_NOT_FOUND;
     const space_id = table.space_id;
+    dict.dict_sys_table_remove(dulintFromId(table.id));
     if (!catalogRemoveByName(name)) {
         return .DB_TABLE_NOT_FOUND;
     }
@@ -4201,6 +4266,7 @@ pub fn ib_index_drop(ib_trx: ib_trx_t, index_id: ib_id_t) ib_err_t {
     for (table_registry.items) |table| {
         for (table.indexes.items, 0..) |idx, idx_pos| {
             if (idx.id == index_id) {
+                dict.dict_sys_index_remove(dulintFromId(index_id));
                 catalogIndexDestroy(&table.indexes.items[idx_pos], table.allocator);
                 _ = table.indexes.orderedRemove(idx_pos);
                 return .DB_SUCCESS;

@@ -86,11 +86,39 @@ pub const dict_foreign_t = struct {
     referenced_index: ?*dict_index_t = null,
 };
 
+pub const dict_sys_table_row_t = struct {
+    id: dulint = .{ .high = 0, .low = 0 },
+    name: []const u8 = "",
+    space: ulint = 0,
+    n_cols: ulint = 0,
+    flags: ulint = 0,
+};
+
+pub const dict_sys_column_row_t = struct {
+    table_id: dulint = .{ .high = 0, .low = 0 },
+    name: []const u8 = "",
+    pos: ulint = 0,
+    mtype: ulint = 0,
+    prtype: ulint = 0,
+    len: ulint = 0,
+};
+
+pub const dict_sys_index_row_t = struct {
+    id: dulint = .{ .high = 0, .low = 0 },
+    table_id: dulint = .{ .high = 0, .low = 0 },
+    name: []const u8 = "",
+    type: ulint = 0,
+    space: ulint = 0,
+};
+
 pub const dict_sys_t = struct {
     row_id: dulint = .{ .high = 0, .low = DICT_HDR_FIRST_ID },
     booted: bool = false,
     tables_by_name: std.StringHashMapUnmanaged(*dict_table_t) = .{},
     tables_by_id: std.AutoHashMapUnmanaged(u128, *dict_table_t) = .{},
+    sys_tables: std.ArrayListUnmanaged(dict_sys_table_row_t) = .{},
+    sys_columns: std.ArrayListUnmanaged(dict_sys_column_row_t) = .{},
+    sys_indexes: std.ArrayListUnmanaged(dict_sys_index_row_t) = .{},
 };
 
 pub var dict_sys: dict_sys_t = .{};
@@ -194,9 +222,13 @@ pub fn dict_var_init() void {
 pub fn dict_init() void {
     dict_sys.tables_by_name = .{};
     dict_sys.tables_by_id = .{};
+    dict_sys.sys_tables = .{};
+    dict_sys.sys_columns = .{};
+    dict_sys.sys_indexes = .{};
 }
 
 pub fn dict_close() void {
+    dict_sys_metadata_clear();
     dict_sys.tables_by_name.deinit(std.heap.page_allocator);
     dict_sys.tables_by_id.deinit(std.heap.page_allocator);
 }
@@ -253,6 +285,169 @@ pub fn dict_create() void {
     _ = dict_hdr_create();
     dict_boot();
     dict_insert_initial_data();
+}
+
+fn dupSysName(name: []const u8) ?[]u8 {
+    if (name.len == 0) {
+        return "";
+    }
+    const buf = std.heap.page_allocator.alloc(u8, name.len) catch return null;
+    std.mem.copyForwards(u8, buf, name);
+    return buf;
+}
+
+fn freeSysName(name: []const u8) void {
+    if (name.len == 0) {
+        return;
+    }
+    std.heap.page_allocator.free(name);
+}
+
+fn dict_sys_metadata_clear() void {
+    for (dict_sys.sys_tables.items) |row| {
+        freeSysName(row.name);
+    }
+    for (dict_sys.sys_columns.items) |row| {
+        freeSysName(row.name);
+    }
+    for (dict_sys.sys_indexes.items) |row| {
+        freeSysName(row.name);
+    }
+    dict_sys.sys_tables.deinit(std.heap.page_allocator);
+    dict_sys.sys_columns.deinit(std.heap.page_allocator);
+    dict_sys.sys_indexes.deinit(std.heap.page_allocator);
+}
+
+pub fn dict_sys_table_insert(name: []const u8, table_id: dulint, space: ulint, n_cols: ulint, flags: ulint) ibool {
+    const name_copy = dupSysName(name) orelse return compat.FALSE;
+    errdefer freeSysName(name_copy);
+    dict_sys.sys_tables.append(std.heap.page_allocator, .{
+        .id = table_id,
+        .name = name_copy,
+        .space = space,
+        .n_cols = n_cols,
+        .flags = flags,
+    }) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn dict_sys_column_insert(table_id: dulint, name: []const u8, pos: ulint, mtype: ulint, prtype: ulint, len: ulint) ibool {
+    const name_copy = dupSysName(name) orelse return compat.FALSE;
+    errdefer freeSysName(name_copy);
+    dict_sys.sys_columns.append(std.heap.page_allocator, .{
+        .table_id = table_id,
+        .name = name_copy,
+        .pos = pos,
+        .mtype = mtype,
+        .prtype = prtype,
+        .len = len,
+    }) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn dict_sys_index_insert(table_id: dulint, index_id: dulint, name: []const u8, type_: ulint, space: ulint) ibool {
+    const name_copy = dupSysName(name) orelse return compat.FALSE;
+    errdefer freeSysName(name_copy);
+    dict_sys.sys_indexes.append(std.heap.page_allocator, .{
+        .id = index_id,
+        .table_id = table_id,
+        .name = name_copy,
+        .type = type_,
+        .space = space,
+    }) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+fn dict_sys_remove_columns_for_table(table_id: dulint) void {
+    var idx: usize = 0;
+    while (idx < dict_sys.sys_columns.items.len) {
+        if (dulintEqual(dict_sys.sys_columns.items[idx].table_id, table_id)) {
+            freeSysName(dict_sys.sys_columns.items[idx].name);
+            _ = dict_sys.sys_columns.orderedRemove(idx);
+        } else {
+            idx += 1;
+        }
+    }
+}
+
+fn dict_sys_remove_indexes_for_table(table_id: dulint) void {
+    var idx: usize = 0;
+    while (idx < dict_sys.sys_indexes.items.len) {
+        if (dulintEqual(dict_sys.sys_indexes.items[idx].table_id, table_id)) {
+            freeSysName(dict_sys.sys_indexes.items[idx].name);
+            _ = dict_sys.sys_indexes.orderedRemove(idx);
+        } else {
+            idx += 1;
+        }
+    }
+}
+
+pub fn dict_sys_table_remove(table_id: dulint) void {
+    dict_sys_remove_columns_for_table(table_id);
+    dict_sys_remove_indexes_for_table(table_id);
+    var idx: usize = 0;
+    while (idx < dict_sys.sys_tables.items.len) {
+        if (dulintEqual(dict_sys.sys_tables.items[idx].id, table_id)) {
+            freeSysName(dict_sys.sys_tables.items[idx].name);
+            _ = dict_sys.sys_tables.orderedRemove(idx);
+            break;
+        }
+        idx += 1;
+    }
+}
+
+pub fn dict_sys_index_remove(index_id: dulint) void {
+    var idx: usize = 0;
+    while (idx < dict_sys.sys_indexes.items.len) {
+        if (dulintEqual(dict_sys.sys_indexes.items[idx].id, index_id)) {
+            freeSysName(dict_sys.sys_indexes.items[idx].name);
+            _ = dict_sys.sys_indexes.orderedRemove(idx);
+            break;
+        }
+        idx += 1;
+    }
+}
+
+pub fn dict_sys_table_find_by_name(name: []const u8) ?*dict_sys_table_row_t {
+    for (dict_sys.sys_tables.items, 0..) |_, idx| {
+        if (std.mem.eql(u8, dict_sys.sys_tables.items[idx].name, name)) {
+            return &dict_sys.sys_tables.items[idx];
+        }
+    }
+    return null;
+}
+
+pub fn dict_sys_column_count_for_table_name(name: []const u8) ulint {
+    const table = dict_sys_table_find_by_name(name) orelse return 0;
+    var count: ulint = 0;
+    for (dict_sys.sys_columns.items) |col| {
+        if (dulintEqual(col.table_id, table.id)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+pub fn dict_sys_index_find_by_name(table_name: []const u8, index_name: []const u8) ?*dict_sys_index_row_t {
+    const table = dict_sys_table_find_by_name(table_name) orelse return null;
+    for (dict_sys.sys_indexes.items, 0..) |_, idx| {
+        const item = &dict_sys.sys_indexes.items[idx];
+        if (dulintEqual(item.table_id, table.id) and std.mem.eql(u8, item.name, index_name)) {
+            return item;
+        }
+    }
+    return null;
+}
+
+pub fn dict_sys_index_count_for_table_name(name: []const u8) ulint {
+    const table = dict_sys_table_find_by_name(name) orelse return 0;
+    var count: ulint = 0;
+    for (dict_sys.sys_indexes.items) |idx| {
+        if (dulintEqual(idx.table_id, table.id)) {
+            count += 1;
+        }
+    }
+    return count;
 }
 
 pub fn tab_create_graph_create(table: *dict_table_t, heap: *mem_heap_t, commit: ibool) ?*tab_node_t {
