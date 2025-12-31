@@ -218,6 +218,145 @@ pub fn page_rec_delete_bytes(page: [*]byte, rec_offs: ulint, rec_size: ulint) vo
     page_garbage_add_bytes(page, rec_size);
 }
 
+const PageRecSpan = struct {
+    header_offs: ulint,
+    extra: ulint,
+    total_len: ulint,
+};
+
+fn page_dir_rebuild_bytes(page: [*]byte, rec_offsets: []const ulint) void {
+    page_header_set_field_bytes(page, PAGE_N_DIR_SLOTS, @as(ulint, @intCast(rec_offsets.len)));
+    var i: ulint = 0;
+    while (i < rec_offsets.len) : (i += 1) {
+        page_dir_set_nth_slot(page, i, rec_offsets[@as(usize, @intCast(i))]);
+    }
+}
+
+pub fn page_reorganize_bytes(page: []u8, fields: []const rec_mod.FieldMeta) bool {
+    if (fields.len == 0) {
+        return false;
+    }
+
+    const n_slots = page_header_get_field_bytes(page.ptr, PAGE_N_DIR_SLOTS);
+    if (n_slots == 0) {
+        return false;
+    }
+
+    const allocator = std.heap.page_allocator;
+    const slot_count: usize = @intCast(n_slots);
+    var rec_offsets = allocator.alloc(ulint, slot_count) catch return false;
+    defer allocator.free(rec_offsets);
+
+    var i: usize = 0;
+    while (i < slot_count) : (i += 1) {
+        rec_offsets[i] = page_dir_get_nth_slot_val(page.ptr, @as(ulint, @intCast(i)));
+    }
+    std.sort.pdq(ulint, rec_offsets, {}, comptime std.sort.asc(ulint));
+
+    const offs_needed = rec_mod.REC_OFFS_HEADER_SIZE + 1 + @as(ulint, @intCast(fields.len));
+    const offsets_buf = allocator.alloc(ulint, @as(usize, @intCast(offs_needed))) catch return false;
+    defer allocator.free(offsets_buf);
+
+    var spans = allocator.alloc(PageRecSpan, slot_count) catch return false;
+    defer allocator.free(spans);
+
+    var live_count: usize = 0;
+    var total_size: ulint = 0;
+    var min_header_live: ?ulint = null;
+    var min_header_any: ?ulint = null;
+    var deleted_found = false;
+    const had_garbage = page_garbage_get_bytes(page.ptr) != 0;
+
+    for (rec_offsets) |rec_offs| {
+        if (rec_offs == 0) {
+            continue;
+        }
+        const rec_ptr = page.ptr + @as(usize, @intCast(rec_offs));
+        rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, fields, offsets_buf);
+        const n_fields = rec_mod.rec_offs_n_fields(offsets_buf);
+        if (n_fields == 0) {
+            continue;
+        }
+        var len: ulint = 0;
+        const last_offs = rec_mod.rec_get_nth_field_offs(offsets_buf, n_fields - 1, &len);
+        const data_len = last_offs + len;
+        const extra = offsets_buf[rec_mod.REC_OFFS_HEADER_SIZE] & rec_mod.REC_OFFS_MASK;
+        if (rec_offs < extra) {
+            return false;
+        }
+        const header_offs = rec_offs - extra;
+        if (min_header_any == null or header_offs < min_header_any.?) {
+            min_header_any = header_offs;
+        }
+
+        if (page_rec_is_deleted_bytes(page.ptr, rec_offs)) {
+            deleted_found = true;
+            continue;
+        }
+
+        if (min_header_live == null or header_offs < min_header_live.?) {
+            min_header_live = header_offs;
+        }
+        const total = extra + data_len;
+        spans[live_count] = .{
+            .header_offs = header_offs,
+            .extra = extra,
+            .total_len = total,
+        };
+        live_count += 1;
+        total_size += total;
+    }
+
+    if (live_count == 0) {
+        const reset_top = min_header_any orelse page_header_get_offs_bytes(page.ptr, PAGE_HEAP_TOP);
+        page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, reset_top);
+        page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
+        page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
+        page_header_set_field_bytes(page.ptr, PAGE_N_DIR_SLOTS, 0);
+        page_free_set_bytes(page.ptr, 0);
+        page_garbage_set_bytes(page.ptr, 0);
+        return deleted_found or had_garbage;
+    }
+
+    const start = min_header_live orelse return false;
+    const dir_limit = compat.UNIV_PAGE_SIZE - PAGE_DIR - @as(ulint, @intCast(live_count)) * PAGE_DIR_SLOT_SIZE;
+    if (start + total_size > dir_limit) {
+        return false;
+    }
+
+    var temp = allocator.alloc(u8, @as(usize, @intCast(total_size))) catch return false;
+    defer allocator.free(temp);
+    var new_offsets = allocator.alloc(ulint, live_count) catch return false;
+    defer allocator.free(new_offsets);
+
+    var temp_pos: ulint = 0;
+    i = 0;
+    while (i < live_count) : (i += 1) {
+        const span = spans[i];
+        const src_start = span.header_offs;
+        const src_end = span.header_offs + span.total_len;
+        const src = page[@as(usize, @intCast(src_start))..@as(usize, @intCast(src_end))];
+        const dst = temp[@as(usize, @intCast(temp_pos))..@as(usize, @intCast(temp_pos + span.total_len))];
+        std.mem.copyForwards(u8, dst, src);
+
+        const new_header = start + temp_pos;
+        new_offsets[i] = new_header + span.extra;
+        temp_pos += span.total_len;
+    }
+
+    const dest_start = @as(usize, @intCast(start));
+    std.mem.copyForwards(u8, page[dest_start .. dest_start + temp.len], temp);
+
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, start + total_size);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, @as(ulint, @intCast(live_count)));
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, @as(ulint, @intCast(live_count)));
+    page_free_set_bytes(page.ptr, 0);
+    page_garbage_set_bytes(page.ptr, 0);
+    page_dir_rebuild_bytes(page.ptr, new_offsets);
+
+    return deleted_found or had_garbage;
+}
+
 pub const page_t = struct {
     header: PageHeader = .{},
     infimum: rec_t = .{ .is_infimum = true },
@@ -1056,7 +1195,7 @@ test "page free list and garbage byte helpers" {
 
 test "page bytes append insert" {
     var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
-    var page = buf[0..];
+    const page = buf[0..];
     page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, 200);
     page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
     page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
@@ -1101,4 +1240,109 @@ test "page delete mark bytes" {
 
     try std.testing.expect(page_rec_is_deleted_bytes(page.ptr, rec_offs));
     try std.testing.expectEqual(rec_len, page_garbage_get_bytes(page.ptr));
+}
+
+test "page reorganize bytes compacts records" {
+    var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const page = buf[0..];
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, 200);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_DIR_SLOTS, 0);
+    page_garbage_set_bytes(page.ptr, 0);
+
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = 0, .max_len = 10, .nullable = false }};
+    const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1 + 1;
+
+    var field1 = data.dfield_t{};
+    data.dfield_set_data(&field1, "aa".ptr, 2);
+    var tuple1 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field1)[0..1] };
+    var rec1_buf = [_]byte{0} ** 16;
+    const rec1_len: ulint = header_len + 2;
+    const rec1_storage = rec1_buf[0..@as(usize, @intCast(rec1_len))];
+    const rec1_ptr = @as([*]byte, @ptrCast(rec1_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec1_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple1);
+
+    var field2 = data.dfield_t{};
+    data.dfield_set_data(&field2, "bbb".ptr, 3);
+    var tuple2 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field2)[0..1] };
+    var rec2_buf = [_]byte{0} ** 16;
+    const rec2_len: ulint = header_len + 3;
+    const rec2_storage = rec2_buf[0..@as(usize, @intCast(rec2_len))];
+    const rec2_ptr = @as([*]byte, @ptrCast(rec2_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec2_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple2);
+
+    var field3 = data.dfield_t{};
+    data.dfield_set_data(&field3, "cccc".ptr, 4);
+    var tuple3 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field3)[0..1] };
+    var rec3_buf = [_]byte{0} ** 16;
+    const rec3_len: ulint = header_len + 4;
+    const rec3_storage = rec3_buf[0..@as(usize, @intCast(rec3_len))];
+    const rec3_ptr = @as([*]byte, @ptrCast(rec3_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec3_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple3);
+
+    const off1 = page_bytes_insert_append(page, rec1_storage) orelse return error.TestExpectedEqual;
+    const off2 = page_bytes_insert_append(page, rec2_storage) orelse return error.TestExpectedEqual;
+    const off3 = page_bytes_insert_append(page, rec3_storage) orelse return error.TestExpectedEqual;
+
+    const rec1_offs = off1 + header_len;
+    const rec2_offs = off2 + header_len;
+    const rec3_offs = off3 + header_len;
+
+    var size_offsets = [_]ulint{0} ** 16;
+    rec_mod.rec_init_offsets_compact(rec2_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, size_offsets[0..]);
+    const rec2_extra = size_offsets[rec_mod.REC_OFFS_HEADER_SIZE] & rec_mod.REC_OFFS_MASK;
+    var rec2_field_len: ulint = 0;
+    const rec2_last_offs = rec_mod.rec_get_nth_field_offs(size_offsets[0..], 0, &rec2_field_len);
+    const rec2_total = rec2_extra + rec2_last_offs + rec2_field_len;
+
+    page_rec_delete_bytes(page.ptr, rec2_offs, rec2_total);
+    page_header_set_field_bytes(page.ptr, PAGE_N_DIR_SLOTS, 3);
+    page_dir_set_nth_slot(page.ptr, 0, rec1_offs);
+    page_dir_set_nth_slot(page.ptr, 1, rec2_offs);
+    page_dir_set_nth_slot(page.ptr, 2, rec3_offs);
+
+    rec_mod.rec_init_offsets_compact(rec1_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, size_offsets[0..]);
+    const rec1_extra = size_offsets[rec_mod.REC_OFFS_HEADER_SIZE] & rec_mod.REC_OFFS_MASK;
+    var rec1_field_len: ulint = 0;
+    const rec1_last_offs = rec_mod.rec_get_nth_field_offs(size_offsets[0..], 0, &rec1_field_len);
+    const rec1_total = rec1_extra + rec1_last_offs + rec1_field_len;
+
+    @memset(size_offsets[0..], 0);
+    rec_mod.rec_init_offsets_compact(rec3_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, size_offsets[0..]);
+    const rec3_extra = size_offsets[rec_mod.REC_OFFS_HEADER_SIZE] & rec_mod.REC_OFFS_MASK;
+    var rec3_field_len: ulint = 0;
+    const rec3_last_offs = rec_mod.rec_get_nth_field_offs(size_offsets[0..], 0, &rec3_field_len);
+    const rec3_total = rec3_extra + rec3_last_offs + rec3_field_len;
+
+    const expected_start = rec1_offs - rec1_extra;
+    const expected_heap_top = expected_start + rec1_total + rec3_total;
+    try std.testing.expect(page_reorganize_bytes(page, &meta));
+
+    try std.testing.expectEqual(@as(ulint, 0), page_garbage_get_bytes(page.ptr));
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_RECS));
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_HEAP));
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_DIR_SLOTS));
+    try std.testing.expectEqual(expected_heap_top, page_header_get_offs_bytes(page.ptr, PAGE_HEAP_TOP));
+
+    const new_rec1 = page_dir_get_nth_slot_val(page.ptr, 0);
+    const new_rec2 = page_dir_get_nth_slot_val(page.ptr, 1);
+
+    var offsets = [_]ulint{0} ** 16;
+    rec_mod.rec_init_offsets_compact(page.ptr + @as(usize, @intCast(new_rec1)), rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+    var out_field1 = data.dfield_t{};
+    var out_tuple1 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&out_field1)[0..1] };
+    rec_mod.rec_decode_to_dtuple(page.ptr + @as(usize, @intCast(new_rec1)), offsets[0..], &out_tuple1);
+    const f1_ptr = data.dfield_get_data(&out_field1).?;
+    const f1_len = data.dfield_get_len(&out_field1);
+    try std.testing.expectEqualStrings("aa", @as([*]const byte, @ptrCast(f1_ptr))[0..@as(usize, @intCast(f1_len))]);
+
+    @memset(offsets[0..], 0);
+    rec_mod.rec_init_offsets_compact(page.ptr + @as(usize, @intCast(new_rec2)), rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+    var out_field2 = data.dfield_t{};
+    var out_tuple2 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&out_field2)[0..1] };
+    rec_mod.rec_decode_to_dtuple(page.ptr + @as(usize, @intCast(new_rec2)), offsets[0..], &out_tuple2);
+    const f2_ptr = data.dfield_get_data(&out_field2).?;
+    const f2_len = data.dfield_get_len(&out_field2);
+    try std.testing.expectEqualStrings("cccc", @as([*]const byte, @ptrCast(f2_ptr))[0..@as(usize, @intCast(f2_len))]);
 }
