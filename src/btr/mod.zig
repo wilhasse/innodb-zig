@@ -817,6 +817,30 @@ pub fn btr_rec_set_deleted_flag(rec: *rec_t, deleted: ibool) void {
     rec.deleted = deleted != compat.FALSE;
 }
 
+fn btr_page_rebuild_bytes(block: *buf_block_t) bool {
+    if (block.bytes.len == 0) {
+        return false;
+    }
+    page.page_bytes_reset(block.bytes);
+
+    var current = page_first_user_rec(block.frame);
+    var dir_pos: ulint = 0;
+    while (current) |rec| {
+        if (rec.is_supremum) {
+            break;
+        }
+        const rec_bytes = rec.rec_bytes orelse return false;
+        const rec_head = page.page_bytes_insert_append(block.bytes, rec_bytes) orelse return false;
+        rec.rec_page_offset = rec_head + rec.rec_offset;
+        if (!page.page_dir_insert_slot_bytes(block.bytes.ptr, dir_pos, rec.rec_page_offset)) {
+            return false;
+        }
+        dir_pos += 1;
+        current = rec.next;
+    }
+    return true;
+}
+
 pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction: byte, level: ulint, mtr: *mtr_t) ?*buf_block_t {
     _ = hint_page_no;
     _ = file_direction;
@@ -965,6 +989,9 @@ fn btr_page_reorganize_low(block: *buf_block_t, index: *dict_index_t, mtr: *mtr_
         }
         cursor.rec = rec.next;
     }
+    if (changed and block.bytes.len != 0) {
+        _ = btr_page_rebuild_bytes(block);
+    }
     return if (changed) compat.TRUE else compat.FALSE;
 }
 
@@ -1105,9 +1132,15 @@ pub fn btr_set_min_rec_mark(rec: *rec_t, mtr: *mtr_t) void {
 pub fn btr_node_ptr_delete(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) void {
     const parent = block.frame.parent_block orelse return;
     const node_ptr = find_node_ptr(parent.frame, block) orelse return;
-    var cursor = page.page_cur_t{ .block = parent, .rec = node_ptr };
-    var offsets: ulint = 0;
-    page.page_cur_delete_rec(&cursor, index, &offsets, mtr);
+    btr_rec_set_deleted_flag(node_ptr, compat.TRUE);
+    if (parent.bytes.len != 0 and node_ptr.rec_page_offset != 0) {
+        if (node_ptr.rec_bytes) |rec_bytes| {
+            page.page_rec_delete_bytes(parent.bytes.ptr, node_ptr.rec_page_offset, @as(ulint, @intCast(rec_bytes.len)));
+        } else {
+            page.page_rec_set_deleted_bytes(parent.bytes.ptr, node_ptr.rec_page_offset, true);
+        }
+    }
+    _ = btr_page_reorganize(parent, index, mtr);
     block.frame.parent_block = null;
 }
 
@@ -1696,8 +1729,12 @@ pub fn btr_cur_del_mark_set_clust_rec(
     _ = flags;
     _ = thr;
     _ = mtr;
+    const block = cursor.block orelse return 1;
     const rec = cursor.rec orelse return 1;
     btr_rec_set_deleted_flag(rec, val);
+    if (block.bytes.len != 0 and rec.rec_page_offset != 0) {
+        page.page_rec_set_deleted_bytes(block.bytes.ptr, rec.rec_page_offset, val != compat.FALSE);
+    }
     return 0;
 }
 
@@ -1723,8 +1760,12 @@ pub fn btr_cur_del_mark_set_sec_rec(
     _ = flags;
     _ = thr;
     _ = mtr;
+    const block = cursor.block orelse return 1;
     const rec = cursor.rec orelse return 1;
     btr_rec_set_deleted_flag(rec, val);
+    if (block.bytes.len != 0 and rec.rec_page_offset != 0) {
+        page.page_rec_set_deleted_bytes(block.bytes.ptr, rec.rec_page_offset, val != compat.FALSE);
+    }
     return 0;
 }
 
@@ -1748,10 +1789,17 @@ pub fn btr_cur_optimistic_delete(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
     }
     const index = cursor.index orelse return compat.FALSE;
     btr_search_update_hash_on_delete(cursor);
-    var page_cursor = page.page_cur_t{ .block = block, .rec = rec };
-    var offsets: ulint = 0;
-    page.page_cur_delete_rec(&page_cursor, index, &offsets, mtr);
-    cursor.rec = page_cursor.rec;
+    const next_rec = btr_get_next_user_rec(rec, null);
+    btr_rec_set_deleted_flag(rec, compat.TRUE);
+    if (block.bytes.len != 0 and rec.rec_page_offset != 0) {
+        if (rec.rec_bytes) |rec_bytes| {
+            page.page_rec_delete_bytes(block.bytes.ptr, rec.rec_page_offset, @as(ulint, @intCast(rec_bytes.len)));
+        } else {
+            page.page_rec_set_deleted_bytes(block.bytes.ptr, rec.rec_page_offset, true);
+        }
+    }
+    _ = btr_page_reorganize(block, index, mtr);
+    cursor.rec = next_rec orelse page.page_get_supremum_rec(block.frame);
     cursor.block = block;
     btr_update_parent_min_key(block);
     btr_rebuild_leaf_chain(index);
@@ -3028,6 +3076,67 @@ test "btr update paths" {
         rec_opt = btr_get_next_user_rec(rec, null);
     }
     const expected = [_]i64{ 0, 1, 4 };
+    try std.testing.expectEqualSlices(i64, expected[0..], values.items);
+
+    index_state_remove(index);
+}
+
+test "btr delete rebuilds byte page" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 750 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= 3) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const rec1 = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    const rec2 = btr_get_next_user_rec(rec1, null) orelse return error.OutOfMemory;
+    cursor.rec = rec2;
+    try std.testing.expectEqual(compat.TRUE, btr_cur_optimistic_delete(&cursor, &mtr));
+
+    try std.testing.expect(root_block.bytes.len != 0);
+    var byte_cur = page.page_cur_bytes_t{};
+    page.page_cur_bytes_set_before_first(root_block.bytes, &byte_cur);
+
+    var values = ArrayList(i64).init(allocator);
+    defer values.deinit();
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = @sizeOf(i64), .nullable = false }};
+    var offsets = [_]ulint{0} ** 16;
+
+    while (true) {
+        page.page_cur_bytes_move_to_next(&byte_cur);
+        if (page.page_cur_bytes_is_after_last(&byte_cur)) {
+            break;
+        }
+        const rec_ptr = page.page_cur_bytes_get_rec_ptr(&byte_cur) orelse return error.TestExpectedEqual;
+        rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+        var out_field = data.dfield_t{};
+        var out_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&out_field)[0..1] };
+        rec_mod.rec_decode_to_dtuple(rec_ptr, offsets[0..], &out_tuple);
+        const data_ptr = out_field.data orelse return error.TestExpectedEqual;
+        const bytes = @as([*]const u8, @ptrCast(data_ptr))[0..@sizeOf(i64)];
+        const val = std.mem.bytesToValue(i64, bytes);
+        values.append(val) catch return error.OutOfMemory;
+    }
+
+    const expected = [_]i64{ 1, 3 };
     try std.testing.expectEqualSlices(i64, expected[0..], values.items);
 
     index_state_remove(index);
