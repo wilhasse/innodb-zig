@@ -122,6 +122,14 @@ fn btr_page_get_level(page_obj: *const page_t, mtr: *mtr_t) ulint {
     return page_obj.header.level;
 }
 
+fn btr_node_ptr_set_child_page_no(rec: *rec_t, page_no: ulint) void {
+    rec.child_page_no = page_no;
+}
+
+fn btr_node_ptr_get_child_page_no(rec: *const rec_t) ulint {
+    return rec.child_page_no;
+}
+
 fn btr_page_create(block: *buf_block_t, page_zip: ?*page_zip_des_t, index: *dict_index_t, level: ulint, mtr: *mtr_t) void {
     if (page_zip != null) {
         _ = page.page_create_zip(block, index, level, mtr);
@@ -141,6 +149,77 @@ fn btr_page_empty(block: *buf_block_t, page_zip: ?*page_zip_des_t, index: *dict_
         btr_page_set_level(block.frame, null, level, mtr);
     }
     btr_page_set_index_id(block.frame, page_zip, index.id, mtr);
+}
+
+fn page_first_user_rec(page_obj: *page_t) ?*rec_t {
+    const first = page_obj.infimum.next orelse return null;
+    return if (first.is_supremum) null else first;
+}
+
+fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
+    var current = parent_page.infimum.next;
+    const child_no = child_block.frame.page_no;
+    while (current) |node| {
+        if (node.is_supremum) {
+            return null;
+        }
+        if (node.child_block) |blk| {
+            if (blk == child_block) {
+                return node;
+            }
+        } else if (node.child_page_no != 0 and node.child_page_no == child_no) {
+            return node;
+        }
+        current = node.next;
+    }
+    return null;
+}
+
+pub fn btr_node_ptr_get_child(node_ptr: *const rec_t, index: *dict_index_t, offsets: *const ulint, mtr: *mtr_t) ?*buf_block_t {
+    _ = index;
+    _ = offsets;
+    _ = mtr;
+    return node_ptr.child_block;
+}
+
+pub fn btr_page_get_father_node_ptr_func(
+    offsets: ?*ulint,
+    heap: ?*mem_heap_t,
+    cursor: *btr_cur_t,
+    file: []const u8,
+    line: ulint,
+    mtr: *mtr_t,
+) ?*ulint {
+    _ = heap;
+    _ = file;
+    _ = line;
+    _ = mtr;
+    const child_block = cursor.block orelse return offsets;
+    const parent_block = child_block.frame.parent_block orelse return offsets;
+    const node_ptr = find_node_ptr(parent_block.frame, child_block) orelse return offsets;
+    cursor.block = parent_block;
+    cursor.rec = node_ptr;
+    cursor.opened = true;
+    return offsets;
+}
+
+pub fn btr_page_get_father_block(
+    offsets: ?*ulint,
+    heap: ?*mem_heap_t,
+    index: *dict_index_t,
+    block: *buf_block_t,
+    mtr: *mtr_t,
+    cursor: *btr_cur_t,
+) ?*ulint {
+    _ = index;
+    cursor.block = block;
+    cursor.rec = page_first_user_rec(block.frame);
+    cursor.opened = true;
+    return btr_page_get_father_node_ptr_func(offsets, heap, cursor, "btr_page_get_father_block", 0, mtr);
+}
+
+pub fn btr_page_get_father(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t, cursor: *btr_cur_t) void {
+    _ = btr_page_get_father_block(null, null, index, block, mtr, cursor);
 }
 
 pub fn btr_get_prev_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
@@ -986,6 +1065,42 @@ test "btr page create and empty base records" {
     try std.testing.expectEqual(page.PAGE_HEAP_NO_USER_LOW, block.frame.header.n_heap);
     try std.testing.expect(block.frame.infimum.next == &block.frame.supremum);
     try std.testing.expect(block.frame.supremum.prev == &block.frame.infimum);
+}
+
+test "btr node pointer and father lookup" {
+    var parent_page = page.page_t{ .page_no = 10 };
+    var child_page = page.page_t{ .page_no = 20 };
+    var parent_block = page.buf_block_t{ .frame = &parent_page, .page_zip = null };
+    var child_block = page.buf_block_t{ .frame = &child_page, .page_zip = null };
+    child_page.parent_block = &parent_block;
+
+    page.page_init(&parent_page);
+    page.page_init(&child_page);
+
+    var index = dict_index_t{};
+    var mtr = mtr_t{};
+    var node_ptr = page.rec_t{};
+    btr_node_ptr_set_child_page_no(&node_ptr, child_page.page_no);
+    node_ptr.child_block = &child_block;
+
+    var cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(&parent_block, &cursor);
+    var offsets: ulint = 0;
+    _ = page.page_cur_rec_insert(&cursor, &node_ptr, &index, &offsets, &mtr);
+
+    try std.testing.expectEqual(child_page.page_no, btr_node_ptr_get_child_page_no(&node_ptr));
+    const child_out = btr_node_ptr_get_child(&node_ptr, &index, &offsets, &mtr);
+    try std.testing.expect(child_out == &child_block);
+
+    var btr_cursor = btr_cur_t{ .index = &index };
+    _ = btr_page_get_father_block(null, null, btr_cursor.index.?, &child_block, &mtr, &btr_cursor);
+    try std.testing.expect(btr_cursor.block == &parent_block);
+    try std.testing.expect(btr_cursor.rec == &node_ptr);
+
+    var btr_cursor2 = btr_cur_t{ .index = &index };
+    btr_page_get_father(btr_cursor2.index.?, &child_block, &mtr, &btr_cursor2);
+    try std.testing.expect(btr_cursor2.block == &parent_block);
+    try std.testing.expect(btr_cursor2.rec == &node_ptr);
 }
 
 test "btr external field prefix copy" {

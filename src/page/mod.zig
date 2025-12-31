@@ -62,6 +62,8 @@ pub const rec_t = struct {
     is_supremum: bool = false,
     deleted: bool = false,
     key: i64 = 0,
+    child_page_no: ulint = 0,
+    child_block: ?*buf_block_t = null,
 };
 
 pub const PageHeader = struct {
@@ -83,6 +85,8 @@ pub const page_t = struct {
     header: PageHeader = .{},
     infimum: rec_t = .{ .is_infimum = true },
     supremum: rec_t = .{ .is_supremum = true },
+    page_no: ulint = 0,
+    parent_block: ?*buf_block_t = null,
 };
 
 pub const buf_block_t = struct {
@@ -96,6 +100,8 @@ pub const page_cur_t = struct {
 };
 
 pub fn page_init(page: *page_t) void {
+    const page_no = page.page_no;
+    const parent = page.parent_block;
     page.header = .{};
     page.header.n_heap = PAGE_HEAP_NO_USER_LOW;
     page.infimum = .{ .is_infimum = true };
@@ -105,6 +111,8 @@ pub fn page_init(page: *page_t) void {
     page.supremum.prev = &page.infimum;
     page.supremum.next = null;
     page.header.n_recs = 0;
+    page.page_no = page_no;
+    page.parent_block = parent;
 }
 
 pub fn buf_block_get_frame(block: *const buf_block_t) *page_t {
