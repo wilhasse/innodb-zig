@@ -225,6 +225,18 @@ fn dtuple_to_key(entry: *const dtuple_t) i64 {
     };
 }
 
+fn dtuple_to_child_block(entry: *const dtuple_t) ?*buf_block_t {
+    if (entry.n_fields < 2) {
+        return null;
+    }
+    const field = entry.fields[1];
+    const data_ptr = field.data orelse return null;
+    if (field.len != @sizeOf(*buf_block_t)) {
+        return null;
+    }
+    return @as(*buf_block_t, @ptrCast(data_ptr));
+}
+
 fn page_find_insert_after(page_obj: *page_t, key: i64) *rec_t {
     var prev = &page_obj.infimum;
     var current = page_obj.infimum.next;
@@ -334,9 +346,7 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
     return null;
 }
 
-fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) void {
-    const child_min = page_first_user_rec(child_block.frame);
-    const key = if (child_min) |rec| rec.key else 0;
+fn insert_node_ptr_with_key(parent_block: *buf_block_t, child_block: *buf_block_t, key: i64, index: *dict_index_t, mtr: *mtr_t) void {
     const insert_after = page_find_insert_after(parent_block.frame, key);
     const allocator = std.heap.page_allocator;
     const node_ptr = allocator.create(rec_t) catch return;
@@ -351,6 +361,12 @@ fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index:
         return;
     }
     child_block.frame.parent_block = parent_block;
+}
+
+fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) void {
+    const child_min = page_first_user_rec(child_block.frame);
+    const key = if (child_min) |rec| rec.key else 0;
+    insert_node_ptr_with_key(parent_block, child_block, key, index, mtr);
 }
 
 fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
@@ -639,12 +655,52 @@ pub fn btr_page_get_split_rec_to_right(cursor: *btr_cur_t, split_rec: *?*rec_t) 
 }
 
 pub fn btr_insert_on_non_leaf_level_func(index: *dict_index_t, level: ulint, tuple: *dtuple_t, file: []const u8, line: ulint, mtr: *mtr_t) void {
-    _ = index;
-    _ = level;
-    _ = tuple;
-    _ = file;
-    _ = line;
-    _ = mtr;
+    if (level == 0) {
+        return;
+    }
+    const child_block = dtuple_to_child_block(tuple) orelse return;
+    const key = dtuple_to_key(tuple);
+    var cursor = btr_cur_t{};
+    btr_cur_search_to_nth_level(index, level, tuple, page.PAGE_CUR_LE, 0, &cursor, 0, file, line, mtr);
+    const parent = cursor.block orelse return;
+    insert_node_ptr_with_key(parent, child_block, key, index, mtr);
+}
+
+pub fn btr_attach_half_pages(
+    index: *dict_index_t,
+    block: *buf_block_t,
+    split_rec: *rec_t,
+    new_block: *buf_block_t,
+    direction: ulint,
+    mtr: *mtr_t,
+) void {
+    _ = direction;
+    const parent = block.frame.parent_block;
+    new_block.frame.parent_block = parent;
+    new_block.frame.prev_block = block;
+    new_block.frame.next_block = block.frame.next_block;
+    block.frame.next_block = new_block;
+    if (new_block.frame.next_block) |next| {
+        next.frame.prev_block = new_block;
+    }
+
+    if (parent) |parent_block| {
+        insert_node_ptr_with_key(parent_block, new_block, split_rec.key, index, mtr);
+        return;
+    }
+
+    const old_level = block.frame.header.level;
+    const new_root = btr_page_alloc(index, 0, 0, old_level + 1, mtr) orelse return;
+    btr_page_create(new_root, new_root.page_zip, index, old_level + 1, mtr);
+    index.page = new_root.frame.page_no;
+    index.root_level = old_level + 1;
+    block.frame.parent_block = new_root;
+    new_block.frame.parent_block = new_root;
+
+    const left_min = page_first_user_rec(block.frame);
+    const left_key = if (left_min) |rec| rec.key else 0;
+    insert_node_ptr_with_key(new_root, block, left_key, index, mtr);
+    insert_node_ptr_with_key(new_root, new_block, split_rec.key, index, mtr);
 }
 
 pub fn btr_page_split_and_insert(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext: ulint, mtr: *mtr_t) ?*rec_t {
@@ -676,9 +732,29 @@ pub fn btr_set_min_rec_mark(rec: *rec_t, mtr: *mtr_t) void {
 }
 
 pub fn btr_node_ptr_delete(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) void {
-    _ = index;
-    _ = block;
+    const parent = block.frame.parent_block orelse return;
+    const node_ptr = find_node_ptr(parent.frame, block) orelse return;
+    var cursor = page.page_cur_t{ .block = parent, .rec = node_ptr };
+    var offsets: ulint = 0;
+    page.page_cur_delete_rec(&cursor, index, &offsets, mtr);
+    block.frame.parent_block = null;
+}
+
+pub fn btr_lift_page_up(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) void {
     _ = mtr;
+    const parent = block.frame.parent_block orelse return;
+    if (block.frame.prev_block != null or block.frame.next_block != null) {
+        return;
+    }
+    index.page = block.frame.page_no;
+    index.root_level = block.frame.header.level;
+    block.frame.parent_block = null;
+    if (index_states.get(index)) |state| {
+        if (state.pages.fetchRemove(parent.frame.page_no)) |removed| {
+            std.heap.page_allocator.destroy(removed.value.frame);
+            std.heap.page_allocator.destroy(removed.value);
+        }
+    }
 }
 
 pub fn btr_compress(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
@@ -1637,6 +1713,115 @@ test "btr leaf split raises root" {
         try std.testing.expectEqual(expected, val);
         expected += 1;
     }
+
+    index_state_remove(index);
+}
+
+test "btr non-leaf insert updates node pointers" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 500 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const new_root = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, 2), new_root.frame.header.n_recs);
+
+    const extra = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    btr_page_create(extra, extra.page_zip, index, 0, &mtr);
+    var extra_cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(extra, &extra_cursor);
+    var extra_rec = page.rec_t{ .key = 99 };
+    var offsets: ulint = 0;
+    _ = page.page_cur_rec_insert(&extra_cursor, &extra_rec, index, &offsets, &mtr);
+
+    var fields_np = [_]data.dfield_t{
+        .{ .data = &extra_rec.key, .len = @intCast(@sizeOf(i64)) },
+        .{ .data = @ptrCast(extra), .len = @intCast(@sizeOf(*buf_block_t)) },
+    };
+    var tuple_np = data.dtuple_t{ .n_fields = 2, .n_fields_cmp = 1, .fields = fields_np[0..] };
+    btr_insert_on_non_leaf_level_func(index, index.root_level, &tuple_np, "file", 1, &mtr);
+
+    try std.testing.expectEqual(@as(ulint, 3), new_root.frame.header.n_recs);
+    var found = false;
+    var node = page_first_user_rec(new_root.frame) orelse return error.OutOfMemory;
+    while (true) {
+        if (node.child_block == extra) {
+            found = true;
+            break;
+        }
+        node = btr_get_next_user_rec(node, null) orelse break;
+    }
+    try std.testing.expect(found);
+
+    index_state_remove(index);
+}
+
+test "btr attach pages and delete node pointer" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 600 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const new_root = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    const left_ptr = page_first_user_rec(new_root.frame) orelse return error.OutOfMemory;
+    const right_ptr = btr_get_next_user_rec(left_ptr, null) orelse return error.OutOfMemory;
+    const right_block = right_ptr.child_block orelse return error.OutOfMemory;
+
+    const extra = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    btr_page_create(extra, extra.page_zip, index, 0, &mtr);
+    var extra_cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(extra, &extra_cursor);
+    var extra_rec = page.rec_t{ .key = 150 };
+    var offsets: ulint = 0;
+    _ = page.page_cur_rec_insert(&extra_cursor, &extra_rec, index, &offsets, &mtr);
+
+    btr_attach_half_pages(index, right_block, &extra_rec, extra, 0, &mtr);
+    try std.testing.expectEqual(@as(ulint, 3), new_root.frame.header.n_recs);
+    try std.testing.expect(right_block.frame.next_block == extra);
+    try std.testing.expect(extra.frame.prev_block == right_block);
+    try std.testing.expect(extra.frame.parent_block == new_root);
+
+    btr_node_ptr_delete(index, extra, &mtr);
+    try std.testing.expectEqual(@as(ulint, 2), new_root.frame.header.n_recs);
+    try std.testing.expect(extra.frame.parent_block == null);
 
     index_state_remove(index);
 }
