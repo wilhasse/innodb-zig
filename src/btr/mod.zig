@@ -21,6 +21,8 @@ pub const BTR_BLOB_HDR_PART_LEN: ulint = 0;
 pub const BTR_BLOB_HDR_NEXT_PAGE_NO: ulint = 4;
 pub const BTR_BLOB_HDR_SIZE: ulint = 8;
 
+const BTR_MAX_RECS_PER_PAGE: ulint = 4;
+
 const RW_NO_LATCH: u32 = 0;
 const RW_S_LATCH: u32 = 1;
 const RW_X_LATCH: u32 = 2;
@@ -237,6 +239,118 @@ fn page_find_insert_after(page_obj: *page_t, key: i64) *rec_t {
         current = node.next;
     }
     return prev;
+}
+
+const SplitEntry = struct {
+    key: i64,
+    is_new: bool,
+};
+
+const SplitResult = struct {
+    right: *buf_block_t,
+    inserted: *rec_t,
+    inserted_block: *buf_block_t,
+};
+
+fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict_index_t, mtr: *mtr_t) ?*rec_t {
+    var cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(block, &cursor);
+    var offsets: ulint = 0;
+    var inserted: ?*rec_t = null;
+    const allocator = std.heap.page_allocator;
+    for (entries) |entry| {
+        const rec = allocator.create(rec_t) catch return inserted;
+        rec.* = .{ .key = entry.key };
+        if (page.page_cur_rec_insert(&cursor, rec, index, &offsets, mtr) == null) {
+            allocator.destroy(rec);
+            return inserted;
+        }
+        cursor.rec = rec;
+        if (entry.is_new and inserted == null) {
+            inserted = rec;
+        }
+    }
+    return inserted;
+}
+
+fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *const dtuple_t, mtr: *mtr_t) ?SplitResult {
+    const allocator = std.heap.page_allocator;
+    var entries = std.ArrayList(SplitEntry).init(allocator);
+    defer entries.deinit();
+
+    const new_key = dtuple_to_key(tuple);
+    var inserted = false;
+    var current = block.frame.infimum.next;
+    while (current) |node| {
+        if (node.is_supremum) {
+            break;
+        }
+        if (!inserted and new_key < node.key) {
+            entries.append(.{ .key = new_key, .is_new = true }) catch return null;
+            inserted = true;
+        }
+        entries.append(.{ .key = node.key, .is_new = false }) catch return null;
+        current = node.next;
+    }
+    if (!inserted) {
+        entries.append(.{ .key = new_key, .is_new = true }) catch return null;
+    }
+
+    if (entries.items.len < 2) {
+        return null;
+    }
+
+    var split_index = entries.items.len / 2;
+    if (split_index == 0) {
+        split_index = 1;
+    } else if (split_index >= entries.items.len) {
+        split_index = entries.items.len - 1;
+    }
+
+    const level = block.frame.header.level;
+    const right = btr_page_alloc(index, 0, 0, level, mtr) orelse return null;
+    btr_page_create(right, right.page_zip, index, level, mtr);
+    right.frame.parent_block = block.frame.parent_block;
+
+    const old_next = block.frame.next_block;
+    right.frame.prev_block = block;
+    right.frame.next_block = old_next;
+    block.frame.next_block = right;
+    if (old_next) |next_blk| {
+        next_blk.frame.prev_block = right;
+    }
+
+    btr_page_empty(block, block.page_zip, index, level, mtr);
+
+    const left_inserted = insert_entries(block, entries.items[0..split_index], index, mtr);
+    const right_inserted = insert_entries(right, entries.items[split_index..], index, mtr);
+
+    if (left_inserted) |rec| {
+        return .{ .right = right, .inserted = rec, .inserted_block = block };
+    }
+    if (right_inserted) |rec| {
+        return .{ .right = right, .inserted = rec, .inserted_block = right };
+    }
+    return null;
+}
+
+fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) void {
+    const child_min = page_first_user_rec(child_block.frame);
+    const key = if (child_min) |rec| rec.key else 0;
+    const insert_after = page_find_insert_after(parent_block.frame, key);
+    const allocator = std.heap.page_allocator;
+    const node_ptr = allocator.create(rec_t) catch return;
+    node_ptr.* = .{ .key = key };
+    node_ptr.child_block = child_block;
+    btr_node_ptr_set_child_page_no(node_ptr, child_block.frame.page_no);
+
+    var page_cursor = page.page_cur_t{ .block = parent_block, .rec = insert_after };
+    var offsets: ulint = 0;
+    if (page.page_cur_rec_insert(&page_cursor, node_ptr, index, &offsets, mtr) == null) {
+        allocator.destroy(node_ptr);
+        return;
+    }
+    child_block.frame.parent_block = parent_block;
 }
 
 fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
@@ -483,23 +597,45 @@ pub fn btr_parse_page_reorganize(ptr: [*]byte, end_ptr: [*]byte, index: ?*dict_i
 }
 
 pub fn btr_root_raise_and_insert(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext: ulint, mtr: *mtr_t) ?*rec_t {
-    _ = cursor;
-    _ = tuple;
     _ = n_ext;
-    _ = mtr;
-    return null;
+    const block = cursor.block orelse return null;
+    const index = cursor.index orelse return null;
+    const split = split_leaf_and_insert(index, block, tuple, mtr) orelse return null;
+
+    const old_level = block.frame.header.level;
+    const new_root = btr_page_alloc(index, 0, 0, old_level + 1, mtr) orelse return null;
+    btr_page_create(new_root, new_root.page_zip, index, old_level + 1, mtr);
+    index.page = new_root.frame.page_no;
+    index.root_level = old_level + 1;
+
+    block.frame.parent_block = new_root;
+    split.right.frame.parent_block = new_root;
+
+    insert_node_ptr(new_root, block, index, mtr);
+    insert_node_ptr(new_root, split.right, index, mtr);
+
+    cursor.block = split.inserted_block;
+    cursor.rec = split.inserted;
+    cursor.opened = true;
+    return split.inserted;
 }
 
 pub fn btr_page_get_split_rec_to_left(cursor: *btr_cur_t, split_rec: *?*rec_t) ibool {
-    _ = cursor;
-    split_rec.* = null;
-    return compat.FALSE;
+    const block = cursor.block orelse {
+        split_rec.* = null;
+        return compat.FALSE;
+    };
+    split_rec.* = page.page_get_middle_rec(block.frame);
+    return if (split_rec.* != null) compat.TRUE else compat.FALSE;
 }
 
 pub fn btr_page_get_split_rec_to_right(cursor: *btr_cur_t, split_rec: *?*rec_t) ibool {
-    _ = cursor;
-    split_rec.* = null;
-    return compat.FALSE;
+    const block = cursor.block orelse {
+        split_rec.* = null;
+        return compat.FALSE;
+    };
+    split_rec.* = page.page_get_middle_rec(block.frame);
+    return if (split_rec.* != null) compat.TRUE else compat.FALSE;
 }
 
 pub fn btr_insert_on_non_leaf_level_func(index: *dict_index_t, level: ulint, tuple: *dtuple_t, file: []const u8, line: ulint, mtr: *mtr_t) void {
@@ -512,11 +648,18 @@ pub fn btr_insert_on_non_leaf_level_func(index: *dict_index_t, level: ulint, tup
 }
 
 pub fn btr_page_split_and_insert(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext: ulint, mtr: *mtr_t) ?*rec_t {
-    _ = cursor;
-    _ = tuple;
-    _ = n_ext;
-    _ = mtr;
-    return null;
+    const block = cursor.block orelse return null;
+    const index = cursor.index orelse return null;
+    if (block.frame.parent_block == null) {
+        return btr_root_raise_and_insert(cursor, tuple, n_ext, mtr);
+    }
+    const split = split_leaf_and_insert(index, block, tuple, mtr) orelse return null;
+    const parent = block.frame.parent_block orelse return split.inserted;
+    insert_node_ptr(parent, split.right, index, mtr);
+    cursor.block = split.inserted_block;
+    cursor.rec = split.inserted;
+    cursor.opened = true;
+    return split.inserted;
 }
 
 pub fn btr_parse_set_min_rec_mark(ptr: [*]byte, end_ptr: [*]byte, comp: ulint, page_ptr: ?*page_t, mtr: ?*mtr_t) [*]byte {
@@ -682,6 +825,9 @@ fn btr_cur_insert_if_possible(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext:
     _ = n_ext;
     const block = cursor.block orelse return null;
     const index = cursor.index orelse return null;
+    if (block.frame.header.n_recs >= BTR_MAX_RECS_PER_PAGE) {
+        return null;
+    }
     const key = dtuple_to_key(tuple);
     const insert_after = page_find_insert_after(block.frame, key);
     const allocator = std.heap.page_allocator;
@@ -741,8 +887,13 @@ pub fn btr_cur_optimistic_insert(
         return lock_err;
     }
 
-    const inserted = btr_cur_insert_if_possible(cursor, entry, n_ext, mtr) orelse return 1;
-    rec.* = inserted;
+    if (btr_cur_insert_if_possible(cursor, entry, n_ext, mtr)) |inserted| {
+        rec.* = inserted;
+        return 0;
+    }
+
+    const split_rec = btr_page_split_and_insert(cursor, entry, n_ext, mtr) orelse return 1;
+    rec.* = split_rec;
     return 0;
 }
 
@@ -1425,6 +1576,67 @@ test "btr optimistic insert leaf order and duplicates" {
     try std.testing.expectEqual(@as(i64, 2), third.key);
     try std.testing.expect(btr_get_next_user_rec(third, null) == null);
     try std.testing.expectEqual(@as(ulint, 3), root_block.frame.header.n_recs);
+
+    index_state_remove(index);
+}
+
+test "btr leaf split raises root" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 400 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    try std.testing.expectEqual(@as(ulint, 1), index.root_level);
+    const new_root = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, 1), new_root.frame.header.level);
+    try std.testing.expectEqual(@as(ulint, 3), btr_get_size(index, 0));
+    try std.testing.expectEqual(@as(ulint, 2), new_root.frame.header.n_recs);
+
+    const left_ptr = page_first_user_rec(new_root.frame) orelse return error.OutOfMemory;
+    const right_ptr = btr_get_next_user_rec(left_ptr, null) orelse return error.OutOfMemory;
+    const left_block = left_ptr.child_block orelse return error.OutOfMemory;
+    const right_block = right_ptr.child_block orelse return error.OutOfMemory;
+
+    try std.testing.expect(left_block.frame.next_block == right_block);
+    try std.testing.expect(right_block.frame.prev_block == left_block);
+    try std.testing.expect(left_block.frame.parent_block == new_root);
+    try std.testing.expect(right_block.frame.parent_block == new_root);
+
+    var values = std.ArrayList(i64).init(allocator);
+    defer values.deinit();
+    var rec = page_first_user_rec(left_block.frame) orelse return error.OutOfMemory;
+    while (true) {
+        values.append(rec.key) catch return error.OutOfMemory;
+        const next = btr_get_next_user_rec(rec, null) orelse break;
+        rec = next;
+    }
+
+    try std.testing.expectEqual(@as(usize, BTR_MAX_RECS_PER_PAGE + 1), values.items.len);
+    var expected: i64 = 1;
+    for (values.items) |val| {
+        try std.testing.expectEqual(expected, val);
+        expected += 1;
+    }
 
     index_state_remove(index);
 }
