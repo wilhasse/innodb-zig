@@ -193,6 +193,15 @@ fn makeOffset(offset: ulint, offset_high: ulint) u64 {
     return (@as(u64, @intCast(offset_high)) << 32) | @as(u64, @intCast(offset));
 }
 
+fn pageOffset(page_no: ulint) struct { low: ulint, high: ulint } {
+    const page_size = @as(u64, @intCast(compat.UNIV_PAGE_SIZE));
+    const offs = @as(u64, @intCast(page_no)) * page_size;
+    return .{
+        .low = @as(ulint, @intCast(offs & 0xFFFF_FFFF)),
+        .high = @as(ulint, @intCast(offs >> 32)),
+    };
+}
+
 fn fileKindToType(kind: std.fs.File.Kind) os_file_type_t {
     return switch (kind) {
         .file => .OS_FILE_TYPE_FILE,
@@ -581,6 +590,16 @@ pub fn os_file_write(name: []const u8, file: os_file_t, buf: [*]const byte, offs
         return os_file_flush(file);
     }
     return compat.TRUE;
+}
+
+pub fn os_file_read_page(file: os_file_t, page_no: ulint, buf: [*]byte) ibool {
+    const offs = pageOffset(page_no);
+    return os_file_read(file, buf, offs.low, offs.high, compat.UNIV_PAGE_SIZE);
+}
+
+pub fn os_file_write_page(name: []const u8, file: os_file_t, page_no: ulint, buf: [*]const byte) ibool {
+    const offs = pageOffset(page_no);
+    return os_file_write(name, file, buf, offs.low, offs.high, compat.UNIV_PAGE_SIZE);
 }
 
 pub fn os_file_status(path: []const u8, exists_out: *ibool, type_out: *os_file_type_t) ibool {

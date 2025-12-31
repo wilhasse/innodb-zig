@@ -609,6 +609,62 @@ pub fn fil_io(
     return DB_SUCCESS;
 }
 
+fn fil_first_node(space: *fil_space_t) ?*fil_node_t {
+    if (space.nodes.items.len == 0) {
+        return null;
+    }
+    return &space.nodes.items[0];
+}
+
+fn fil_page_in_space(space: *fil_space_t, page_no: ulint) bool {
+    if (space.size == 0) {
+        return true;
+    }
+    return page_no < space.size;
+}
+
+pub fn fil_read_page(space_id: ulint, page_no: ulint, buf: [*]byte) ulint {
+    const space = findSpace(space_id) orelse return DB_TABLESPACE_DELETED;
+    if (space.deleted) {
+        return DB_TABLESPACE_DELETED;
+    }
+    if (!fil_page_in_space(space, page_no)) {
+        return DB_ERROR;
+    }
+    const node = fil_first_node(space) orelse return DB_ERROR;
+    var success: ibool = compat.FALSE;
+    const file = os_file.os_file_create_simple(node.name, os_file.OS_FILE_OPEN, os_file.OS_FILE_READ_WRITE, &success);
+    if (success == compat.FALSE or file == null) {
+        return DB_ERROR;
+    }
+    defer _ = os_file.os_file_close(file);
+    if (os_file.os_file_read_page(file, page_no, buf) == compat.FALSE) {
+        return DB_ERROR;
+    }
+    return DB_SUCCESS;
+}
+
+pub fn fil_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint {
+    const space = findSpace(space_id) orelse return DB_TABLESPACE_DELETED;
+    if (space.deleted) {
+        return DB_TABLESPACE_DELETED;
+    }
+    if (!fil_page_in_space(space, page_no)) {
+        return DB_ERROR;
+    }
+    const node = fil_first_node(space) orelse return DB_ERROR;
+    var success: ibool = compat.FALSE;
+    const file = os_file.os_file_create_simple(node.name, os_file.OS_FILE_OPEN, os_file.OS_FILE_READ_WRITE, &success);
+    if (success == compat.FALSE or file == null) {
+        return DB_ERROR;
+    }
+    defer _ = os_file.os_file_close(file);
+    if (os_file.os_file_write_page(node.name, file, page_no, buf) == compat.FALSE) {
+        return DB_ERROR;
+    }
+    return DB_SUCCESS;
+}
+
 pub fn fil_aio_wait(segment: ulint) void {
     _ = segment;
 }
@@ -697,4 +753,31 @@ test "fil page header helpers" {
 test "fil addr null" {
     try std.testing.expect(fil_addr_is_null(fil_addr_null) == compat.TRUE);
     try std.testing.expect(fil_addr_is_null(.{ .page = 1, .boffset = 0 }) == compat.FALSE);
+}
+
+test "fil read/write page" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const prev_path = fil_path_to_client_datadir;
+    fil_path_to_client_datadir = base;
+    defer fil_path_to_client_datadir = prev_path;
+
+    fil_init(0, 32);
+    defer fil_close();
+
+    var space_id: ulint = 0;
+    const err = fil_create_new_single_table_tablespace(&space_id, "rwtest", compat.FALSE, 0, 4);
+    try std.testing.expectEqual(DB_SUCCESS, err);
+
+    var write_page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    @memset(write_page[0..], 0xAB);
+    try std.testing.expectEqual(DB_SUCCESS, fil_write_page(space_id, 1, write_page[0..].ptr));
+
+    var read_page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    @memset(read_page[0..], 0);
+    try std.testing.expectEqual(DB_SUCCESS, fil_read_page(space_id, 1, read_page[0..].ptr));
+    try std.testing.expect(std.mem.eql(u8, read_page[0..], write_page[0..]));
 }
