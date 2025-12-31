@@ -888,10 +888,112 @@ pub fn btr_print_index(index: *dict_index_t, width: ulint) void {
     _ = width;
 }
 
+fn btr_validate_page_recs(page_obj: *page_t) bool {
+    var count: ulint = 0;
+    var last_key: ?i64 = null;
+    var current = page_obj.infimum.next;
+    while (current) |rec| {
+        if (rec.is_supremum) {
+            break;
+        }
+        if (rec.page != page_obj) {
+            return false;
+        }
+        if (last_key) |prev_key| {
+            if (rec.key < prev_key) {
+                return false;
+            }
+        }
+        last_key = rec.key;
+        count += 1;
+        current = rec.next;
+    }
+    return count == page_obj.header.n_recs;
+}
+
+fn btr_validate_leaf_chain(start: *buf_block_t) bool {
+    var block_opt: ?*buf_block_t = start;
+    var prev_block: ?*buf_block_t = null;
+    var last_key: ?i64 = null;
+    while (block_opt) |block| {
+        if (block.frame.prev_block != prev_block) {
+            return false;
+        }
+        var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+        while (rec_opt) |rec| {
+            if (last_key) |prev_key| {
+                if (rec.key < prev_key) {
+                    return false;
+                }
+            }
+            last_key = rec.key;
+            rec_opt = btr_get_next_user_rec(rec, null);
+        }
+        prev_block = block;
+        block_opt = block.frame.next_block;
+        if (block_opt) |next_block| {
+            if (next_block.frame.prev_block != block) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn btr_validate_subtree(index: *dict_index_t, block: *buf_block_t) bool {
+    if (!btr_validate_page_recs(block.frame)) {
+        return false;
+    }
+    if (block.frame.header.level == 0) {
+        return true;
+    }
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+    while (rec_opt) |rec| {
+        const child = rec.child_block orelse return false;
+        if (child.frame.parent_block != block) {
+            return false;
+        }
+        if (child.frame.header.level + 1 != block.frame.header.level) {
+            return false;
+        }
+        var mtr = mtr_t{};
+        if (btr_check_node_ptr(index, child, &mtr) == compat.FALSE) {
+            return false;
+        }
+        if (!btr_validate_subtree(index, child)) {
+            return false;
+        }
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    return true;
+}
+
+fn btr_find_leaf_for_key(index: *dict_index_t, key: i64) ?*buf_block_t {
+    var block = descend_to_level(index, 0, true) orelse return null;
+    while (true) {
+        const last = page_last_user_rec(block.frame);
+        if (last == null or key <= last.?.key) {
+            return block;
+        }
+        block = block.frame.next_block orelse return block;
+    }
+}
+
+fn btr_block_for_rec(index: *dict_index_t, rec: *rec_t) ?*buf_block_t {
+    const page_ptr = rec.page orelse return null;
+    const state = index_states.get(index) orelse return null;
+    return state.pages.get(page_ptr.page_no);
+}
+
 pub fn btr_check_node_ptr(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) ibool {
     _ = index;
-    _ = block;
     _ = mtr;
+    const parent = block.frame.parent_block orelse return compat.TRUE;
+    const node_ptr = find_node_ptr(parent.frame, block) orelse return compat.FALSE;
+    const child_min = page_first_user_rec(block.frame) orelse return compat.TRUE;
+    if (node_ptr.key != child_min.key) {
+        return compat.FALSE;
+    }
     return compat.TRUE;
 }
 
@@ -903,9 +1005,19 @@ pub fn btr_index_rec_validate(rec: *const rec_t, index: *const dict_index_t, dum
 }
 
 pub fn btr_validate_index(index: *dict_index_t, trx: ?*trx_t) ibool {
-    _ = index;
     _ = trx;
-    return compat.TRUE;
+    const root_block = btr_root_block_get(index, null) orelse return compat.TRUE;
+    if (root_block.frame.page_no != index.page) {
+        return compat.FALSE;
+    }
+    if (root_block.frame.header.level != index.root_level) {
+        return compat.FALSE;
+    }
+    if (!btr_validate_subtree(index, root_block)) {
+        return compat.FALSE;
+    }
+    const leftmost = descend_to_level(index, 0, true) orelse return compat.TRUE;
+    return if (btr_validate_leaf_chain(leftmost)) compat.TRUE else compat.FALSE;
 }
 
 pub fn btr_cur_var_init() void {
@@ -2876,4 +2988,115 @@ test "btr search stubs" {
 
     btr_search_sys_free();
     try std.testing.expect(btr_search_sys == null);
+}
+
+fn btr_collect_keys(index: *dict_index_t, list: *std.ArrayList(i64)) !void {
+    list.clearRetainingCapacity();
+    const leftmost = descend_to_level(index, 0, true) orelse return;
+    var block_opt: ?*buf_block_t = leftmost;
+    while (block_opt) |block| {
+        var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+        while (rec_opt) |rec| {
+            try list.append(rec.key);
+            rec_opt = btr_get_next_user_rec(rec, null);
+        }
+        block_opt = block.frame.next_block;
+    }
+}
+
+test "btr validate index random ops" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1400 }, index, &mtr);
+
+    var keys = std.ArrayList(i64).init(allocator);
+    defer keys.deinit();
+    var key_set = std.AutoHashMap(i64, void).init(allocator);
+    defer key_set.deinit();
+
+    var prng = std.rand.DefaultPrng.init(0x1357_9BDF);
+    const rnd = prng.random();
+
+    var op: usize = 0;
+    while (op < 200) : (op += 1) {
+        const action: u8 = if (keys.items.len == 0) 0 else rnd.uintLessThan(u8, 3);
+        switch (action) {
+            0 => {
+                var key = rnd.intRangeAtMost(i64, 1, 1000);
+                var tries: usize = 0;
+                while (key_set.contains(key) and tries < 10) : (tries += 1) {
+                    key = rnd.intRangeAtMost(i64, 1, 1000);
+                }
+                if (key_set.contains(key)) {
+                    continue;
+                }
+                const block = btr_find_leaf_for_key(index, key) orelse return error.OutOfMemory;
+                var cursor = btr_cur_t{
+                    .index = index,
+                    .block = block,
+                    .rec = page.page_get_infimum_rec(block.frame),
+                    .opened = true,
+                };
+                var rec_out: ?*rec_t = null;
+                var big_rec: ?*big_rec_t = null;
+                var fields = [_]data.dfield_t{.{ .data = &key, .len = @intCast(@sizeOf(i64)) }};
+                var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+                try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+                try key_set.put(key, {});
+                try keys.append(key);
+            },
+            1 => {
+                const idx = rnd.uintLessThan(usize, keys.items.len);
+                const key = keys.items[idx];
+                const rec = btr_find_rec_by_key(index, key) orelse return error.OutOfMemory;
+                const block = btr_block_for_rec(index, rec) orelse return error.OutOfMemory;
+                var cursor = btr_cur_t{
+                    .index = index,
+                    .block = block,
+                    .rec = rec,
+                    .opened = true,
+                };
+                _ = btr_cur_optimistic_delete(&cursor, &mtr);
+                _ = key_set.remove(key);
+                keys.items[idx] = keys.items[keys.items.len - 1];
+                keys.items.len -= 1;
+            },
+            else => {
+                const idx = rnd.uintLessThan(usize, keys.items.len);
+                const key = keys.items[idx];
+                const rec = btr_find_rec_by_key(index, key) orelse return error.OutOfMemory;
+                const block = btr_block_for_rec(index, rec) orelse return error.OutOfMemory;
+                var cursor = btr_cur_t{
+                    .index = index,
+                    .block = block,
+                    .rec = rec,
+                    .opened = true,
+                };
+                var update = upd_t{ .new_key = key, .size_change = false };
+                var thr = que_thr_t{};
+                try std.testing.expectEqual(@as(ulint, 0), btr_cur_update_in_place(0, &cursor, &update, 0, &thr, &mtr));
+            },
+        }
+
+        try std.testing.expectEqual(compat.TRUE, btr_validate_index(index, null));
+    }
+
+    var scanned = std.ArrayList(i64).init(allocator);
+    defer scanned.deinit();
+    try btr_collect_keys(index, &scanned);
+
+    const expected = try allocator.dupe(i64, keys.items);
+    defer allocator.free(expected);
+    std.sort.sort(i64, expected, {}, comptime std.sort.asc(i64));
+
+    try std.testing.expectEqual(expected.len, scanned.items.len);
+    for (expected, scanned.items) |exp, got| {
+        try std.testing.expectEqual(exp, got);
+    }
+
+    index_state_remove(index);
 }
