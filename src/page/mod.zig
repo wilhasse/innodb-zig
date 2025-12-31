@@ -4,6 +4,7 @@ const data = @import("../data/mod.zig");
 const dict = @import("../dict/mod.zig");
 const fil = @import("../fil/mod.zig");
 const fsp = @import("../fsp/mod.zig");
+const rec_mod = @import("../rec/mod.zig");
 const mach = @import("../mach/mod.zig");
 
 pub const module_name = "page";
@@ -200,6 +201,21 @@ pub fn page_bytes_insert_append(page: []u8, rec_bytes: []const u8) ?ulint {
     page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, page_header_get_field_bytes(page.ptr, PAGE_N_HEAP) + 1);
     page_header_set_field_bytes(page.ptr, PAGE_N_RECS, page_header_get_field_bytes(page.ptr, PAGE_N_RECS) + 1);
     return heap_top;
+}
+
+pub fn page_rec_set_deleted_bytes(page: [*]byte, rec_offs: ulint, deleted: bool) void {
+    const rec_ptr = page + @as(usize, @intCast(rec_offs));
+    rec_mod.rec_set_deleted_flag_new(rec_ptr, if (deleted) 1 else 0);
+}
+
+pub fn page_rec_is_deleted_bytes(page: [*]const byte, rec_offs: ulint) bool {
+    const rec_ptr = page + @as(usize, @intCast(rec_offs));
+    return rec_mod.rec_get_deleted_flag(rec_ptr, true) != 0;
+}
+
+pub fn page_rec_delete_bytes(page: [*]byte, rec_offs: ulint, rec_size: ulint) void {
+    page_rec_set_deleted_bytes(page, rec_offs, true);
+    page_garbage_add_bytes(page, rec_size);
 }
 
 pub const page_t = struct {
@@ -1057,4 +1073,32 @@ test "page bytes append insert" {
 
     try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_HEAP));
     try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_RECS));
+}
+
+test "page delete mark bytes" {
+    var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const page = buf[0..];
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, 200);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
+    page_garbage_set_bytes(page.ptr, 0);
+
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = 0, .max_len = 10, .nullable = false }};
+    var field = data.dfield_t{};
+    data.dfield_set_data(&field, "abc".ptr, 3);
+    var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field)[0..1] };
+
+    const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1 + 1;
+    var rec_buf = [_]byte{0} ** 16;
+    const rec_len = header_len + 3;
+    const rec_storage = rec_buf[0..@as(usize, @intCast(rec_len))];
+    const rec_ptr = @as([*]byte, @ptrCast(rec_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple);
+
+    const off = page_bytes_insert_append(page, rec_storage) orelse return error.TestExpectedEqual;
+    const rec_offs = off + header_len;
+    page_rec_delete_bytes(page.ptr, rec_offs, rec_len);
+
+    try std.testing.expect(page_rec_is_deleted_bytes(page.ptr, rec_offs));
+    try std.testing.expectEqual(rec_len, page_garbage_get_bytes(page.ptr));
 }
