@@ -1,6 +1,8 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const page = @import("../page/mod.zig");
+const fil = @import("../fil/mod.zig");
+const buf_mod = @import("../buf/mod.zig");
 const dict = @import("../dict/mod.zig");
 const data = @import("../data/mod.zig");
 const rec_mod = @import("../rec/mod.zig");
@@ -945,8 +947,8 @@ pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction:
     const allocator = std.heap.page_allocator;
     const page_obj = allocator.create(page_t) catch return null;
     page_obj.* = .{};
-    page_obj.page_no = state.next_page_no;
-    state.next_page_no += 1;
+    const page_no = state.next_page_no;
+    page_obj.page_no = page_no;
     page.page_init(page_obj);
     page_obj.header.level = level;
 
@@ -955,15 +957,24 @@ pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction:
         return null;
     };
     block.* = .{ .frame = page_obj, .page_zip = null };
-    if (btr_block_bytes_ensure(block) == null) {
-        btr_block_destroy(block);
-        return null;
-    }
-
-    state.pages.put(page_obj.page_no, block) catch {
+    const bytes = btr_block_bytes_ensure(block) orelse {
         btr_block_destroy(block);
         return null;
     };
+
+    if (fil.fil_tablespace_exists_in_mem(index.space) == compat.TRUE) {
+        buf_mod.buf_flush_init_for_writing(bytes.ptr, null, 0);
+        if (fil.fil_write_page(index.space, page_no, bytes.ptr) != fil.DB_SUCCESS) {
+            btr_block_destroy(block);
+            return null;
+        }
+    }
+
+    state.pages.put(page_no, block) catch {
+        btr_block_destroy(block);
+        return null;
+    };
+    state.next_page_no = page_no + 1;
 
     return block;
 }
@@ -3518,6 +3529,45 @@ test "btr page alloc free and size" {
     try std.testing.expectEqual(@as(ulint, 0), btr_get_size(index, 0));
 
     index_state_remove(index);
+}
+
+test "btr page alloc writes to disk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const prev_path = fil.fil_path_to_client_datadir;
+    fil.fil_path_to_client_datadir = base;
+    defer fil.fil_path_to_client_datadir = prev_path;
+
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+
+    var space_id: ulint = 0;
+    const create_err = fil.fil_create_new_single_table_tablespace(&space_id, "btralloc", compat.FALSE, 0, 4);
+    try std.testing.expectEqual(fil.DB_SUCCESS, create_err);
+
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    index.space = space_id;
+    defer allocator.destroy(index);
+    defer index_state_remove(index);
+
+    var mtr = mtr_t{};
+    const block = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    defer btr_page_free(index, block, &mtr);
+
+    var read_buf: [compat.UNIV_PAGE_SIZE]u8 = undefined;
+    @memset(read_buf[0..], 0);
+    try std.testing.expectEqual(
+        fil.DB_SUCCESS,
+        fil.fil_read_page(space_id, block.frame.page_no, read_buf[0..].ptr),
+    );
+
+    try std.testing.expectEqual(@as(usize, compat.UNIV_PAGE_SIZE), block.bytes.len);
+    try std.testing.expect(std.mem.eql(u8, read_buf[0..], block.bytes));
 }
 
 test "btr create root and free" {
