@@ -1295,16 +1295,38 @@ pub fn btr_estimate_n_rows_in_range(
     tuple2: *const dtuple_t,
     mode2: ulint,
 ) ib_int64_t {
-    _ = index;
-    _ = tuple1;
     _ = mode1;
-    _ = tuple2;
     _ = mode2;
-    return 0;
+    const key1 = dtuple_to_key(tuple1);
+    const key2 = dtuple_to_key(tuple2);
+    const min_key = if (key1 <= key2) key1 else key2;
+    const max_key = if (key1 <= key2) key2 else key1;
+
+    const block = descend_to_level(index, 0, true) orelse return 0;
+    var count: ib_int64_t = 0;
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+    while (rec_opt) |rec| {
+        if (rec.key >= min_key and rec.key <= max_key) {
+            count += 1;
+        }
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    return count;
 }
 
-pub fn btr_estimate_number_of_different_key_vals(index: *dict_index_t) void {
-    _ = index;
+pub fn btr_estimate_number_of_different_key_vals(index: *dict_index_t) ib_int64_t {
+    const block = descend_to_level(index, 0, true) orelse return 0;
+    var count: ib_int64_t = 0;
+    var last_key: ?i64 = null;
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+    while (rec_opt) |rec| {
+        if (last_key == null or rec.key != last_key.?) {
+            count += 1;
+            last_key = rec.key;
+        }
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    return count;
 }
 
 pub fn btr_cur_mark_extern_inherited_fields(
@@ -2247,6 +2269,48 @@ test "btr min rec mark" {
     var mtr = mtr_t{};
     btr_set_min_rec_mark(&rec, &mtr);
     try std.testing.expect(rec.min_rec_mark);
+}
+
+test "btr estimate helpers" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1300 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    const keys = [_]i64{ 1, 2, 2, 4, 5 };
+    for (keys) |key_val| {
+        var key = key_val;
+        var fields = [_]data.dfield_t{.{ .data = &key, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    var low_key: i64 = 2;
+    var high_key: i64 = 4;
+    var low_fields = [_]data.dfield_t{.{ .data = &low_key, .len = @intCast(@sizeOf(i64)) }};
+    var high_fields = [_]data.dfield_t{.{ .data = &high_key, .len = @intCast(@sizeOf(i64)) }};
+    var low_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = low_fields[0..] };
+    var high_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = high_fields[0..] };
+
+    const count = btr_estimate_n_rows_in_range(index, &low_tuple, 0, &high_tuple, 0);
+    try std.testing.expectEqual(@as(ib_int64_t, 3), count);
+
+    const distinct = btr_estimate_number_of_different_key_vals(index);
+    try std.testing.expectEqual(@as(ib_int64_t, 4), distinct);
+
+    index_state_remove(index);
 }
 
 test "btr page create and empty base records" {
