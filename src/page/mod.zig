@@ -203,6 +203,31 @@ pub fn page_bytes_insert_append(page: []u8, rec_bytes: []const u8) ?ulint {
     return heap_top;
 }
 
+pub fn page_bytes_reset(page: []u8) void {
+    @memset(page, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, 200);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_DIR_SLOTS, 0);
+    page_free_set_bytes(page.ptr, 0);
+    page_garbage_set_bytes(page.ptr, 0);
+}
+
+pub fn page_dir_insert_slot_bytes(page: [*]byte, pos: ulint, rec_offs: ulint) bool {
+    const n_slots = page_header_get_field_bytes(page, PAGE_N_DIR_SLOTS);
+    if (pos > n_slots) {
+        return false;
+    }
+    var i = n_slots;
+    while (i > pos) : (i -= 1) {
+        const prev_val = page_dir_get_nth_slot_val(page, i - 1);
+        page_dir_set_nth_slot(page, i, prev_val);
+    }
+    page_dir_set_nth_slot(page, pos, rec_offs);
+    page_header_set_field_bytes(page, PAGE_N_DIR_SLOTS, n_slots + 1);
+    return true;
+}
+
 pub fn page_rec_set_deleted_bytes(page: [*]byte, rec_offs: ulint, deleted: bool) void {
     const rec_ptr = page + @as(usize, @intCast(rec_offs));
     rec_mod.rec_set_deleted_flag_new(rec_ptr, if (deleted) 1 else 0);
@@ -370,6 +395,7 @@ pub const page_t = struct {
 pub const buf_block_t = struct {
     frame: *page_t,
     page_zip: ?*page_zip_des_t = null,
+    bytes: []u8 = &[_]u8{},
 };
 
 pub const page_cur_t = struct {
