@@ -448,8 +448,7 @@ pub fn btr_page_get_father(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_
     _ = btr_page_get_father_block(null, null, index, block, mtr, cursor);
 }
 
-pub fn btr_get_prev_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
-    _ = mtr;
+fn btr_get_prev_user_rec_raw(rec: ?*rec_t) ?*rec_t {
     const current = rec orelse return null;
     if (!current.is_infimum) {
         const prev = current.prev orelse return null;
@@ -464,8 +463,7 @@ pub fn btr_get_prev_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
     return if (prev_rec.is_infimum) null else prev_rec;
 }
 
-pub fn btr_get_next_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
-    _ = mtr;
+fn btr_get_next_user_rec_raw(rec: ?*rec_t) ?*rec_t {
     const current = rec orelse return null;
     if (!current.is_supremum) {
         const next = current.next orelse return null;
@@ -478,6 +476,34 @@ pub fn btr_get_next_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
     const next_page = next_block.frame;
     const next_rec = next_page.infimum.next orelse return null;
     return if (next_rec.is_supremum) null else next_rec;
+}
+
+pub fn btr_get_prev_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
+    _ = mtr;
+    var candidate = btr_get_prev_user_rec_raw(rec);
+    while (candidate) |cand| {
+        if (!cand.deleted) {
+            return cand;
+        }
+        candidate = btr_get_prev_user_rec_raw(cand);
+    }
+    return null;
+}
+
+pub fn btr_get_next_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
+    _ = mtr;
+    var candidate = btr_get_next_user_rec_raw(rec);
+    while (candidate) |cand| {
+        if (!cand.deleted) {
+            return cand;
+        }
+        candidate = btr_get_next_user_rec_raw(cand);
+    }
+    return null;
+}
+
+pub fn btr_rec_set_deleted_flag(rec: *rec_t, deleted: ibool) void {
+    rec.deleted = deleted != compat.FALSE;
 }
 
 pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction: byte, level: ulint, mtr: *mtr_t) ?*buf_block_t {
@@ -1085,10 +1111,10 @@ pub fn btr_cur_del_mark_set_clust_rec(
     mtr: *mtr_t,
 ) ulint {
     _ = flags;
-    _ = cursor;
-    _ = val;
     _ = thr;
     _ = mtr;
+    const rec = cursor.rec orelse return 1;
+    btr_rec_set_deleted_flag(rec, val);
     return 0;
 }
 
@@ -1112,17 +1138,17 @@ pub fn btr_cur_del_mark_set_sec_rec(
     mtr: *mtr_t,
 ) ulint {
     _ = flags;
-    _ = cursor;
-    _ = val;
     _ = thr;
     _ = mtr;
+    const rec = cursor.rec orelse return 1;
+    btr_rec_set_deleted_flag(rec, val);
     return 0;
 }
 
 pub fn btr_cur_del_unmark_for_ibuf(rec: *rec_t, page_zip: ?*page_zip_des_t, mtr: *mtr_t) void {
-    _ = rec;
     _ = page_zip;
     _ = mtr;
+    btr_rec_set_deleted_flag(rec, compat.FALSE);
 }
 
 pub fn btr_cur_compress_if_useful(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
@@ -1132,18 +1158,26 @@ pub fn btr_cur_compress_if_useful(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
 }
 
 pub fn btr_cur_optimistic_delete(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
-    _ = cursor;
-    _ = mtr;
-    return compat.FALSE;
+    const block = cursor.block orelse return compat.FALSE;
+    const rec = cursor.rec orelse return compat.FALSE;
+    if (rec.is_infimum or rec.is_supremum) {
+        return compat.FALSE;
+    }
+    const index = cursor.index orelse return compat.FALSE;
+    var page_cursor = page.page_cur_t{ .block = block, .rec = rec };
+    var offsets: ulint = 0;
+    page.page_cur_delete_rec(&page_cursor, index, &offsets, mtr);
+    cursor.rec = page_cursor.rec;
+    cursor.block = block;
+    return compat.TRUE;
 }
 
 pub fn btr_cur_pessimistic_delete(err: *ulint, has_reserved_extents: ibool, cursor: *btr_cur_t, rb_ctx: trx_rb_ctx, mtr: *mtr_t) ibool {
     _ = has_reserved_extents;
-    _ = cursor;
     _ = rb_ctx;
-    _ = mtr;
-    err.* = 0;
-    return compat.FALSE;
+    const ok = btr_cur_optimistic_delete(cursor, mtr);
+    err.* = if (ok == compat.TRUE) 0 else 1;
+    return ok;
 }
 
 pub fn btr_estimate_n_rows_in_range(
@@ -1822,6 +1856,89 @@ test "btr attach pages and delete node pointer" {
     btr_node_ptr_delete(index, extra, &mtr);
     try std.testing.expectEqual(@as(ulint, 2), new_root.frame.header.n_recs);
     try std.testing.expect(extra.frame.parent_block == null);
+
+    index_state_remove(index);
+}
+
+test "btr delete mark and delete visibility" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 700 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+
+    var key_val: i64 = 1;
+    while (key_val <= 3) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const rec1 = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    const rec2 = btr_get_next_user_rec(rec1, null) orelse return error.OutOfMemory;
+    const rec3 = btr_get_next_user_rec(rec2, null) orelse return error.OutOfMemory;
+
+    var thr = que_thr_t{};
+    cursor.rec = rec2;
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_del_mark_set_sec_rec(0, &cursor, compat.TRUE, &thr, &mtr));
+    try std.testing.expect(rec2.deleted);
+
+    var values = std.ArrayList(i64).init(allocator);
+    defer values.deinit();
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
+    while (rec_opt) |rec| {
+        values.append(rec.key) catch return error.OutOfMemory;
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    const expected_marked = [_]i64{ 1, 3 };
+    try std.testing.expectEqualSlices(i64, expected_marked[0..], values.items);
+
+    btr_cur_del_unmark_for_ibuf(rec2, null, &mtr);
+    try std.testing.expect(!rec2.deleted);
+    values.clearRetainingCapacity();
+    rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
+    while (rec_opt) |rec| {
+        values.append(rec.key) catch return error.OutOfMemory;
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    const expected_unmarked = [_]i64{ 1, 2, 3 };
+    try std.testing.expectEqualSlices(i64, expected_unmarked[0..], values.items);
+
+    cursor.rec = rec2;
+    try std.testing.expectEqual(compat.TRUE, btr_cur_optimistic_delete(&cursor, &mtr));
+    values.clearRetainingCapacity();
+    rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
+    while (rec_opt) |rec| {
+        values.append(rec.key) catch return error.OutOfMemory;
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    const expected_deleted = [_]i64{ 1, 3 };
+    try std.testing.expectEqualSlices(i64, expected_deleted[0..], values.items);
+
+    cursor.rec = rec3;
+    var err: ulint = 0;
+    try std.testing.expectEqual(compat.TRUE, btr_cur_pessimistic_delete(&err, compat.FALSE, &cursor, .TRX_RB_NONE, &mtr));
+    try std.testing.expectEqual(@as(ulint, 0), err);
+    values.clearRetainingCapacity();
+    rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
+    while (rec_opt) |rec| {
+        values.append(rec.key) catch return error.OutOfMemory;
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    const expected_final = [_]i64{1};
+    try std.testing.expectEqualSlices(i64, expected_final[0..], values.items);
 
     index_state_remove(index);
 }
