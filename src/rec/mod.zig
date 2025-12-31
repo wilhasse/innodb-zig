@@ -105,24 +105,28 @@ fn rec_ptr_mut(rec: [*]byte, offs: ulint) [*]byte {
 
 pub fn rec_get_bit_field_1(rec: [*]const byte, offs: ulint, mask: ulint, shift: ulint) ulint {
     const ptr = rec_ptr(rec, offs);
-    return (mach.mach_read_from_1(ptr) & mask) >> shift;
+    const shift_amt: u6 = @intCast(shift);
+    return (@as(ulint, mach.mach_read_from_1(ptr)) & mask) >> shift_amt;
 }
 
 pub fn rec_set_bit_field_1(rec: [*]byte, val: ulint, offs: ulint, mask: ulint, shift: ulint) void {
     const ptr = rec_ptr_mut(rec, offs);
     const current = mach.mach_read_from_1(ptr);
-    mach.mach_write_to_1(ptr, (current & ~mask) | (val << shift));
+    const shift_amt: u6 = @intCast(shift);
+    mach.mach_write_to_1(ptr, @as(u8, @intCast((@as(ulint, current) & ~mask) | (val << shift_amt))));
 }
 
 pub fn rec_get_bit_field_2(rec: [*]const byte, offs: ulint, mask: ulint, shift: ulint) ulint {
     const ptr = rec_ptr(rec, offs);
-    return (mach.mach_read_from_2(ptr) & mask) >> shift;
+    const shift_amt: u6 = @intCast(shift);
+    return (@as(ulint, mach.mach_read_from_2(ptr)) & mask) >> shift_amt;
 }
 
 pub fn rec_set_bit_field_2(rec: [*]byte, val: ulint, offs: ulint, mask: ulint, shift: ulint) void {
     const ptr = rec_ptr_mut(rec, offs);
     const current = mach.mach_read_from_2(ptr);
-    mach.mach_write_to_2(ptr, (current & ~mask) | (val << shift));
+    const shift_amt: u6 = @intCast(shift);
+    mach.mach_write_to_2(ptr, @as(u16, @intCast((@as(ulint, current) & ~mask) | (val << shift_amt))));
 }
 
 pub fn rec_get_status(rec: [*]const byte) ulint {
@@ -446,7 +450,7 @@ pub fn cmp_dtuple_rec_with_match(
         const rec_info = rec_get_info_bits(rec, rec_offs_comp(offsets) != 0);
         const tup_info = data.dtuple_get_info_bits(dtuple);
         if ((rec_info & REC_INFO_MIN_REC_FLAG) != 0) {
-            const ret = if ((tup_info & REC_INFO_MIN_REC_FLAG) == 0) 1 else 0;
+            const ret: i32 = if ((tup_info & REC_INFO_MIN_REC_FLAG) == 0) 1 else 0;
             matched_fields.* = cur_field;
             matched_bytes.* = cur_bytes;
             return ret;

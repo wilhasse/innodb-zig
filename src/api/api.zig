@@ -8,6 +8,7 @@ const dict = @import("../dict/mod.zig");
 const errors = @import("../ut/errors.zig");
 const fil = @import("../fil/mod.zig");
 const fsp = @import("../fsp/mod.zig");
+const rec_mod = @import("../rec/mod.zig");
 const log = @import("../ut/log.zig");
 const log_mod = @import("../log/mod.zig");
 const os_file = @import("../os/file.zig");
@@ -1697,6 +1698,190 @@ fn tupleCheckNotNull(tuple: *Tuple) bool {
     return true;
 }
 
+const RecBytes = struct {
+    buf: []u8,
+    offset: rec_mod.ulint,
+};
+
+const RecSizes = struct {
+    header: rec_mod.ulint,
+    payload: rec_mod.ulint,
+};
+
+fn bitsInBytes(n: rec_mod.ulint) rec_mod.ulint {
+    return (n + 7) / 8;
+}
+
+fn fieldMetaFromColumnMeta(meta: ib_col_meta_t) rec_mod.FieldMeta {
+    const not_null_flag = @intFromEnum(ib_col_attr_t.IB_COL_NOT_NULL);
+    const attr_val = @intFromEnum(meta.attr);
+    var out = rec_mod.FieldMeta{
+        .fixed_len = 0,
+        .max_len = 0,
+        .nullable = (attr_val & not_null_flag) == 0,
+        .is_blob = meta.type == .IB_BLOB,
+    };
+
+    switch (meta.type) {
+        .IB_INT, .IB_FLOAT, .IB_DOUBLE, .IB_SYS => {
+            out.fixed_len = @as(rec_mod.ulint, @intCast(meta.type_len));
+        },
+        .IB_CHAR, .IB_BINARY, .IB_CHAR_ANYCHARSET => {
+            out.fixed_len = @as(rec_mod.ulint, @intCast(meta.type_len));
+        },
+        .IB_VARCHAR, .IB_VARBINARY, .IB_VARCHAR_ANYCHARSET, .IB_DECIMAL => {
+            out.max_len = @as(rec_mod.ulint, @intCast(meta.type_len));
+        },
+        .IB_BLOB => {
+            out.max_len = @as(rec_mod.ulint, @intCast(meta.type_len));
+            out.is_blob = true;
+        },
+    }
+
+    return out;
+}
+
+fn fillFieldMetaFromTuple(tuple: *Tuple, metas: []rec_mod.FieldMeta) void {
+    for (tuple.cols, 0..) |col, idx| {
+        metas[idx] = fieldMetaFromColumnMeta(col.meta);
+    }
+}
+
+fn recCompactSizes(fields: []const rec_mod.FieldMeta, tuple: *Tuple) ?RecSizes {
+    var payload: rec_mod.ulint = 0;
+    var len_bytes: rec_mod.ulint = 0;
+    var n_nullable: rec_mod.ulint = 0;
+
+    for (fields, 0..) |field, i| {
+        if (field.nullable) {
+            n_nullable += 1;
+        }
+        const col = tuple.cols[i];
+        const data = col.data orelse {
+            if (!field.nullable) {
+                return null;
+            }
+            continue;
+        };
+        const len = @as(rec_mod.ulint, @intCast(data.len));
+        if (field.fixed_len != 0) {
+            if (len != field.fixed_len) {
+                return null;
+            }
+            payload += field.fixed_len;
+            continue;
+        }
+
+        payload += len;
+        if (field.max_len > 255 or field.is_blob) {
+            len_bytes += if (len < 128) 1 else 2;
+        } else {
+            len_bytes += 1;
+        }
+    }
+
+    const null_bytes = bitsInBytes(n_nullable);
+    const header = rec_mod.REC_N_NEW_EXTRA_BYTES + 1 + null_bytes + len_bytes;
+    return .{ .header = header, .payload = payload };
+}
+
+fn encodeTupleToRecBytes(tuple: *Tuple, allocator: std.mem.Allocator) ?RecBytes {
+    const n_fields = tuple.cols.len;
+    if (n_fields == 0) {
+        return null;
+    }
+
+    const metas = allocator.alloc(rec_mod.FieldMeta, n_fields) catch return null;
+    defer allocator.free(metas);
+    fillFieldMetaFromTuple(tuple, metas);
+
+    const sizes = recCompactSizes(metas, tuple) orelse return null;
+    const total = @as(usize, @intCast(sizes.header + sizes.payload));
+    const buf = allocator.alloc(u8, total) catch return null;
+
+    const fields = allocator.alloc(data_mod.dfield_t, n_fields) catch {
+        allocator.free(buf);
+        return null;
+    };
+    defer allocator.free(fields);
+
+    for (tuple.cols, 0..) |col, idx| {
+        fields[idx] = .{};
+        if (col.data) |data| {
+            fields[idx].data = @ptrCast(data.ptr);
+            fields[idx].len = @intCast(data.len);
+            fields[idx].ext = false;
+        } else {
+            fields[idx].data = null;
+            fields[idx].len = data_mod.UNIV_SQL_NULL_U32;
+            fields[idx].ext = false;
+        }
+    }
+
+    var dtuple = data_mod.dtuple_t{
+        .n_fields = @as(rec_mod.ulint, @intCast(n_fields)),
+        .n_fields_cmp = @as(rec_mod.ulint, @intCast(n_fields)),
+        .fields = fields[0..],
+    };
+    const rec_ptr = @as([*]u8, @ptrCast(buf[@as(usize, @intCast(sizes.header))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, metas, &dtuple);
+
+    return .{ .buf = buf, .offset = sizes.header };
+}
+
+fn assignRecBytes(rec: *page.rec_t, tuple: *Tuple) bool {
+    const new_bytes = encodeTupleToRecBytes(tuple, std.heap.page_allocator) orelse return false;
+    if (rec.rec_bytes) |old| {
+        std.heap.page_allocator.free(old);
+    }
+    rec.rec_bytes = new_bytes.buf;
+    rec.rec_offset = new_bytes.offset;
+    return true;
+}
+
+fn decodeRecToTuple(rec: *page.rec_t, tuple: *Tuple) bool {
+    const rec_bytes = rec.rec_bytes orelse return false;
+    if (rec.rec_offset >= rec_bytes.len) {
+        return false;
+    }
+    const rec_ptr = @as([*]const u8, @ptrCast(rec_bytes[@as(usize, @intCast(rec.rec_offset))..].ptr));
+    const n_fields = tuple.cols.len;
+    if (n_fields == 0) {
+        return false;
+    }
+
+    const allocator = tuple.allocator;
+    const metas = allocator.alloc(rec_mod.FieldMeta, n_fields) catch return false;
+    defer allocator.free(metas);
+    fillFieldMetaFromTuple(tuple, metas);
+
+    const needed = @as(usize, @intCast(rec_mod.REC_OFFS_HEADER_SIZE + 1 + n_fields));
+    const offsets = allocator.alloc(rec_mod.ulint, needed) catch return false;
+    defer allocator.free(offsets);
+    rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, metas, offsets);
+
+    for (tuple.cols, 0..) |*col, idx| {
+        var len: rec_mod.ulint = 0;
+        const data_ptr = rec_mod.rec_get_nth_field(rec_ptr, offsets, @intCast(idx), &len);
+        if (len == compat.UNIV_SQL_NULL) {
+            if (col.data) |old| {
+                allocator.free(old);
+            }
+            col.data = null;
+            continue;
+        }
+        const size = @as(usize, @intCast(len));
+        const buf = allocator.alloc(u8, size) catch return false;
+        std.mem.copyForwards(u8, buf, data_ptr[0..size]);
+        if (col.data) |old| {
+            allocator.free(old);
+        }
+        col.data = buf;
+    }
+
+    return true;
+}
+
 fn catalogClusteredIndex(table: *CatalogTable) ?*CatalogIndex {
     for (table.indexes.items) |*idx| {
         if (idx.clustered) {
@@ -1859,6 +2044,13 @@ fn btrInsertTupleIntoIndex(table: *const CatalogTable, index: *CatalogIndex, tup
     var field: data_mod.dfield_t = .{};
     var dtuple: data_mod.dtuple_t = .{};
     const entry = btrTupleForKey(&key_storage, &dtuple, &field);
+    const rec_bytes = encodeTupleToRecBytes(tuple, std.heap.page_allocator) orelse return null;
+    var bytes_assigned = false;
+    defer {
+        if (!bytes_assigned) {
+            std.heap.page_allocator.free(rec_bytes.buf);
+        }
+    }
     const block = btr.btr_find_leaf_for_key(index.btr_index, key_val) orelse return null;
     var cursor = btr.btr_cur_t{ .index = index.btr_index, .block = block, .rec = null, .opened = true };
     var rec_out: ?*page.rec_t = null;
@@ -1869,6 +2061,9 @@ fn btrInsertTupleIntoIndex(table: *const CatalogTable, index: *CatalogIndex, tup
     }
     const rec = rec_out orelse return null;
     rec.payload = @ptrCast(tuple);
+    rec.rec_bytes = rec_bytes.buf;
+    rec.rec_offset = rec_bytes.offset;
+    bytes_assigned = true;
     return rec;
 }
 
@@ -2615,8 +2810,11 @@ pub fn ib_cursor_read_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
     if (!cursor.positioned) {
         return .DB_RECORD_NOT_FOUND;
     }
-    const row = cursorCurrentRow(cursor) orelse return .DB_RECORD_NOT_FOUND;
-    return ib_tuple_copy(tuple, row);
+    const rec = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (!decodeRecToTuple(rec, tuple)) {
+        return .DB_RECORD_NOT_FOUND;
+    }
+    return .DB_SUCCESS;
 }
 
 pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
@@ -2704,6 +2902,11 @@ pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl
     var positioned_rec: ?*page.rec_t = null;
     for (table.indexes.items, 0..) |*idx, i| {
         if (!key_changed[i]) {
+            if (btrFindRecForTuple(idx, row)) |same_rec| {
+                if (!assignRecBytes(same_rec, row)) {
+                    return .DB_OUT_OF_MEMORY;
+                }
+            }
             if (active != null and active.? == idx) {
                 positioned_rec = cursor.position;
             } else if (idx.clustered and positioned_rec == null) {
@@ -2832,15 +3035,17 @@ pub fn ib_cursor_moveto(
     }
     const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
     const index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
+    const scratch = tupleCreateFromCatalogColumns(@constCast(table), .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
+    defer tupleDestroy(scratch);
 
     var candidate: ?*page.rec_t = null;
     var rec_opt = btrIndexFirstRec(index);
     while (rec_opt) |rec| {
-        const row = recPayloadTuple(rec) orelse {
+        if (!decodeRecToTuple(rec, scratch)) {
             rec_opt = btr.btr_get_next_user_rec(rec, null);
             continue;
-        };
-        const cmp = tupleCompareByIndexFirst(table, index, tuple, row);
+        }
+        const cmp = tupleCompareByIndexFirst(table, index, tuple, scratch);
         switch (ib_srch_mode) {
             .IB_CUR_GE => {
                 if (cmp <= 0) {
@@ -2876,8 +3081,10 @@ pub fn ib_cursor_moveto(
     };
     cursor.position = chosen;
     cursor.positioned = true;
-    const row = recPayloadTuple(chosen) orelse return .DB_RECORD_NOT_FOUND;
-    result.* = tupleCompareByIndexFirst(table, index, tuple, row);
+    if (!decodeRecToTuple(chosen, scratch)) {
+        return .DB_RECORD_NOT_FOUND;
+    }
+    result.* = tupleCompareByIndexFirst(table, index, tuple, scratch);
     return .DB_SUCCESS;
 }
 

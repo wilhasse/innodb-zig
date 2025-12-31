@@ -37,7 +37,7 @@ pub const modules = [_]Module{
     .{ .name = "eval", .c_dir = "eval", .zig_path = "src/eval", .depends_on = &[_][]const u8{ "data", "mach", "pars", "row", "que", "mem", "ut" } },
     .{ .name = "ddl", .c_dir = "ddl", .zig_path = "src/ddl", .depends_on = &[_][]const u8{ "dict", "row", "trx", "que", "mem", "ut" } },
     .{ .name = "usr", .c_dir = "usr", .zig_path = "src/usr", .depends_on = &[_][]const u8{ "trx", "mem", "ut" } },
-    .{ .name = "api", .c_dir = "api", .zig_path = "src/api", .depends_on = &[_][]const u8{ "srv", "trx", "dict", "mem", "ut" } },
+    .{ .name = "api", .c_dir = "api", .zig_path = "src/api", .depends_on = &[_][]const u8{ "srv", "trx", "dict", "mem", "rec", "ut" } },
     .{ .name = "ha", .c_dir = "ha", .zig_path = "src/ha", .depends_on = &[_][]const u8{ "api", "srv", "mem", "ut" } },
     .{ .name = "srv", .c_dir = "srv", .zig_path = "src/srv", .depends_on = &[_][]const u8{ "os", "sync", "thr", "log", "fil", "buf", "trx", "dict", "row", "mem", "ut" } },
 };

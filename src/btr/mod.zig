@@ -273,6 +273,8 @@ fn page_find_insert_after(page_obj: *page_t, key: i64) *rec_t {
 const SplitEntry = struct {
     key: i64,
     payload: ?*anyopaque,
+    rec_bytes: ?[]u8,
+    rec_offset: ulint,
     deleted: bool,
     min_rec_mark: bool,
     extern_fields: []page.extern_field_t,
@@ -311,6 +313,8 @@ fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict
         rec.* = .{
             .key = entry.key,
             .payload = entry.payload,
+            .rec_bytes = entry.rec_bytes,
+            .rec_offset = entry.rec_offset,
             .deleted = entry.deleted,
             .min_rec_mark = entry.min_rec_mark,
             .extern_fields = entry.extern_fields,
@@ -345,6 +349,8 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
             entries.append(.{
                 .key = new_key,
                 .payload = null,
+                .rec_bytes = null,
+                .rec_offset = 0,
                 .deleted = false,
                 .min_rec_mark = false,
                 .extern_fields = &[_]page.extern_field_t{},
@@ -357,6 +363,8 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
         entries.append(.{
             .key = node.key,
             .payload = node.payload,
+            .rec_bytes = node.rec_bytes,
+            .rec_offset = node.rec_offset,
             .deleted = node.deleted,
             .min_rec_mark = node.min_rec_mark,
             .extern_fields = node.extern_fields,
@@ -370,6 +378,8 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
         entries.append(.{
             .key = new_key,
             .payload = null,
+            .rec_bytes = null,
+            .rec_offset = 0,
             .deleted = false,
             .min_rec_mark = false,
             .extern_fields = &[_]page.extern_field_t{},

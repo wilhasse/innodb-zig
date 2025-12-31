@@ -71,6 +71,8 @@ pub const rec_t = struct {
     min_rec_mark: bool = false,
     key: i64 = 0,
     payload: ?*anyopaque = null,
+    rec_bytes: ?[]u8 = null,
+    rec_offset: ulint = 0,
     child_page_no: ulint = 0,
     child_block: ?*buf_block_t = null,
     extern_fields: []extern_field_t = &[_]extern_field_t{},
@@ -358,6 +360,8 @@ pub fn page_copy_rec_list_end_to_created_page(new_page: *page_t, rec: *rec_t, in
         copy.* = .{
             .key = node.key,
             .payload = node.payload,
+            .rec_bytes = node.rec_bytes,
+            .rec_offset = node.rec_offset,
             .deleted = node.deleted,
             .min_rec_mark = node.min_rec_mark,
             .extern_fields = node.extern_fields,
@@ -524,6 +528,8 @@ pub fn page_copy_rec_list_start(new_block: *buf_block_t, block: *buf_block_t, re
         copy.* = .{
             .key = node.key,
             .payload = node.payload,
+            .rec_bytes = node.rec_bytes,
+            .rec_offset = node.rec_offset,
             .deleted = node.deleted,
             .min_rec_mark = node.min_rec_mark,
             .extern_fields = node.extern_fields,
