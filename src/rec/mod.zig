@@ -46,6 +46,12 @@ pub const REC_OFFS_HEADER_SIZE: ulint = if (builtin.mode == .Debug) 4 else 2;
 pub const REC_OFFS_NORMAL_SIZE: ulint = 100;
 pub const REC_OFFS_SMALL_SIZE: ulint = 10;
 
+// Offsets flags.
+pub const REC_OFFS_COMPACT: ulint = 1 << 31;
+pub const REC_OFFS_SQL_NULL: ulint = 1 << 31;
+pub const REC_OFFS_EXTERNAL: ulint = 1 << 30;
+pub const REC_OFFS_MASK: ulint = REC_OFFS_EXTERNAL - 1;
+
 // Bit-field offsets and masks.
 pub const REC_NEXT: ulint = 2;
 pub const REC_NEXT_MASK: ulint = 0xFFFF;
@@ -205,6 +211,45 @@ pub fn rec_set_heap_no_new(rec: [*]byte, heap_no: ulint) void {
     rec_set_bit_field_2(rec, heap_no, REC_NEW_HEAP_NO, REC_HEAP_NO_MASK, REC_HEAP_NO_SHIFT);
 }
 
+pub fn rec_offs_get_n_alloc(offsets: []const ulint) ulint {
+    return offsets[0];
+}
+
+pub fn rec_offs_set_n_alloc(offsets: []ulint, n_alloc: ulint) void {
+    offsets[0] = n_alloc;
+}
+
+pub fn rec_offs_n_fields(offsets: []const ulint) ulint {
+    return offsets[1];
+}
+
+pub fn rec_offs_set_n_fields(offsets: []ulint, n_fields: ulint) void {
+    offsets[1] = n_fields;
+}
+
+fn rec_offs_base(offsets: []ulint) []ulint {
+    return offsets[REC_OFFS_HEADER_SIZE..];
+}
+
+pub fn rec_init_offsets_fixed(field_lens: []const ulint, offsets: []ulint, compact: bool) void {
+    const needed = @as(usize, @intCast(REC_OFFS_HEADER_SIZE + 1 + field_lens.len));
+    std.debug.assert(offsets.len >= needed);
+    rec_offs_set_n_fields(offsets, @intCast(field_lens.len));
+    rec_offs_set_n_alloc(offsets, @intCast(offsets.len));
+
+    var total: ulint = 0;
+    const base = rec_offs_base(offsets);
+    base[0] = if (compact)
+        (REC_N_NEW_EXTRA_BYTES | REC_OFFS_COMPACT)
+    else
+        REC_N_OLD_EXTRA_BYTES;
+
+    for (field_lens, 0..) |len, i| {
+        total += len;
+        base[1 + i] = total;
+    }
+}
+
 test "rec constants match C defaults" {
     try std.testing.expectEqual(@as(ulint, 1023), REC_MAX_N_FIELDS);
     try std.testing.expectEqual(@as(ulint, 16383), REC_MAX_HEAP_NO);
@@ -238,4 +283,16 @@ test "rec header bit helpers (compact)" {
     try std.testing.expectEqual(@as(ibool, 1), rec_get_min_rec_flag(rec, true));
     rec_set_min_rec_flag_new(rec, 0);
     try std.testing.expectEqual(@as(ibool, 0), rec_get_min_rec_flag(rec, true));
+}
+
+test "rec offsets fixed-length" {
+    var offsets = [_]ulint{0} ** 16;
+    const lens = [_]ulint{ 3, 4, 2 };
+
+    rec_init_offsets_fixed(&lens, offsets[0..], true);
+    const base = rec_offs_base(offsets[0..]);
+    try std.testing.expectEqual(@as(ulint, REC_N_NEW_EXTRA_BYTES | REC_OFFS_COMPACT), base[0]);
+    try std.testing.expectEqual(@as(ulint, 3), base[1]);
+    try std.testing.expectEqual(@as(ulint, 7), base[2]);
+    try std.testing.expectEqual(@as(ulint, 9), base[3]);
 }
