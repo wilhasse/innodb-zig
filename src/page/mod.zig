@@ -748,13 +748,246 @@ pub fn page_cur_delete_rec(cursor: *page_cur_t, index: *dict_index_t, offsets: *
     cursor.rec = next;
 }
 
-pub fn page_cur_search(block: *const buf_block_t, index: *const dict_index_t, tuple: *const dtuple_t, mode: ulint, cursor: *page_cur_t) ulint {
+fn tuple_to_key_simple(tuple: *const dtuple_t) i64 {
+    if (tuple.n_fields == 0) {
+        return 0;
+    }
+    const field = tuple.fields[0];
+    const data_ptr = field.data orelse return 0;
+    if (field.len == data.UNIV_SQL_NULL_U32) {
+        return 0;
+    }
+    return switch (field.len) {
+        4 => @as(i64, @intCast(@as(*const i32, @ptrCast(@alignCast(data_ptr))).*)),
+        8 => @as(*const i64, @ptrCast(@alignCast(data_ptr))).*,
+        else => 0,
+    };
+}
+
+fn build_tuple_meta(tuple: *const dtuple_t, allocator: std.mem.Allocator) ?[]rec_mod.FieldMeta {
+    const n_fields = @as(usize, @intCast(tuple.n_fields));
+    if (n_fields == 0) {
+        return null;
+    }
+    const metas = allocator.alloc(rec_mod.FieldMeta, n_fields) catch return null;
+    var i: usize = 0;
+    while (i < n_fields) : (i += 1) {
+        const field = data.dtuple_get_nth_field(tuple, @intCast(i));
+        const len = data.dfield_get_len(field);
+        if (len == compat.UNIV_SQL_NULL) {
+            metas[i] = .{ .fixed_len = 0, .max_len = 0, .nullable = true };
+        } else {
+            metas[i] = .{ .fixed_len = len, .max_len = 0, .nullable = false };
+        }
+    }
+    return metas;
+}
+
+fn rec_data_ptr(block: *const buf_block_t, rec: *const rec_t) ?[*]const byte {
+    if (rec.rec_page_offset != 0 and block.bytes.len != 0) {
+        const off = @as(usize, @intCast(rec.rec_page_offset));
+        if (off < block.bytes.len) {
+            return @as([*]const byte, @ptrCast(block.bytes[off..].ptr));
+        }
+    }
+    if (rec.rec_bytes) |bytes| {
+        if (rec.rec_offset != 0 and rec.rec_offset <= bytes.len) {
+            const start = @as(usize, @intCast(rec.rec_offset));
+            return @as([*]const byte, @ptrCast(bytes[start..].ptr));
+        }
+    }
+    return null;
+}
+
+fn rec_is_node_ptr(rec: *const rec_t, rec_ptr: ?[*]const byte) bool {
+    if (rec.child_block != null or rec.child_page_no != 0) {
+        return true;
+    }
+    if (rec_ptr) |ptr| {
+        return rec_mod.rec_get_status(ptr) == rec_mod.REC_STATUS_NODE_PTR;
+    }
+    return false;
+}
+
+fn tuple_key_cmp(tuple: *const dtuple_t, rec: *const rec_t, matched_fields: ?*ulint, matched_bytes: ?*ulint) i32 {
+    if (matched_fields) |ptr| {
+        ptr.* = 0;
+    }
+    if (matched_bytes) |ptr| {
+        ptr.* = 0;
+    }
+    const key = tuple_to_key_simple(tuple);
+    if (key < rec.key) {
+        return -1;
+    }
+    if (key > rec.key) {
+        return 1;
+    }
+    return 0;
+}
+
+fn compare_tuple_rec(
+    tuple: *const dtuple_t,
+    rec: *const rec_t,
+    block: *const buf_block_t,
+    tuple_meta: ?[]const rec_mod.FieldMeta,
+    allocator: std.mem.Allocator,
+    matched_fields: ?*ulint,
+    matched_bytes: ?*ulint,
+) i32 {
+    if (data.dtuple_get_n_fields_cmp(tuple) == 0) {
+        if (matched_fields) |ptr| {
+            ptr.* = 0;
+        }
+        if (matched_bytes) |ptr| {
+            ptr.* = 0;
+        }
+        return -1;
+    }
+
+    const rec_ptr = rec_data_ptr(block, rec) orelse return tuple_key_cmp(tuple, rec, matched_fields, matched_bytes);
+    var node_meta_storage = [_]rec_mod.FieldMeta{
+        .{ .fixed_len = @sizeOf(i64), .nullable = false },
+        .{ .fixed_len = @sizeOf(u32), .nullable = false },
+    };
+    const meta = if (rec_is_node_ptr(rec, rec_ptr))
+        node_meta_storage[0..]
+    else
+        tuple_meta orelse return tuple_key_cmp(tuple, rec, matched_fields, matched_bytes);
+
+    if (meta.len == 0) {
+        return tuple_key_cmp(tuple, rec, matched_fields, matched_bytes);
+    }
+
+    const needed = @as(usize, @intCast(rec_mod.REC_OFFS_HEADER_SIZE + 1 + @as(ulint, @intCast(meta.len))));
+    var offsets_buf = [_]ulint{0} ** rec_mod.REC_OFFS_NORMAL_SIZE;
+    var offsets: []ulint = offsets_buf[0..];
+    var heap_offsets: ?[]ulint = null;
+    if (needed > offsets_buf.len) {
+        heap_offsets = allocator.alloc(ulint, needed) catch return tuple_key_cmp(tuple, rec, matched_fields, matched_bytes);
+        offsets = heap_offsets.?;
+    } else {
+        offsets = offsets_buf[0..needed];
+    }
+    defer if (heap_offsets) |offs| allocator.free(offs);
+
+    rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, meta, offsets);
+    var mfields: ulint = 0;
+    var mbytes: ulint = 0;
+    const cmp = rec_mod.cmp_dtuple_rec_with_match(null, tuple, rec_ptr, offsets, &mfields, &mbytes);
+    if (matched_fields) |ptr| {
+        ptr.* = mfields;
+    }
+    if (matched_bytes) |ptr| {
+        ptr.* = mbytes;
+    }
+    return cmp;
+}
+
+fn page_cur_search_impl(
+    block: *const buf_block_t,
+    index: *const dict_index_t,
+    tuple: *const dtuple_t,
+    mode: ulint,
+    cursor: *page_cur_t,
+    matched_fields: ?*ulint,
+    matched_bytes: ?*ulint,
+) void {
     _ = index;
-    _ = tuple;
-    _ = mode;
+    if (matched_fields) |ptr| {
+        ptr.* = 0;
+    }
+    if (matched_bytes) |ptr| {
+        ptr.* = 0;
+    }
+    const effective_mode = switch (mode) {
+        PAGE_CUR_G, PAGE_CUR_GE, PAGE_CUR_L, PAGE_CUR_LE => mode,
+        else => PAGE_CUR_GE,
+    };
+
     const page = block.frame;
     const first = page.infimum.next orelse &page.supremum;
-    page_cur_position(first, block, cursor);
+    if (first.is_supremum) {
+        if (effective_mode == PAGE_CUR_L or effective_mode == PAGE_CUR_LE) {
+            page_cur_set_before_first(block, cursor);
+        } else {
+            page_cur_set_after_last(block, cursor);
+        }
+        return;
+    }
+
+    if (data.dtuple_get_n_fields_cmp(tuple) == 0) {
+        if (effective_mode == PAGE_CUR_L or effective_mode == PAGE_CUR_LE) {
+            page_cur_set_before_first(block, cursor);
+        } else {
+            page_cur_position(first, block, cursor);
+        }
+        return;
+    }
+
+    const allocator = std.heap.page_allocator;
+    const tuple_meta = build_tuple_meta(tuple, allocator);
+    defer if (tuple_meta) |meta| allocator.free(meta);
+
+    if (effective_mode == PAGE_CUR_GE or effective_mode == PAGE_CUR_G) {
+        var current_opt: ?*rec_t = first;
+        while (current_opt) |current| {
+            if (current.is_supremum) {
+                break;
+            }
+            const cmp = compare_tuple_rec(tuple, current, block, tuple_meta, allocator, null, null);
+            if (cmp < 0 or (cmp == 0 and effective_mode == PAGE_CUR_GE)) {
+                page_cur_position(current, block, cursor);
+                if (matched_fields != null or matched_bytes != null) {
+                    _ = compare_tuple_rec(tuple, current, block, tuple_meta, allocator, matched_fields, matched_bytes);
+                }
+                return;
+            }
+            current_opt = current.next;
+        }
+        page_cur_set_after_last(block, cursor);
+        return;
+    }
+
+    var candidate: ?*rec_t = null;
+    var current_opt: ?*rec_t = first;
+    while (current_opt) |current| {
+        if (current.is_supremum) {
+            break;
+        }
+        const cmp = compare_tuple_rec(tuple, current, block, tuple_meta, allocator, null, null);
+        if (cmp < 0) {
+            break;
+        }
+        if (cmp == 0) {
+            if (effective_mode == PAGE_CUR_LE) {
+                candidate = current;
+            } else {
+                const prev = current.prev;
+                if (prev != null and !prev.?.is_infimum) {
+                    candidate = prev.?;
+                } else {
+                    candidate = null;
+                }
+            }
+            break;
+        }
+        candidate = current;
+        current_opt = current.next;
+    }
+
+    if (candidate) |rec| {
+        page_cur_position(rec, block, cursor);
+        if (matched_fields != null or matched_bytes != null) {
+            _ = compare_tuple_rec(tuple, rec, block, tuple_meta, allocator, matched_fields, matched_bytes);
+        }
+    } else {
+        page_cur_set_before_first(block, cursor);
+    }
+}
+
+pub fn page_cur_search(block: *const buf_block_t, index: *const dict_index_t, tuple: *const dtuple_t, mode: ulint, cursor: *page_cur_t) ulint {
+    page_cur_search_impl(block, index, tuple, mode, cursor, null, null);
     return 0;
 }
 
@@ -769,16 +1002,9 @@ pub fn page_cur_search_with_match(
     ilow_matched_bytes: *ulint,
     cursor: *page_cur_t,
 ) void {
-    _ = index;
-    _ = tuple;
-    _ = mode;
-    iup_matched_fields.* = 0;
-    iup_matched_bytes.* = 0;
-    ilow_matched_fields.* = 0;
-    ilow_matched_bytes.* = 0;
-    const page = block.frame;
-    const first = page.infimum.next orelse &page.supremum;
-    page_cur_position(first, block, cursor);
+    page_cur_search_impl(block, index, tuple, mode, cursor, ilow_matched_fields, ilow_matched_bytes);
+    iup_matched_fields.* = ilow_matched_fields.*;
+    iup_matched_bytes.* = ilow_matched_bytes.*;
 }
 
 pub fn page_cur_open_on_rnd_user_rec(block: *const buf_block_t, cursor: *page_cur_t) void {
@@ -1161,6 +1387,63 @@ test "page cursor open on rnd user rec" {
 
     page_cur_open_on_rnd_user_rec(&block, &cursor);
     try std.testing.expect(cursor.rec == &rec1);
+}
+
+test "page cursor search uses record bytes" {
+    var page = page_t{};
+    page_init(&page);
+
+    var bytes = [_]u8{0} ** compat.UNIV_PAGE_SIZE;
+    page_bytes_reset(bytes[0..]);
+
+    var block = buf_block_t{ .frame = &page, .bytes = bytes[0..] };
+    var index = dict_index_t{};
+    var mtr = mtr_t{};
+
+    const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1;
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = @sizeOf(i64), .nullable = false }};
+
+    var key1: i64 = 5;
+    var field1 = data.dfield_t{ .data = &key1, .len = @intCast(@sizeOf(i64)) };
+    var tuple1 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field1)[0..1] };
+    var rec1_buf = [_]byte{0} ** 32;
+    const rec1_ptr = @as([*]byte, @ptrCast(rec1_buf[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec1_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple1);
+    const rec1_slice = rec1_buf[0..@as(usize, @intCast(header_len + @sizeOf(i64)))];
+
+    var key2: i64 = 10;
+    var field2 = data.dfield_t{ .data = &key2, .len = @intCast(@sizeOf(i64)) };
+    var tuple2 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field2)[0..1] };
+    var rec2_buf = [_]byte{0} ** 32;
+    const rec2_ptr = @as([*]byte, @ptrCast(rec2_buf[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec2_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple2);
+    const rec2_slice = rec2_buf[0..@as(usize, @intCast(header_len + @sizeOf(i64)))];
+
+    var rec1 = rec_t{ .key = 100 };
+    var rec2 = rec_t{ .key = 1 };
+    var cursor = page_cur_t{};
+    var offsets: ulint = 0;
+    page_cur_set_before_first(&block, &cursor);
+    _ = page_cur_rec_insert(&cursor, &rec1, &index, &offsets, &mtr);
+    cursor.rec = &rec1;
+    _ = page_cur_rec_insert(&cursor, &rec2, &index, &offsets, &mtr);
+
+    const rec1_head = page_bytes_insert_append(bytes[0..], rec1_slice) orelse return error.TestExpectedEqual;
+    rec1.rec_bytes = rec1_slice;
+    rec1.rec_offset = header_len;
+    rec1.rec_page_offset = rec1_head + header_len;
+
+    const rec2_head = page_bytes_insert_append(bytes[0..], rec2_slice) orelse return error.TestExpectedEqual;
+    rec2.rec_bytes = rec2_slice;
+    rec2.rec_offset = header_len;
+    rec2.rec_page_offset = rec2_head + header_len;
+
+    var search_key: i64 = 6;
+    var search_field = data.dfield_t{ .data = &search_key, .len = @intCast(@sizeOf(i64)) };
+    var search_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&search_field)[0..1] };
+    var search_cursor = page_cur_t{};
+    _ = page_cur_search(&block, &index, &search_tuple, PAGE_CUR_GE, &search_cursor);
+    try std.testing.expect(search_cursor.rec == &rec2);
 }
 
 test "page header fields and create" {
