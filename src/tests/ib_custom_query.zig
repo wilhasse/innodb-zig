@@ -153,10 +153,22 @@ fn rowMatchesFilters(ib_tpl: api.ib_tpl_t, params: *const QueryParams) bool {
 fn executeCustomQuery(crsr: api.ib_crsr_t, params: *const QueryParams) !QueryResult {
     var result = QueryResult{};
     const cursor = crsr orelse return error.OutOfMemory;
+    const tpl = api.ib_clust_read_tuple_create(cursor) orelse return error.OutOfMemory;
+    defer api.ib_tuple_delete(tpl);
 
-    for (cursor.rows.items) |row| {
+    var err = api.ib_cursor_first(cursor);
+    if (err != .DB_SUCCESS) {
+        _ = api.ib_cursor_reset(cursor);
+        return result;
+    }
+
+    while (err == .DB_SUCCESS) {
+        err = api.ib_cursor_read_row(cursor, tpl);
+        if (err != .DB_SUCCESS) {
+            break;
+        }
         result.processed += 1;
-        if (rowMatchesFilters(row, params)) {
+        if (rowMatchesFilters(tpl, params)) {
             if (result.matched < params.offset) {
                 result.matched += 1;
             } else {
@@ -167,7 +179,16 @@ fn executeCustomQuery(crsr: api.ib_crsr_t, params: *const QueryParams) !QueryRes
                 }
             }
         }
+
+        err = api.ib_cursor_next(cursor);
+        if (err != .DB_SUCCESS) {
+            break;
+        }
+
+        _ = api.ib_tuple_clear(tpl);
     }
+
+    _ = api.ib_cursor_reset(cursor);
 
     return result;
 }

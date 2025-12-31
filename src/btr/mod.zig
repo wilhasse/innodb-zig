@@ -61,7 +61,12 @@ pub const rec_t = struct {
     is_supremum: bool = false,
 };
 
-pub const dict_index_t = struct {};
+pub const dict_index_t = struct {
+    space: ulint = 0,
+    page: ulint = 0,
+    zip_size: ulint = 0,
+    root_level: ulint = 0,
+};
 pub const mtr_t = struct {};
 pub const buf_block_t = struct {};
 pub const page_t = struct {};
