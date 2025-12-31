@@ -20,7 +20,7 @@ pub const modules = [_]Module{
     .{ .name = "fil", .c_dir = "fil", .zig_path = "src/fil", .depends_on = &[_][]const u8{ "os", "sync", "mach", "mem", "ut" } },
     .{ .name = "fsp", .c_dir = "fsp", .zig_path = "src/fsp", .depends_on = &[_][]const u8{ "fil", "mach", "mem", "ut" } },
     .{ .name = "mtr", .c_dir = "mtr", .zig_path = "src/mtr", .depends_on = &[_][]const u8{ "log", "sync", "mach", "mem", "ut" } },
-    .{ .name = "page", .c_dir = "page", .zig_path = "src/page", .depends_on = &[_][]const u8{ "mtr", "mach", "mem", "ut" } },
+    .{ .name = "page", .c_dir = "page", .zig_path = "src/page", .depends_on = &[_][]const u8{ "mtr", "mach", "mem", "fsp", "ut" } },
     .{ .name = "buf", .c_dir = "buf", .zig_path = "src/buf", .depends_on = &[_][]const u8{ "fil", "fsp", "log", "mtr", "sync", "mach", "mem", "ut" } },
     .{ .name = "fut", .c_dir = "fut", .zig_path = "src/fut", .depends_on = &[_][]const u8{ "page", "buf", "mtr", "ut" } },
     .{ .name = "ibuf", .c_dir = "ibuf", .zig_path = "src/ibuf", .depends_on = &[_][]const u8{ "buf", "btr", "mtr", "page", "ut" } },

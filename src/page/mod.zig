@@ -1,7 +1,9 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
-const dict = @import("../dict/mod.zig");
 const data = @import("../data/mod.zig");
+const dict = @import("../dict/mod.zig");
+const fsp = @import("../fsp/mod.zig");
+const mach = @import("../mach/mod.zig");
 
 pub const module_name = "page";
 
@@ -15,6 +17,8 @@ pub const PAGE_CUR_G: ulint = 1;
 pub const PAGE_CUR_GE: ulint = 2;
 pub const PAGE_CUR_L: ulint = 3;
 pub const PAGE_CUR_LE: ulint = 4;
+
+pub const PAGE_HEADER: ulint = fsp.FSEG_PAGE_DATA;
 
 pub const PAGE_N_DIR_SLOTS: ulint = 0;
 pub const PAGE_HEAP_TOP: ulint = 2;
@@ -92,6 +96,47 @@ pub const PageHeader = struct {
     level: ulint = 0,
     index_id: compat.Dulint = .{ .high = 0, .low = 0 },
 };
+
+pub fn page_header_get_field_bytes(page: [*]const byte, field: ulint) ulint {
+    std.debug.assert(field <= PAGE_INDEX_ID);
+    return mach.mach_read_from_2(page + PAGE_HEADER + field);
+}
+
+pub fn page_header_set_field_bytes(page: [*]byte, field: ulint, val: ulint) void {
+    std.debug.assert(field <= PAGE_N_RECS);
+    mach.mach_write_to_2(page + PAGE_HEADER + field, val);
+}
+
+pub fn page_header_get_offs_bytes(page: [*]const byte, field: ulint) ulint {
+    std.debug.assert(field == PAGE_FREE or field == PAGE_LAST_INSERT or field == PAGE_HEAP_TOP);
+    return page_header_get_field_bytes(page, field);
+}
+
+pub fn page_header_set_offs_bytes(page: [*]byte, field: ulint, val: ulint) void {
+    std.debug.assert(field == PAGE_FREE or field == PAGE_LAST_INSERT or field == PAGE_HEAP_TOP);
+    page_header_set_field_bytes(page, field, val);
+}
+
+pub fn page_get_max_trx_id_bytes(page: [*]const byte) trx_id_t {
+    const d = mach.mach_read_from_8(page + PAGE_HEADER + PAGE_MAX_TRX_ID);
+    return (@as(trx_id_t, @intCast(d.high)) << 32) | d.low;
+}
+
+pub fn page_set_max_trx_id_bytes(page: [*]byte, trx_id: trx_id_t) void {
+    const d = compat.Dulint{
+        .high = @as(ulint, @intCast(trx_id >> 32)),
+        .low = @as(ulint, @intCast(trx_id & 0xFFFF_FFFF)),
+    };
+    mach.mach_write_to_8(page + PAGE_HEADER + PAGE_MAX_TRX_ID, d);
+}
+
+pub fn page_get_index_id_bytes(page: [*]const byte) compat.Dulint {
+    return mach.mach_read_from_8(page + PAGE_HEADER + PAGE_INDEX_ID);
+}
+
+pub fn page_set_index_id_bytes(page: [*]byte, id: compat.Dulint) void {
+    mach.mach_write_to_8(page + PAGE_HEADER + PAGE_INDEX_ID, id);
+}
 
 pub const page_t = struct {
     header: PageHeader = .{},
@@ -880,4 +925,24 @@ test "page zip basic" {
     if (zip.data) |buf| {
         std.heap.page_allocator.free(buf);
     }
+}
+
+test "page header byte helpers" {
+    var buf = [_]byte{0} ** 256;
+    const page_bytes = buf[0..].ptr;
+
+    page_header_set_field_bytes(page_bytes, PAGE_N_RECS, 7);
+    try std.testing.expectEqual(@as(ulint, 7), page_header_get_field_bytes(page_bytes, PAGE_N_RECS));
+
+    page_header_set_offs_bytes(page_bytes, PAGE_HEAP_TOP, 1234);
+    try std.testing.expectEqual(@as(ulint, 1234), page_header_get_offs_bytes(page_bytes, PAGE_HEAP_TOP));
+
+    page_set_max_trx_id_bytes(page_bytes, 0x0102030405060708);
+    try std.testing.expectEqual(@as(trx_id_t, 0x0102030405060708), page_get_max_trx_id_bytes(page_bytes));
+
+    const id = compat.Dulint{ .high = 0x12345678, .low = 0x9abcdef0 };
+    page_set_index_id_bytes(page_bytes, id);
+    const read_id = page_get_index_id_bytes(page_bytes);
+    try std.testing.expectEqual(id.high, read_id.high);
+    try std.testing.expectEqual(id.low, read_id.low);
 }
