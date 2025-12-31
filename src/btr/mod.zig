@@ -103,9 +103,14 @@ pub const btr_search_sys_t = struct {
 pub const dtuple_t = struct {};
 
 pub fn btr_root_get(index: *dict_index_t, mtr: *mtr_t) ?*page_t {
-    _ = index;
+    const block = btr_root_block_get(index, mtr) orelse return null;
+    return block.frame;
+}
+
+pub fn btr_root_block_get(index: *dict_index_t, mtr: *mtr_t) ?*buf_block_t {
     _ = mtr;
-    return null;
+    const state = index_states.get(index) orelse return null;
+    return state.pages.get(index.page);
 }
 
 fn btr_page_set_index_id(page_obj: *page_t, page_zip: ?*page_zip_des_t, id: dulint, mtr: *mtr_t) void {
@@ -337,25 +342,70 @@ pub fn btr_page_free(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) voi
 
 pub fn btr_create(type_: ulint, space: ulint, zip_size: ulint, index_id: dulint, index: *dict_index_t, mtr: *mtr_t) ulint {
     _ = type_;
-    _ = space;
-    _ = zip_size;
-    _ = index_id;
-    _ = index;
-    _ = mtr;
-    return 0;
+    index.space = space;
+    index.zip_size = zip_size;
+    index.id = index_id;
+    const block = btr_page_alloc(index, 0, 0, 0, mtr) orelse return 0;
+    btr_page_create(block, block.page_zip, index, 0, mtr);
+    index.page = block.frame.page_no;
+    index.root_level = 0;
+    return index.page;
 }
 
 pub fn btr_free_but_not_root(space: ulint, zip_size: ulint, root_page_no: ulint) void {
     _ = space;
     _ = zip_size;
-    _ = root_page_no;
+    var it = index_states.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.pages.get(root_page_no) == null) {
+            continue;
+        }
+        const allocator = std.heap.page_allocator;
+        var keys = std.ArrayList(ulint).init(allocator);
+        defer keys.deinit();
+        var page_it = entry.value_ptr.pages.iterator();
+        while (page_it.next()) |page_entry| {
+            if (page_entry.key_ptr.* != root_page_no) {
+                keys.append(page_entry.key_ptr.*) catch {};
+            }
+        }
+        for (keys.items) |page_no| {
+            if (entry.value_ptr.pages.fetchRemove(page_no)) |removed| {
+                allocator.destroy(removed.value.frame);
+                allocator.destroy(removed.value);
+            }
+        }
+        break;
+    }
 }
 
 pub fn btr_free_root(space: ulint, zip_size: ulint, root_page_no: ulint, mtr: *mtr_t) void {
     _ = space;
     _ = zip_size;
-    _ = root_page_no;
     _ = mtr;
+    var remove_index: ?*dict_index_t = null;
+    var remove_state: ?*IndexState = null;
+    var it = index_states.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.pages.fetchRemove(root_page_no)) |removed| {
+            std.heap.page_allocator.destroy(removed.value.frame);
+            std.heap.page_allocator.destroy(removed.value);
+            entry.key_ptr.*.page = 0;
+            entry.key_ptr.*.root_level = 0;
+            if (entry.value_ptr.pages.count() == 0) {
+                remove_index = entry.key_ptr.*;
+                remove_state = entry.value_ptr.*;
+            }
+            break;
+        }
+    }
+    if (remove_index) |idx| {
+        if (remove_state) |state| {
+            state.pages.deinit();
+            std.heap.page_allocator.destroy(state);
+        }
+        _ = index_states.remove(idx);
+    }
 }
 
 pub fn btr_page_reorganize(block: *buf_block_t, index: *dict_index_t, mtr: *mtr_t) ibool {
@@ -1182,6 +1232,35 @@ test "btr page alloc free and size" {
 
     btr_page_free(index, block2, &mtr);
     try std.testing.expectEqual(@as(ulint, 0), btr_get_size(index, 0));
+
+    index_state_remove(index);
+}
+
+test "btr create root and free" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    const root_no = btr_create(0, 1, 0, .{ .high = 0, .low = 100 }, index, &mtr);
+    try std.testing.expect(root_no != 0);
+    try std.testing.expectEqual(root_no, index.page);
+    try std.testing.expectEqual(@as(ulint, 0), index.root_level);
+    try std.testing.expect(btr_root_get(index, &mtr) != null);
+    try std.testing.expectEqual(@as(ulint, 1), btr_get_size(index, 0));
+
+    const extra = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expect(extra.frame.page_no != root_no);
+    try std.testing.expectEqual(@as(ulint, 2), btr_get_size(index, 0));
+
+    btr_free_but_not_root(index.space, index.zip_size, root_no);
+    try std.testing.expectEqual(@as(ulint, 1), btr_get_size(index, 0));
+    try std.testing.expect(btr_root_get(index, &mtr) != null);
+
+    btr_free_root(index.space, index.zip_size, root_no, &mtr);
+    try std.testing.expectEqual(@as(ulint, 0), btr_get_size(index, 0));
+    try std.testing.expect(btr_root_get(index, &mtr) == null);
 
     index_state_remove(index);
 }
