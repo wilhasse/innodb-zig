@@ -250,7 +250,7 @@ pub fn dict_boot() void {
 }
 
 pub fn dict_create() void {
-    dict_hdr_create();
+    _ = dict_hdr_create();
     dict_boot();
     dict_insert_initial_data();
 }
@@ -834,8 +834,8 @@ pub fn dict_table_add_to_cache(table: *dict_table_t, heap: *mem_heap_t) void {
     }
     table.cached = true;
     const key = dulintKey(table.id);
-    _ = dict_sys.tables_by_name.put(std.heap.page_allocator, table.name, table);
-    _ = dict_sys.tables_by_id.put(std.heap.page_allocator, key, table);
+    dict_sys.tables_by_name.put(std.heap.page_allocator, table.name, table) catch {};
+    dict_sys.tables_by_id.put(std.heap.page_allocator, key, table) catch {};
 }
 
 pub fn dict_table_remove_from_cache(table: *dict_table_t) void {
@@ -848,14 +848,15 @@ pub fn dict_table_rename_in_cache(table: *dict_table_t, new_name: []const u8, re
     _ = rename_also_foreigns;
     dict_table_remove_from_cache(table);
     table.name = new_name;
-    dict_table_add_to_cache(table, &mem_heap_t{});
+    var heap = mem_heap_t{};
+    dict_table_add_to_cache(table, &heap);
     return compat.TRUE;
 }
 
 pub fn dict_table_change_id_in_cache(table: *dict_table_t, new_id: dulint) void {
     _ = dict_sys.tables_by_id.remove(dulintKey(table.id));
     table.id = new_id;
-    _ = dict_sys.tables_by_id.put(std.heap.page_allocator, dulintKey(new_id), table);
+    dict_sys.tables_by_id.put(std.heap.page_allocator, dulintKey(new_id), table) catch {};
 }
 
 pub fn dict_foreign_add_to_cache(foreign: *dict_foreign_t, check_charsets: ibool) ulint {
@@ -930,7 +931,8 @@ pub fn dict_load_table_on_id(recovery: u8, table_id: dulint) ?*dict_table_t {
 }
 
 pub fn dict_load_sys_table(table: *dict_table_t) void {
-    dict_table_add_to_cache(table, &mem_heap_t{});
+    var heap = mem_heap_t{};
+    dict_table_add_to_cache(table, &heap);
 }
 
 pub fn dict_load_foreigns(table_name: []const u8, check_charsets: ibool) ulint {
@@ -1048,7 +1050,7 @@ fn dulintGetLow(id: dulint) ulint {
 
 fn dulintAdd(id: dulint, add: ulint) dulint {
     const low = id.low + add;
-    const carry = if (low < id.low) 1 else 0;
+    const carry: ulint = if (low < id.low) 1 else 0;
     return .{ .high = id.high + carry, .low = low };
 }
 
@@ -1111,7 +1113,7 @@ fn readU32Be(ptr: [*]const byte) ulint {
 }
 
 test "dict header id allocation" {
-    dict_hdr_create();
+    _ = dict_hdr_create();
     const id1 = dict_hdr_get_new_id(DICT_HDR_TABLE_ID);
     const id2 = dict_hdr_get_new_id(DICT_HDR_TABLE_ID);
     try std.testing.expect(dulintGetLow(id2) == dulintGetLow(id1) + 1);
@@ -1130,7 +1132,7 @@ test "dict row id read/write" {
 }
 
 test "dict boot updates row id" {
-    dict_hdr_create();
+    _ = dict_hdr_create();
     dict_sys.row_id = dulintCreate(0, 1);
     dict_boot();
     try std.testing.expect(dict_sys.booted);
@@ -1183,7 +1185,8 @@ test "dict table cache and index helpers" {
         .ind = 0,
     });
     table.n_cols = 1;
-    dict_table_add_to_cache(&table, &mem_heap_t{});
+    var heap = mem_heap_t{};
+    dict_table_add_to_cache(&table, &heap);
     defer dict_table_remove_from_cache(&table);
 
     const fetched = dict_table_get("db/t1", compat.TRUE);
@@ -1219,7 +1222,8 @@ test "dict load helpers" {
     dict_init();
 
     var table = dict_table_t{ .name = "db/load1", .id = dulintCreate(0, 300) };
-    dict_table_add_to_cache(&table, &mem_heap_t{});
+    var heap = mem_heap_t{};
+    dict_table_add_to_cache(&table, &heap);
     defer dict_table_remove_from_cache(&table);
 
     const first = dict_get_first_table_name_in_db("db/") orelse return error.OutOfMemory;

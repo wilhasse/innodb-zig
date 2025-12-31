@@ -405,7 +405,7 @@ pub fn dtuple_big_rec_free(vector: *big_rec_t) void {
 }
 
 pub fn data_write_sql_null(data: []byte) void {
-    std.mem.set(u8, data, 0);
+    @memset(data, 0);
 }
 
 pub fn dtype_var_init() void {

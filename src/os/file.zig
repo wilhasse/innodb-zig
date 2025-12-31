@@ -450,7 +450,7 @@ pub fn os_file_set_size(name: []const u8, file: os_file_t, size: ulint, size_hig
         return compat.FALSE;
     };
     defer std.heap.page_allocator.free(buf);
-    std.mem.set(u8, buf, 0);
+    @memset(buf, 0);
 
     var current: u64 = 0;
     while (current < desired) {

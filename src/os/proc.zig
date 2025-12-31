@@ -37,7 +37,7 @@ pub fn os_mem_alloc_large(n: *ulint) ?*anyopaque {
     n.* = size;
 
     const buf = std.heap.page_allocator.alignedAlloc(u8, alignment, size) catch return null;
-    std.mem.set(u8, buf, 0);
+    @memset(buf, 0);
     return buf.ptr;
 }
 

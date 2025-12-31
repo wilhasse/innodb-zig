@@ -140,11 +140,11 @@ fn mem_heap_printf_low(buf: ?[]u8, format: []const u8, args: []const MemPrintfAr
                     else => @panic("mem_heap_printf expected ulong"),
                 };
                 var tmp: [32]u8 = undefined;
-                const len = std.fmt.formatIntBuf(&tmp, num, 10, .lower, .{});
+                const formatted = std.fmt.bufPrint(tmp[0..], "{}", .{num}) catch @panic("mem_heap_printf bufPrint");
                 if (buf) |out| {
-                    std.mem.copyForwards(u8, out[out_len .. out_len + len], tmp[0..len]);
+                    std.mem.copyForwards(u8, out[out_len .. out_len + formatted.len], formatted);
                 }
-                out_len += len;
+                out_len += formatted.len;
             },
             '%' => {
                 std.debug.assert(!is_long);

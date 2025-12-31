@@ -286,10 +286,10 @@ test "dyn array spans multiple blocks" {
     defer dyn_array_free(&arr);
 
     const first = dyn_array_push(&arr, 400);
-    std.mem.set(byte, first[0..400], 0xAA);
+    @memset(first[0..400], 0xAA);
 
     const second = dyn_array_push(&arr, 200);
-    std.mem.set(byte, second[0..200], 0xBB);
+    @memset(second[0..200], 0xBB);
 
     try std.testing.expect(dyn_array_get_data_size(&arr) == 600);
     try std.testing.expect(dyn_array_get_next_block(&arr, &arr) != null);
@@ -305,7 +305,7 @@ test "dyn array open and close" {
     defer dyn_array_free(&arr);
 
     const buf = dyn_array_open(&arr, 128);
-    std.mem.set(byte, buf[0..100], 0xCC);
+    @memset(buf[0..100], 0xCC);
     dyn_array_close(&arr, buf + 100);
 
     try std.testing.expect(dyn_array_get_data_size(&arr) == 100);

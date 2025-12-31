@@ -101,7 +101,7 @@ pub fn ut_malloc_low(n: ulint, set_to_zero: ibool, assert_on_error: ibool) ?*any
     };
 
     if (set_to_zero != 0) {
-        std.mem.set(u8, buf, 0);
+        @memset(buf, 0);
     }
 
     const block = @as(*ut_mem_block_t, @ptrCast(@alignCast(buf.ptr)));
@@ -596,7 +596,7 @@ test "ut str sql format cases" {
 
     var buf = [_]u8{0} ** 128;
     for (cases) |case| {
-        std.mem.set(u8, buf[0..10], 'x');
+        @memset(buf[0..10], 'x');
         buf[10] = 0;
         const ret = ut_str_sql_format(case.str.ptr, case.len, buf[0..].ptr, case.buf_size);
         try std.testing.expectEqual(case.ret, ret);

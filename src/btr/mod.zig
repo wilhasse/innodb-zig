@@ -251,7 +251,7 @@ fn dtuple_to_child_block(entry: *const dtuple_t) ?*buf_block_t {
     if (field.len != @sizeOf(*buf_block_t)) {
         return null;
     }
-    return @as(*buf_block_t, @ptrCast(data_ptr));
+    return @as(*buf_block_t, @ptrCast(@alignCast(data_ptr)));
 }
 
 fn page_find_insert_after(page_obj: *page_t, key: i64) *rec_t {
@@ -280,6 +280,19 @@ const SplitResult = struct {
     inserted: *rec_t,
     inserted_block: *buf_block_t,
 };
+
+const LeafEntry = struct {
+    key: i64,
+    page_no: ulint,
+    block: *buf_block_t,
+};
+
+fn leafEntryLessThan(_: void, lhs: LeafEntry, rhs: LeafEntry) bool {
+    if (lhs.key != rhs.key) {
+        return lhs.key < rhs.key;
+    }
+    return lhs.page_no < rhs.page_no;
+}
 
 fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict_index_t, mtr: *mtr_t) ?*rec_t {
     var cursor = page.page_cur_t{};
@@ -420,6 +433,68 @@ fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
     return null;
 }
 
+fn btr_reposition_node_ptr(parent: *buf_block_t, node_ptr: *rec_t, new_key: i64) void {
+    if (node_ptr.key == new_key) {
+        return;
+    }
+    const prev = node_ptr.prev;
+    const next = node_ptr.next;
+    if (prev) |prev_rec| {
+        prev_rec.next = next;
+    }
+    if (next) |next_rec| {
+        next_rec.prev = prev;
+    }
+
+    const insert_after = page_find_insert_after(parent.frame, new_key);
+    node_ptr.key = new_key;
+    node_ptr.prev = insert_after;
+    node_ptr.next = insert_after.next;
+    insert_after.next = node_ptr;
+    if (node_ptr.next) |next_rec| {
+        next_rec.prev = node_ptr;
+    }
+}
+
+fn btr_update_parent_min_key(block: *buf_block_t) void {
+    var current = block;
+    while (true) {
+        const parent = current.frame.parent_block orelse return;
+        const node_ptr = find_node_ptr(parent.frame, current) orelse return;
+        const first = page_first_user_rec(current.frame) orelse return;
+        btr_reposition_node_ptr(parent, node_ptr, first.key);
+        const parent_first = page_first_user_rec(parent.frame) orelse return;
+        if (node_ptr != parent_first) {
+            return;
+        }
+        current = parent;
+    }
+}
+
+fn btr_rebuild_leaf_chain(index: *dict_index_t) void {
+    const state = index_states.get(index) orelse return;
+    var leaves = ArrayList(LeafEntry).init(std.heap.page_allocator);
+    defer leaves.deinit();
+    var it = state.pages.valueIterator();
+    while (it.next()) |block_ptr| {
+        const block = block_ptr.*;
+        if (block.frame.header.level != 0) {
+            continue;
+        }
+        const first = page_first_user_rec(block.frame);
+        const key = if (first) |rec| rec.key else std.math.maxInt(i64);
+        leaves.append(.{ .key = key, .page_no = block.frame.page_no, .block = block }) catch {};
+    }
+    if (leaves.items.len == 0) {
+        return;
+    }
+    std.sort.pdq(LeafEntry, leaves.items, {}, leafEntryLessThan);
+    for (leaves.items, 0..) |entry, idx| {
+        entry.block.frame.prev_block = if (idx == 0) null else leaves.items[idx - 1].block;
+        entry.block.frame.next_block = if (idx + 1 < leaves.items.len) leaves.items[idx + 1].block else null;
+    }
+}
+
 fn descend_to_level(index: *dict_index_t, target_level: ulint, from_left: bool) ?*buf_block_t {
     var mtr = mtr_t{};
     var block = btr_root_block_get(index, &mtr) orelse return null;
@@ -430,6 +505,17 @@ fn descend_to_level(index: *dict_index_t, target_level: ulint, from_left: bool) 
         const child = rec.child_block orelse return block;
         block = child;
         level = block.frame.header.level;
+    }
+    if (target_level == 0) {
+        if (from_left) {
+            while (block.frame.prev_block) |prev| {
+                block = prev;
+            }
+        } else {
+            while (block.frame.next_block) |next| {
+                block = next;
+            }
+        }
     }
     return block;
 }
@@ -606,20 +692,20 @@ pub fn btr_free_but_not_root(space: ulint, zip_size: ulint, root_page_no: ulint)
     _ = zip_size;
     var it = index_states.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.pages.get(root_page_no) == null) {
+        if (entry.value_ptr.*.pages.get(root_page_no) == null) {
             continue;
         }
         const allocator = std.heap.page_allocator;
         var keys = ArrayList(ulint).init(allocator);
         defer keys.deinit();
-        var page_it = entry.value_ptr.pages.iterator();
+        var page_it = entry.value_ptr.*.pages.iterator();
         while (page_it.next()) |page_entry| {
             if (page_entry.key_ptr.* != root_page_no) {
                 keys.append(page_entry.key_ptr.*) catch {};
             }
         }
         for (keys.items) |page_no| {
-            if (entry.value_ptr.pages.fetchRemove(page_no)) |removed| {
+            if (entry.value_ptr.*.pages.fetchRemove(page_no)) |removed| {
                 allocator.destroy(removed.value.frame);
                 allocator.destroy(removed.value);
             }
@@ -636,12 +722,12 @@ pub fn btr_free_root(space: ulint, zip_size: ulint, root_page_no: ulint, mtr: *m
     var remove_state: ?*IndexState = null;
     var it = index_states.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.pages.fetchRemove(root_page_no)) |removed| {
+        if (entry.value_ptr.*.pages.fetchRemove(root_page_no)) |removed| {
             std.heap.page_allocator.destroy(removed.value.frame);
             std.heap.page_allocator.destroy(removed.value);
             entry.key_ptr.*.page = 0;
             entry.key_ptr.*.root_level = 0;
-            if (entry.value_ptr.pages.count() == 0) {
+            if (entry.value_ptr.*.pages.count() == 0) {
                 remove_index = entry.key_ptr.*;
                 remove_state = entry.value_ptr.*;
             }
@@ -706,6 +792,7 @@ pub fn btr_root_raise_and_insert(cursor: *btr_cur_t, tuple: *const dtuple_t, n_e
 
     insert_node_ptr(new_root, block, index, mtr);
     insert_node_ptr(new_root, split.right, index, mtr);
+    btr_rebuild_leaf_chain(index);
 
     cursor.block = split.inserted_block;
     cursor.rec = split.inserted;
@@ -789,6 +876,8 @@ pub fn btr_page_split_and_insert(cursor: *btr_cur_t, tuple: *const dtuple_t, n_e
     const split = split_leaf_and_insert(index, block, tuple, mtr) orelse return null;
     const parent = block.frame.parent_block orelse return split.inserted;
     insert_node_ptr(parent, split.right, index, mtr);
+    btr_update_parent_min_key(block);
+    btr_rebuild_leaf_chain(index);
     cursor.block = split.inserted_block;
     cursor.rec = split.inserted;
     cursor.opened = true;
@@ -911,7 +1000,10 @@ fn btr_validate_page_recs(page_obj: *page_t) bool {
         count += 1;
         current = rec.next;
     }
-    return count == page_obj.header.n_recs;
+    if (count != page_obj.header.n_recs) {
+        return false;
+    }
+    return true;
 }
 
 fn btr_validate_leaf_chain(start: *buf_block_t) bool {
@@ -922,15 +1014,18 @@ fn btr_validate_leaf_chain(start: *buf_block_t) bool {
         if (block.frame.prev_block != prev_block) {
             return false;
         }
-        var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+        var rec_opt = block.frame.infimum.next;
         while (rec_opt) |rec| {
+            if (rec.is_supremum) {
+                break;
+            }
             if (last_key) |prev_key| {
                 if (rec.key < prev_key) {
                     return false;
                 }
             }
             last_key = rec.key;
-            rec_opt = btr_get_next_user_rec(rec, null);
+            rec_opt = rec.next;
         }
         prev_block = block;
         block_opt = block.frame.next_block;
@@ -1021,7 +1116,10 @@ pub fn btr_validate_index(index: *dict_index_t, trx: ?*trx_t) ibool {
         return compat.FALSE;
     }
     const leftmost = descend_to_level(index, 0, true) orelse return compat.TRUE;
-    return if (btr_validate_leaf_chain(leftmost)) compat.TRUE else compat.FALSE;
+    if (!btr_validate_leaf_chain(leftmost)) {
+        return compat.FALSE;
+    }
+    return compat.TRUE;
 }
 
 pub fn btr_cur_var_init() void {
@@ -1142,6 +1240,8 @@ fn btr_cur_insert_if_possible(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext:
         allocator.destroy(new_rec);
         return null;
     }
+    btr_update_parent_min_key(block);
+    btr_rebuild_leaf_chain(index);
     cursor.rec = new_rec;
     cursor.block = block;
     cursor.opened = true;
@@ -1264,6 +1364,8 @@ pub fn btr_cur_update_in_place(
     _ = cmpl_info;
     _ = thr;
     _ = mtr;
+    const index = cursor.index orelse return 1;
+    const block = cursor.block orelse return 1;
     const rec = cursor.rec orelse return 1;
     if (rec.is_infimum or rec.is_supremum) {
         return 1;
@@ -1275,6 +1377,8 @@ pub fn btr_cur_update_in_place(
         btr_search_update_hash_on_delete(cursor);
         rec.key = update.new_key;
         btr_search_update_hash_on_insert(cursor);
+        btr_update_parent_min_key(block);
+        btr_rebuild_leaf_chain(index);
         return 0;
     }
     rec.key = update.new_key;
@@ -1416,6 +1520,8 @@ pub fn btr_cur_optimistic_delete(cursor: *btr_cur_t, mtr: *mtr_t) ibool {
     page.page_cur_delete_rec(&page_cursor, index, &offsets, mtr);
     cursor.rec = page_cursor.rec;
     cursor.block = block;
+    btr_update_parent_min_key(block);
+    btr_rebuild_leaf_chain(index);
     return compat.TRUE;
 }
 
@@ -1736,8 +1842,14 @@ pub fn btr_pcur_restore_position_func(
         cursor.rel_pos = BTR_PCUR_BEFORE;
         return compat.FALSE;
     };
+    const block = btr_block_for_rec(index, rec) orelse {
+        cursor.btr_cur.rec = null;
+        cursor.btr_cur.block = null;
+        cursor.rel_pos = BTR_PCUR_BEFORE;
+        return compat.FALSE;
+    };
     cursor.btr_cur.rec = rec;
-    cursor.btr_cur.block = rec.page;
+    cursor.btr_cur.block = block;
     cursor.btr_cur.opened = true;
     cursor.rel_pos = BTR_PCUR_ON;
     return compat.TRUE;
@@ -2937,7 +3049,8 @@ test "btr search stubs" {
     btr_search_sys_create(128);
     try std.testing.expect(btr_search_sys != null);
 
-    var heap = mem_heap_t{};
+    var heap = mem_heap_t.init(std.testing.allocator, 0, .dynamic) catch return error.OutOfMemory;
+    defer heap.deinit();
     const info = btr_search_info_create(&heap) orelse return error.OutOfMemory;
     defer std.heap.page_allocator.destroy(info);
     try std.testing.expectEqual(@as(ulint, 0), btr_search_info_get_ref_count(info));

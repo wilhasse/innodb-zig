@@ -73,7 +73,7 @@ pub const MemHeap = struct {
 
     pub fn zalloc(self: *MemHeap, n: usize) ![]u8 {
         const buf = try self.alloc(n);
-        std.mem.set(u8, buf, 0);
+        @memset(buf, 0);
         return buf;
     }
 

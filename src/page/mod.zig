@@ -610,7 +610,8 @@ pub fn page_zip_get_size(page_zip: *const page_zip_des_t) ulint {
     if (page_zip.ssize == 0) {
         return 0;
     }
-    return PAGE_ZIP_MIN_SIZE << (@as(ulint, @intCast(page_zip.ssize)) - 1);
+    const shift = @as(u6, @intCast(page_zip.ssize - 1));
+    return PAGE_ZIP_MIN_SIZE << shift;
 }
 
 pub fn page_zip_set_size(page_zip: *page_zip_des_t, size: ulint) void {
@@ -672,7 +673,7 @@ pub fn page_zip_compress(page_zip: *page_zip_des_t, page: *const page_t, index: 
         page_zip.data = buf;
     }
     if (page_zip.data) |buf| {
-        std.mem.set(u8, buf, 0);
+        @memset(buf, 0);
     }
     page_zip.m_end = 0;
     page_zip.m_nonempty = false;

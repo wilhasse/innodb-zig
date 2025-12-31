@@ -38,7 +38,7 @@ pub fn row_ext_create(n_ext: ulint, ext_cols: []const ulint, tuple: *const data.
     std.mem.copyForwards(ulint, @constCast(ext_cache.ext), ext_cols[0..n_ext]);
     ext_cache.buf = allocator.alloc(u8, n_ext * rem.REC_MAX_INDEX_COL_LEN) catch @panic("row_ext_create");
     ext_cache.len = allocator.alloc(ulint, n_ext) catch @panic("row_ext_create");
-    std.mem.set(ulint, ext_cache.len, 0);
+    @memset(ext_cache.len, 0);
 
     for (ext_cols[0..n_ext], 0..) |col_no, i| {
         const dfield = data.dtuple_get_nth_field(tuple, col_no);
