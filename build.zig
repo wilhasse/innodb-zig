@@ -109,6 +109,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    const btr_trace_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/btr_trace.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    btr_trace_module.addImport("innodb", lib_module);
+
+    const btr_trace = b.addExecutable(.{
+        .name = "btr_trace",
+        .root_module = btr_trace_module,
+    });
+    b.installArtifact(btr_trace);
+
+    const btr_trace_run = b.addRunArtifact(btr_trace);
+    if (b.args) |args| {
+        btr_trace_run.addArgs(args);
+    }
+    const btr_trace_step = b.step("btr-trace", "Run B-tree trace generator");
+    btr_trace_step.dependOn(&btr_trace_run.step);
+
     const lib_tests = b.addTest(.{
         .name = "lib_tests",
         .root_module = lib_module,

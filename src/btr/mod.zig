@@ -4,6 +4,7 @@ const page = @import("../page/mod.zig");
 const dict = @import("../dict/mod.zig");
 const data = @import("../data/mod.zig");
 const mem = @import("../mem/mod.zig");
+const ArrayList = std.array_list.Managed;
 
 pub const module_name = "btr";
 
@@ -235,10 +236,8 @@ fn dtuple_to_key(entry: *const dtuple_t) i64 {
         return 0;
     }
     return switch (field.len) {
-        @sizeOf(i32) => @as(i64, @intCast(@as(*const i32, @ptrCast(data_ptr)).*)),
-        @sizeOf(u32) => @as(i64, @intCast(@as(*const u32, @ptrCast(data_ptr)).*)),
-        @sizeOf(i64) => @as(*const i64, @ptrCast(data_ptr)).*,
-        @sizeOf(u64) => @as(i64, @intCast(@as(*const u64, @ptrCast(data_ptr)).*)),
+        4 => @as(i64, @intCast(@as(*const i32, @ptrCast(@alignCast(data_ptr))).*)),
+        8 => @as(*const i64, @ptrCast(@alignCast(data_ptr))).*,
         else => 0,
     };
 }
@@ -305,7 +304,7 @@ fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict
 
 fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *const dtuple_t, mtr: *mtr_t) ?SplitResult {
     const allocator = std.heap.page_allocator;
-    var entries = std.ArrayList(SplitEntry).init(allocator);
+    var entries = ArrayList(SplitEntry).init(allocator);
     defer entries.deinit();
 
     const new_key = dtuple_to_key(tuple);
@@ -388,13 +387,16 @@ fn insert_node_ptr(parent_block: *buf_block_t, child_block: *buf_block_t, index:
 }
 
 fn btr_find_rec_by_key(index: *dict_index_t, key: i64) ?*rec_t {
-    const block = descend_to_level(index, 0, true) orelse return null;
-    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
-    while (rec_opt) |rec| {
-        if (rec.key == key) {
-            return rec;
+    var block_opt: ?*buf_block_t = descend_to_level(index, 0, true) orelse return null;
+    while (block_opt) |block| {
+        var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(block.frame), null);
+        while (rec_opt) |rec| {
+            if (rec.key == key) {
+                return rec;
+            }
+            rec_opt = btr_get_next_user_rec(rec, null);
         }
-        rec_opt = btr_get_next_user_rec(rec, null);
+        block_opt = block.frame.next_block;
     }
     return null;
 }
@@ -419,7 +421,8 @@ fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
 }
 
 fn descend_to_level(index: *dict_index_t, target_level: ulint, from_left: bool) ?*buf_block_t {
-    var block = btr_root_block_get(index, null) orelse return null;
+    var mtr = mtr_t{};
+    var block = btr_root_block_get(index, &mtr) orelse return null;
     var level = block.frame.header.level;
     while (level > target_level) {
         const node_ptr = if (from_left) page_first_user_rec(block.frame) else page_last_user_rec(block.frame);
@@ -607,7 +610,7 @@ pub fn btr_free_but_not_root(space: ulint, zip_size: ulint, root_page_no: ulint)
             continue;
         }
         const allocator = std.heap.page_allocator;
-        var keys = std.ArrayList(ulint).init(allocator);
+        var keys = ArrayList(ulint).init(allocator);
         defer keys.deinit();
         var page_it = entry.value_ptr.pages.iterator();
         while (page_it.next()) |page_entry| {
@@ -1006,7 +1009,8 @@ pub fn btr_index_rec_validate(rec: *const rec_t, index: *const dict_index_t, dum
 
 pub fn btr_validate_index(index: *dict_index_t, trx: ?*trx_t) ibool {
     _ = trx;
-    const root_block = btr_root_block_get(index, null) orelse return compat.TRUE;
+    var mtr = mtr_t{};
+    const root_block = btr_root_block_get(index, &mtr) orelse return compat.TRUE;
     if (root_block.frame.page_no != index.page) {
         return compat.FALSE;
     }
@@ -1900,7 +1904,7 @@ pub fn btr_search_drop_page_hash_index(block: *buf_block_t) void {
         return;
     }
     const sys = btr_search_sys orelse return;
-    var remove_keys = std.ArrayList(HashKey).init(std.heap.page_allocator);
+    var remove_keys = ArrayList(HashKey).init(std.heap.page_allocator);
     defer remove_keys.deinit();
     var it = sys.entries.iterator();
     while (it.next()) |entry| {
@@ -1920,7 +1924,7 @@ pub fn btr_search_drop_page_hash_when_freed(space: ulint, zip_size: ulint, page_
         return;
     }
     const sys = btr_search_sys orelse return;
-    var remove_keys = std.ArrayList(HashKey).init(std.heap.page_allocator);
+    var remove_keys = ArrayList(HashKey).init(std.heap.page_allocator);
     defer remove_keys.deinit();
     var it = sys.entries.iterator();
     while (it.next()) |entry| {
@@ -2232,7 +2236,7 @@ test "btr leaf split raises root" {
     try std.testing.expect(left_block.frame.parent_block == new_root);
     try std.testing.expect(right_block.frame.parent_block == new_root);
 
-    var values = std.ArrayList(i64).init(allocator);
+    var values = ArrayList(i64).init(allocator);
     defer values.deinit();
     var rec = page_first_user_rec(left_block.frame) orelse return error.OutOfMemory;
     while (true) {
@@ -2395,7 +2399,7 @@ test "btr delete mark and delete visibility" {
     try std.testing.expectEqual(@as(ulint, 0), btr_cur_del_mark_set_sec_rec(0, &cursor, compat.TRUE, &thr, &mtr));
     try std.testing.expect(rec2.deleted);
 
-    var values = std.ArrayList(i64).init(allocator);
+    var values = ArrayList(i64).init(allocator);
     defer values.deinit();
     var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
     while (rec_opt) |rec| {
@@ -2484,7 +2488,7 @@ test "btr update paths" {
     cursor.rec = rec3;
     try std.testing.expectEqual(@as(ulint, 0), btr_cur_pessimistic_update(0, &cursor, &heap, &big, &update_size, 0, &thr, &mtr));
 
-    var values = std.ArrayList(i64).init(allocator);
+    var values = ArrayList(i64).init(allocator);
     defer values.deinit();
     var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
     while (rec_opt) |rec| {
@@ -2531,7 +2535,7 @@ test "btr page reorganize removes deleted records" {
     try std.testing.expectEqual(compat.TRUE, btr_page_reorganize(root_block, index, &mtr));
     try std.testing.expectEqual(@as(ulint, 2), root_block.frame.header.n_recs);
 
-    var values = std.ArrayList(i64).init(allocator);
+    var values = ArrayList(i64).init(allocator);
     defer values.deinit();
     var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
     while (rec_opt) |rec| {
@@ -2990,7 +2994,7 @@ test "btr search stubs" {
     try std.testing.expect(btr_search_sys == null);
 }
 
-fn btr_collect_keys(index: *dict_index_t, list: *std.ArrayList(i64)) !void {
+fn btr_collect_keys(index: *dict_index_t, list: *ArrayList(i64)) !void {
     list.clearRetainingCapacity();
     const leftmost = descend_to_level(index, 0, true) orelse return;
     var block_opt: ?*buf_block_t = leftmost;
@@ -3004,6 +3008,107 @@ fn btr_collect_keys(index: *dict_index_t, list: *std.ArrayList(i64)) !void {
     }
 }
 
+pub fn btr_debug_generate_trace(
+    allocator: std.mem.Allocator,
+    seed: u64,
+    ops: usize,
+    validate: bool,
+    writer: anytype,
+) !void {
+    const index = try allocator.create(dict_index_t);
+    index.* = .{};
+    defer allocator.destroy(index);
+    defer index_state_remove(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1500 }, index, &mtr);
+
+    var keys = ArrayList(i64).init(allocator);
+    defer keys.deinit();
+    var key_set = std.AutoHashMap(i64, void).init(allocator);
+    defer key_set.deinit();
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    try writer.print("seed={d} ops={d}\n", .{ seed, ops });
+
+    var op_idx: usize = 0;
+    while (op_idx < ops) : (op_idx += 1) {
+        const action: u8 = if (keys.items.len == 0) 0 else rnd.uintLessThan(u8, 3);
+        switch (action) {
+            0 => {
+                var key = rnd.intRangeAtMost(i64, 1, 1000);
+                var tries: usize = 0;
+                while (key_set.contains(key) and tries < 10) : (tries += 1) {
+                    key = rnd.intRangeAtMost(i64, 1, 1000);
+                }
+                if (key_set.contains(key)) {
+                    continue;
+                }
+                const block = btr_find_leaf_for_key(index, key) orelse return error.OutOfMemory;
+                var cursor = btr_cur_t{
+                    .index = index,
+                    .block = block,
+                    .rec = page.page_get_infimum_rec(block.frame),
+                    .opened = true,
+                };
+                var rec_out: ?*rec_t = null;
+                var big_rec: ?*big_rec_t = null;
+                var fields = [_]data.dfield_t{.{ .data = &key, .len = @intCast(@sizeOf(i64)) }};
+                var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+                if (btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr) != 0) {
+                    continue;
+                }
+                try key_set.put(key, {});
+                try keys.append(key);
+                try writer.print("I {d}\n", .{key});
+            },
+            1 => {
+                const idx = rnd.uintLessThan(usize, keys.items.len);
+                const key = keys.items[idx];
+                const rec = btr_find_rec_by_key(index, key) orelse return error.OutOfMemory;
+                const block = btr_block_for_rec(index, rec) orelse return error.OutOfMemory;
+                var cursor = btr_cur_t{
+                    .index = index,
+                    .block = block,
+                    .rec = rec,
+                    .opened = true,
+                };
+                _ = btr_cur_optimistic_delete(&cursor, &mtr);
+                _ = key_set.remove(key);
+                keys.items[idx] = keys.items[keys.items.len - 1];
+                keys.items.len -= 1;
+                try writer.print("D {d}\n", .{key});
+            },
+            else => {
+                var search_key: i64 = rnd.intRangeAtMost(i64, 1, 1000);
+                if (keys.items.len > 0 and rnd.boolean()) {
+                    search_key = keys.items[rnd.uintLessThan(usize, keys.items.len)];
+                }
+                const found = btr_find_rec_by_key(index, search_key) != null;
+                const found_flag: u8 = @as(u8, @intFromBool(found));
+                try writer.print("S {d} {d}\n", .{ search_key, found_flag });
+            },
+        }
+
+        if (validate and btr_validate_index(index, null) == compat.FALSE) {
+            return error.InvalidTree;
+        }
+    }
+
+    var final_keys = ArrayList(i64).init(allocator);
+    defer final_keys.deinit();
+    try btr_collect_keys(index, &final_keys);
+    std.sort.pdq(i64, final_keys.items, {}, comptime std.sort.asc(i64));
+
+    try writer.print("final {d}", .{final_keys.items.len});
+    for (final_keys.items) |key| {
+        try writer.print(" {d}", .{key});
+    }
+    try writer.writeByte('\n');
+}
+
 test "btr validate index random ops" {
     const allocator = std.heap.page_allocator;
     const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
@@ -3013,12 +3118,12 @@ test "btr validate index random ops" {
     var mtr = mtr_t{};
     _ = btr_create(0, 1, 0, .{ .high = 0, .low = 1400 }, index, &mtr);
 
-    var keys = std.ArrayList(i64).init(allocator);
+    var keys = ArrayList(i64).init(allocator);
     defer keys.deinit();
     var key_set = std.AutoHashMap(i64, void).init(allocator);
     defer key_set.deinit();
 
-    var prng = std.rand.DefaultPrng.init(0x1357_9BDF);
+    var prng = std.Random.DefaultPrng.init(0x1357_9BDF);
     const rnd = prng.random();
 
     var op: usize = 0;
@@ -3085,13 +3190,13 @@ test "btr validate index random ops" {
         try std.testing.expectEqual(compat.TRUE, btr_validate_index(index, null));
     }
 
-    var scanned = std.ArrayList(i64).init(allocator);
+    var scanned = ArrayList(i64).init(allocator);
     defer scanned.deinit();
     try btr_collect_keys(index, &scanned);
 
     const expected = try allocator.dupe(i64, keys.items);
     defer allocator.free(expected);
-    std.sort.sort(i64, expected, {}, comptime std.sort.asc(i64));
+    std.sort.pdq(i64, expected, {}, comptime std.sort.asc(i64));
 
     try std.testing.expectEqual(expected.len, scanned.items.len);
     for (expected, scanned.items) |exp, got| {
