@@ -377,6 +377,7 @@ fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict
     var offsets: ulint = 0;
     var inserted: ?*rec_t = null;
     const allocator = std.heap.page_allocator;
+    const bytes = btr_block_bytes_ensure(block);
     for (entries) |entry| {
         const rec = allocator.create(rec_t) catch return inserted;
         rec.* = .{
@@ -394,6 +395,20 @@ fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict
             allocator.destroy(rec);
             return inserted;
         }
+        if (bytes) |buf| {
+            if (entry.rec_bytes) |rec_bytes| {
+                if (entry.rec_offset != 0) {
+                    const rec_head = page.page_bytes_insert_append(buf, rec_bytes) orelse return inserted;
+                    rec.rec_bytes = rec_bytes;
+                    rec.rec_offset = entry.rec_offset;
+                    rec.rec_page_offset = rec_head + entry.rec_offset;
+                    const dir_pos = page.page_rec_get_n_recs_before(block.frame, rec);
+                    if (!page.page_dir_insert_slot_bytes(buf.ptr, dir_pos, rec.rec_page_offset)) {
+                        return inserted;
+                    }
+                }
+            }
+        }
         cursor.rec = rec;
         if (entry.is_new and inserted == null) {
             inserted = rec;
@@ -408,6 +423,7 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
     defer entries.deinit();
 
     const new_key = dtuple_to_key(tuple);
+    const new_rec_bytes = encode_tuple_compact_bytes(tuple) orelse return null;
     var inserted = false;
     var current = block.frame.infimum.next;
     while (current) |node| {
@@ -418,8 +434,8 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
             entries.append(.{
                 .key = new_key,
                 .payload = null,
-                .rec_bytes = null,
-                .rec_offset = 0,
+                .rec_bytes = new_rec_bytes.buf,
+                .rec_offset = new_rec_bytes.header_len,
                 .deleted = false,
                 .min_rec_mark = false,
                 .extern_fields = &[_]page.extern_field_t{},
@@ -447,8 +463,8 @@ fn split_leaf_and_insert(index: *dict_index_t, block: *buf_block_t, tuple: *cons
         entries.append(.{
             .key = new_key,
             .payload = null,
-            .rec_bytes = null,
-            .rec_offset = 0,
+            .rec_bytes = new_rec_bytes.buf,
+            .rec_offset = new_rec_bytes.header_len,
             .deleted = false,
             .min_rec_mark = false,
             .extern_fields = &[_]page.extern_field_t{},
@@ -1391,9 +1407,10 @@ fn btr_cur_insert_if_possible(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext:
         return null;
     };
     new_rec.rec_bytes = rec_bytes.buf;
-    new_rec.rec_offset = rec_head + rec_bytes.header_len;
+    new_rec.rec_offset = rec_bytes.header_len;
+    new_rec.rec_page_offset = rec_head + rec_bytes.header_len;
     const dir_pos = page.page_rec_get_n_recs_before(block.frame, new_rec);
-    if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, new_rec.rec_offset)) {
+    if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, new_rec.rec_page_offset)) {
         var del_cursor = page.page_cur_t{ .block = block, .rec = new_rec };
         page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
         allocator.destroy(new_rec);
@@ -2574,6 +2591,68 @@ test "btr leaf split raises root" {
         values.append(rec.key) catch return error.OutOfMemory;
         const next = btr_get_next_user_rec(rec, null) orelse break;
         rec = next;
+    }
+
+    try std.testing.expectEqual(@as(usize, BTR_MAX_RECS_PER_PAGE + 1), values.items.len);
+    var expected: i64 = 1;
+    for (values.items) |val| {
+        try std.testing.expectEqual(expected, val);
+        expected += 1;
+    }
+
+    index_state_remove(index);
+}
+
+test "btr leaf split preserves rec bytes" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 401 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= @as(i64, BTR_MAX_RECS_PER_PAGE + 1)) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = @sizeOf(i64), .nullable = false }};
+    var values = ArrayList(i64).init(allocator);
+    defer values.deinit();
+
+    var block_opt = btr_find_leaf_for_key(index, 1);
+    while (block_opt) |block| {
+        var byte_cur = page.page_cur_bytes_t{};
+        page.page_cur_bytes_set_before_first(block.bytes, &byte_cur);
+        while (true) {
+            page.page_cur_bytes_move_to_next(&byte_cur);
+            if (page.page_cur_bytes_is_after_last(&byte_cur)) {
+                break;
+            }
+            const rec_ptr = page.page_cur_bytes_get_rec_ptr(&byte_cur) orelse return error.TestExpectedEqual;
+            var offsets = [_]ulint{0} ** 16;
+            rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+            var len: ulint = 0;
+            const field_ptr = rec_mod.rec_get_nth_field(rec_ptr, offsets[0..], 0, &len);
+            try std.testing.expectEqual(@as(ulint, @sizeOf(i64)), len);
+            const field_buf = @as(*const [@sizeOf(i64)]u8, @ptrCast(field_ptr));
+            const value = std.mem.readInt(i64, field_buf, .little);
+            values.append(value) catch return error.OutOfMemory;
+        }
+        block_opt = block.frame.next_block;
     }
 
     try std.testing.expectEqual(@as(usize, BTR_MAX_RECS_PER_PAGE + 1), values.items.len);
