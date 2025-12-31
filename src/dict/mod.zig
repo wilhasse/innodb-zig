@@ -1034,7 +1034,29 @@ fn dict_hdr_create() ibool {
     return compat.TRUE;
 }
 
-fn dict_insert_initial_data() void {}
+fn dict_bootstrap_sys_table(name: []const u8, table_id: dulint) void {
+    const table = dict_mem_table_create(name, DICT_HDR_SPACE, 1, 0) orelse return;
+    dict_mem_table_add_col(table, null, "ID", data.DATA_INT, data.DATA_UNSIGNED, 4);
+    table.id = table_id;
+    table.n_cols = @as(ulint, @intCast(table.cols.items.len));
+    table.n_def = table.n_cols;
+
+    var heap = mem_heap_t{};
+    dict_table_add_to_cache(table, &heap);
+
+    const index = dict_mem_index_create(name, "PRIMARY", DICT_HDR_SPACE, DICT_UNIQUE | DICT_CLUSTERED, 1) orelse return;
+    if (table.cols.items.len > 0) {
+        dict_index_add_col(index, table, &table.cols.items[0], 0);
+    }
+    index.id = table_id;
+    _ = dict_index_add_to_cache(table, index, 0, compat.FALSE);
+}
+
+fn dict_insert_initial_data() void {
+    dict_bootstrap_sys_table("SYS_TABLES", DICT_TABLES_ID);
+    dict_bootstrap_sys_table("SYS_COLUMNS", DICT_COLUMNS_ID);
+    dict_bootstrap_sys_table("SYS_INDEXES", DICT_INDEXES_ID);
+}
 
 fn dulintCreate(high: ulint, low: ulint) dulint {
     return .{ .high = high, .low = low };
