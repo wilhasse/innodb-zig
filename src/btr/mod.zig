@@ -100,7 +100,7 @@ pub const btr_search_sys_t = struct {
     hash_size: ulint = 0,
 };
 
-pub const dtuple_t = struct {};
+pub const dtuple_t = page.dtuple_t;
 
 pub fn btr_root_get(index: *dict_index_t, mtr: *mtr_t) ?*page_t {
     const block = btr_root_block_get(index, mtr) orelse return null;
@@ -199,6 +199,11 @@ fn page_first_user_rec(page_obj: *page_t) ?*rec_t {
     return if (first.is_supremum) null else first;
 }
 
+fn page_last_user_rec(page_obj: *page_t) ?*rec_t {
+    const last = page_obj.supremum.prev orelse return null;
+    return if (last.is_infimum) null else last;
+}
+
 fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
     var current = parent_page.infimum.next;
     const child_no = child_block.frame.page_no;
@@ -216,6 +221,19 @@ fn find_node_ptr(parent_page: *page_t, child_block: *buf_block_t) ?*rec_t {
         current = node.next;
     }
     return null;
+}
+
+fn descend_to_level(index: *dict_index_t, target_level: ulint, from_left: bool) ?*buf_block_t {
+    var block = btr_root_block_get(index, null) orelse return null;
+    var level = block.frame.header.level;
+    while (level > target_level) {
+        const node_ptr = if (from_left) page_first_user_rec(block.frame) else page_last_user_rec(block.frame);
+        const rec = node_ptr orelse return block;
+        const child = rec.child_block orelse return block;
+        block = child;
+        level = block.frame.header.level;
+    }
+    return block;
 }
 
 pub fn btr_node_ptr_get_child(node_ptr: *const rec_t, index: *dict_index_t, offsets: *const ulint, mtr: *mtr_t) ?*buf_block_t {
@@ -538,19 +556,22 @@ pub fn btr_cur_search_to_nth_level(
     line: ulint,
     mtr: *mtr_t,
 ) void {
-    _ = level;
-    _ = tuple;
-    _ = mode;
     _ = latch_mode;
     _ = has_search_latch;
     _ = file;
     _ = line;
     _ = mtr;
     cursor.index = index;
-    cursor.rec = null;
-    cursor.block = null;
     cursor.opened = true;
     btr_cur_n_non_sea += 1;
+    cursor.rec = null;
+    cursor.block = null;
+
+    const block = descend_to_level(index, level, true) orelse return;
+    var page_cursor = page.page_cur_t{};
+    _ = page.page_cur_search(block, index, tuple, mode, &page_cursor);
+    cursor.block = page_cursor.block;
+    cursor.rec = page_cursor.rec;
 }
 
 pub fn btr_cur_open_at_index_side_func(
@@ -562,15 +583,22 @@ pub fn btr_cur_open_at_index_side_func(
     line: ulint,
     mtr: *mtr_t,
 ) void {
-    _ = from_left;
     _ = latch_mode;
     _ = file;
     _ = line;
     _ = mtr;
     cursor.index = index;
+    cursor.opened = true;
     cursor.rec = null;
     cursor.block = null;
-    cursor.opened = true;
+
+    const open_left = from_left != compat.FALSE;
+    const block = descend_to_level(index, 0, open_left) orelse return;
+    cursor.block = block;
+    cursor.rec = if (open_left)
+        page.page_get_infimum_rec(block.frame)
+    else
+        page.page_get_supremum_rec(block.frame);
 }
 
 pub fn btr_cur_open_at_rnd_pos_func(
@@ -584,11 +612,29 @@ pub fn btr_cur_open_at_rnd_pos_func(
     _ = latch_mode;
     _ = file;
     _ = line;
-    _ = mtr;
     cursor.index = index;
+    cursor.opened = true;
     cursor.rec = null;
     cursor.block = null;
-    cursor.opened = true;
+
+    var block = btr_root_block_get(index, mtr) orelse return;
+    var level = block.frame.header.level;
+    while (level > 0) {
+        var page_cursor = page.page_cur_t{};
+        page.page_cur_open_on_rnd_user_rec(block, &page_cursor);
+        const chosen = page_cursor.rec orelse break;
+        if (chosen.is_infimum or chosen.is_supremum) {
+            break;
+        }
+        const child = chosen.child_block orelse break;
+        block = child;
+        level = block.frame.header.level;
+    }
+
+    var leaf_cursor = page.page_cur_t{};
+    page.page_cur_open_on_rnd_user_rec(block, &leaf_cursor);
+    cursor.block = leaf_cursor.block;
+    cursor.rec = leaf_cursor.rec;
 }
 
 pub fn btr_cur_optimistic_insert(
@@ -1116,7 +1162,7 @@ test "btr split rec helpers default" {
     try std.testing.expect(split == null);
 }
 
-test "btr cursor open and search stubs" {
+test "btr cursor counters reset" {
     btr_cur_n_non_sea = 5;
     btr_cur_n_sea = 3;
     btr_cur_n_non_sea_old = 2;
@@ -1126,21 +1172,88 @@ test "btr cursor open and search stubs" {
     try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_sea);
     try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_non_sea_old);
     try std.testing.expectEqual(@as(ulint, 0), btr_cur_n_sea_old);
+}
 
-    var index = dict_index_t{};
-    var tuple = dtuple_t{};
+test "btr cursor search and open at index sides" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
     var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 200 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+    root_block.frame.header.level = 1;
+    index.root_level = 1;
+
+    const left = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    const right = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    left.frame.parent_block = root_block;
+    right.frame.parent_block = root_block;
+
+    var offsets: ulint = 0;
+    var root_cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(root_block, &root_cursor);
+
+    var left_ptr = page.rec_t{};
+    btr_node_ptr_set_child_page_no(&left_ptr, left.frame.page_no);
+    left_ptr.child_block = left;
+    _ = page.page_cur_rec_insert(&root_cursor, &left_ptr, index, &offsets, &mtr);
+
+    root_cursor.rec = &left_ptr;
+    var right_ptr = page.rec_t{};
+    btr_node_ptr_set_child_page_no(&right_ptr, right.frame.page_no);
+    right_ptr.child_block = right;
+    _ = page.page_cur_rec_insert(&root_cursor, &right_ptr, index, &offsets, &mtr);
+
+    var leaf_cursor = page.page_cur_t{};
+    page.page_cur_set_before_first(left, &leaf_cursor);
+    var lrec = page.rec_t{ .key = 10 };
+    _ = page.page_cur_rec_insert(&leaf_cursor, &lrec, index, &offsets, &mtr);
+
+    page.page_cur_set_before_first(right, &leaf_cursor);
+    var rrec1 = page.rec_t{ .key = 20 };
+    _ = page.page_cur_rec_insert(&leaf_cursor, &rrec1, index, &offsets, &mtr);
+    leaf_cursor.rec = &rrec1;
+    var rrec2 = page.rec_t{ .key = 30 };
+    _ = page.page_cur_rec_insert(&leaf_cursor, &rrec2, index, &offsets, &mtr);
+
+    btr_cur_n_non_sea = 0;
+    var tuple = dtuple_t{};
     var cursor = btr_cur_t{};
-
-    btr_cur_search_to_nth_level(&index, 0, &tuple, 0, 0, &cursor, 0, "file", 1, &mtr);
-    try std.testing.expect(cursor.index == &index);
-    try std.testing.expect(cursor.opened);
+    btr_cur_search_to_nth_level(index, 0, &tuple, 0, 0, &cursor, 0, "file", 1, &mtr);
     try std.testing.expectEqual(@as(ulint, 1), btr_cur_n_non_sea);
+    try std.testing.expect(cursor.block != null);
+    try std.testing.expect(cursor.rec != null);
+    try std.testing.expect(cursor.block.? == left);
+    try std.testing.expect(cursor.rec.? == &lrec);
 
-    var cursor2 = btr_cur_t{};
-    btr_cur_open_at_index_side_func(compat.TRUE, &index, 0, &cursor2, "file", 2, &mtr);
-    try std.testing.expect(cursor2.index == &index);
-    try std.testing.expect(cursor2.opened);
+    var left_cur = btr_cur_t{};
+    btr_cur_open_at_index_side_func(compat.TRUE, index, 0, &left_cur, "file", 2, &mtr);
+    try std.testing.expect(left_cur.block != null);
+    try std.testing.expect(left_cur.rec != null);
+    try std.testing.expect(left_cur.block.? == left);
+    try std.testing.expect(left_cur.rec.? == page.page_get_infimum_rec(left.frame));
+    try std.testing.expect(btr_get_next_user_rec(left_cur.rec, null) == &lrec);
+
+    var right_cur = btr_cur_t{};
+    btr_cur_open_at_index_side_func(compat.FALSE, index, 0, &right_cur, "file", 3, &mtr);
+    try std.testing.expect(right_cur.block != null);
+    try std.testing.expect(right_cur.rec != null);
+    try std.testing.expect(right_cur.block.? == right);
+    try std.testing.expect(right_cur.rec.? == page.page_get_supremum_rec(right.frame));
+    try std.testing.expect(btr_get_prev_user_rec(right_cur.rec, null) == &rrec2);
+
+    var rnd_cur = btr_cur_t{};
+    btr_cur_open_at_rnd_pos_func(index, 0, &rnd_cur, "file", 4, &mtr);
+    try std.testing.expect(rnd_cur.block != null);
+    try std.testing.expect(rnd_cur.rec != null);
+    const rnd_block = rnd_cur.block.?;
+    const rnd_rec = rnd_cur.rec.?;
+    try std.testing.expect(rnd_block == left or rnd_block == right);
+    try std.testing.expect(!rnd_rec.is_infimum and !rnd_rec.is_supremum);
+
+    index_state_remove(index);
 }
 
 test "btr page create and empty base records" {
