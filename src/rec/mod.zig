@@ -52,6 +52,13 @@ pub const REC_OFFS_SQL_NULL: ulint = 1 << 31;
 pub const REC_OFFS_EXTERNAL: ulint = 1 << 30;
 pub const REC_OFFS_MASK: ulint = REC_OFFS_EXTERNAL - 1;
 
+pub const FieldMeta = struct {
+    fixed_len: ulint = 0,
+    max_len: ulint = 0,
+    nullable: bool = false,
+    is_blob: bool = false,
+};
+
 // Bit-field offsets and masks.
 pub const REC_NEXT: ulint = 2;
 pub const REC_NEXT_MASK: ulint = 0xFFFF;
@@ -250,6 +257,80 @@ pub fn rec_init_offsets_fixed(field_lens: []const ulint, offsets: []ulint, compa
     }
 }
 
+fn bitsInBytes(n: ulint) ulint {
+    return (n + 7) / 8;
+}
+
+pub fn rec_init_offsets_compact(rec: [*]const byte, extra: ulint, fields: []const FieldMeta, offsets: []ulint) void {
+    const needed = @as(usize, @intCast(REC_OFFS_HEADER_SIZE + 1 + fields.len));
+    std.debug.assert(offsets.len >= needed);
+    rec_offs_set_n_fields(offsets, @intCast(fields.len));
+    rec_offs_set_n_alloc(offsets, @intCast(offsets.len));
+
+    var n_nullable: ulint = 0;
+    for (fields) |field| {
+        if (field.nullable) {
+            n_nullable += 1;
+        }
+    }
+
+    var offs: ulint = 0;
+    var any_ext: ulint = 0;
+    var null_mask: u8 = 1;
+    var nulls = rec_ptr(rec, extra + 1);
+    var lens = rec_ptr(nulls, bitsInBytes(n_nullable));
+
+    const base = rec_offs_base(offsets);
+    for (fields, 0..) |field, i| {
+        var len: ulint = 0;
+        if (field.nullable) {
+            if (null_mask == 0) {
+                nulls = rec_ptr(nulls, 1);
+                null_mask = 1;
+            }
+            if ((nulls[0] & null_mask) != 0) {
+                null_mask <<= 1;
+                len = offs | REC_OFFS_SQL_NULL;
+                base[1 + i] = len;
+                continue;
+            }
+            null_mask <<= 1;
+        }
+
+        if (field.fixed_len != 0) {
+            offs += field.fixed_len;
+            len = offs;
+            base[1 + i] = len;
+            continue;
+        }
+
+        const len_byte: ulint = lens[0];
+        lens = rec_ptr(lens, 1);
+        if (field.max_len > 255 or field.is_blob) {
+            if ((len_byte & 0x80) != 0) {
+                len = (len_byte << 8) | lens[0];
+                lens = rec_ptr(lens, 1);
+                offs += len & 0x3fff;
+                if ((len & 0x4000) != 0) {
+                    any_ext = REC_OFFS_EXTERNAL;
+                    len = offs | REC_OFFS_EXTERNAL;
+                } else {
+                    len = offs;
+                }
+                base[1 + i] = len;
+                continue;
+            }
+        }
+
+        offs += len_byte;
+        len = offs;
+        base[1 + i] = len;
+    }
+
+    const extra_size = @as(ulint, @intCast(@intFromPtr(rec) - (@intFromPtr(lens) + 1)));
+    base[0] = extra_size | REC_OFFS_COMPACT | any_ext;
+}
+
 test "rec constants match C defaults" {
     try std.testing.expectEqual(@as(ulint, 1023), REC_MAX_N_FIELDS);
     try std.testing.expectEqual(@as(ulint, 16383), REC_MAX_HEAP_NO);
@@ -295,4 +376,30 @@ test "rec offsets fixed-length" {
     try std.testing.expectEqual(@as(ulint, 3), base[1]);
     try std.testing.expectEqual(@as(ulint, 7), base[2]);
     try std.testing.expectEqual(@as(ulint, 9), base[3]);
+}
+
+test "rec offsets varlen + nulls (compact)" {
+    var buf = [_]byte{0} ** 64;
+    const rec = @as([*]const byte, @ptrCast(&buf[32]));
+
+    // One nullable field (field 1), marked NULL in the bitmap.
+    const extra = REC_N_NEW_EXTRA_BYTES;
+    buf[32 - (extra + 1)] = 0x01;
+    // One length byte for field 0 (3 bytes).
+    buf[32 - (extra + 1) - 1] = 3;
+
+    const fields = [_]FieldMeta{
+        .{ .fixed_len = 0, .max_len = 10, .nullable = false },
+        .{ .fixed_len = 0, .max_len = 10, .nullable = true },
+        .{ .fixed_len = 2, .nullable = false },
+    };
+
+    var offsets = [_]ulint{0} ** 16;
+    rec_init_offsets_compact(rec, extra, &fields, offsets[0..]);
+    const base = rec_offs_base(offsets[0..]);
+
+    try std.testing.expectEqual(@as(ulint, 3), base[1]);
+    try std.testing.expect((base[2] & REC_OFFS_SQL_NULL) != 0);
+    try std.testing.expectEqual(@as(ulint, 3), base[2] & REC_OFFS_MASK);
+    try std.testing.expectEqual(@as(ulint, 5), base[3]);
 }
