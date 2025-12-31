@@ -181,6 +181,27 @@ pub fn page_free_push_bytes(page: [*]byte, rec_offs: ulint, rec_size: ulint) voi
     page_garbage_add_bytes(page, rec_size);
 }
 
+pub fn page_bytes_insert_append(page: []u8, rec_bytes: []const u8) ?ulint {
+    const heap_top = page_header_get_offs_bytes(page.ptr, PAGE_HEAP_TOP);
+    if (heap_top == 0) {
+        return null;
+    }
+    const rec_len: ulint = @intCast(rec_bytes.len);
+    const end = heap_top + rec_len;
+    if (end > compat.UNIV_PAGE_SIZE - PAGE_DIR) {
+        return null;
+    }
+
+    const start_idx = @as(usize, @intCast(heap_top));
+    const end_idx = @as(usize, @intCast(end));
+    std.mem.copyForwards(u8, page[start_idx..end_idx], rec_bytes);
+
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, end);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, page_header_get_field_bytes(page.ptr, PAGE_N_HEAP) + 1);
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, page_header_get_field_bytes(page.ptr, PAGE_N_RECS) + 1);
+    return heap_top;
+}
+
 pub const page_t = struct {
     header: PageHeader = .{},
     infimum: rec_t = .{ .is_infimum = true },
@@ -1015,4 +1036,25 @@ test "page free list and garbage byte helpers" {
 
     page_garbage_add_bytes(page_bytes, 16);
     try std.testing.expectEqual(@as(ulint, 48), page_garbage_get_bytes(page_bytes));
+}
+
+test "page bytes append insert" {
+    var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    var page = buf[0..];
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, 200);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
+
+    const rec1 = "abc";
+    const off1 = page_bytes_insert_append(page, rec1) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(ulint, 200), off1);
+    try std.testing.expect(std.mem.eql(u8, page[@intCast(off1) .. @intCast(off1 + rec1.len)], rec1));
+
+    const rec2 = "xyz12";
+    const off2 = page_bytes_insert_append(page, rec2) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(ulint, 200 + rec1.len), off2);
+    try std.testing.expect(std.mem.eql(u8, page[@intCast(off2) .. @intCast(off2 + rec2.len)], rec2));
+
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_HEAP));
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(page.ptr, PAGE_N_RECS));
 }
