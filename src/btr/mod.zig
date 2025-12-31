@@ -56,6 +56,13 @@ pub var btr_search_enabled: u8 = 1;
 pub var btr_search_this_is_zero: ulint = 0;
 pub var btr_search_sys: ?*btr_search_sys_t = null;
 
+const IndexState = struct {
+    pages: std.AutoHashMap(ulint, *buf_block_t),
+    next_page_no: ulint,
+};
+
+var index_states = std.AutoHashMap(*dict_index_t, *IndexState).init(std.heap.page_allocator);
+
 pub const rec_t = page.rec_t;
 pub const dict_index_t = dict.dict_index_t;
 pub const mtr_t = page.mtr_t;
@@ -120,6 +127,37 @@ fn btr_page_set_level(page_obj: *page_t, page_zip: ?*page_zip_des_t, level: ulin
 fn btr_page_get_level(page_obj: *const page_t, mtr: *mtr_t) ulint {
     _ = mtr;
     return page_obj.header.level;
+}
+
+fn index_state_get(index: *dict_index_t) ?*IndexState {
+    if (index_states.get(index)) |state| {
+        return state;
+    }
+    const allocator = std.heap.page_allocator;
+    const state = allocator.create(IndexState) catch return null;
+    state.* = .{
+        .pages = std.AutoHashMap(ulint, *buf_block_t).init(allocator),
+        .next_page_no = 1,
+    };
+    index_states.put(index, state) catch {
+        state.pages.deinit();
+        allocator.destroy(state);
+        return null;
+    };
+    return state;
+}
+
+fn index_state_remove(index: *dict_index_t) void {
+    const allocator = std.heap.page_allocator;
+    if (index_states.fetchRemove(index)) |entry| {
+        var it = entry.value.pages.valueIterator();
+        while (it.next()) |block_ptr| {
+            allocator.destroy(block_ptr.*.frame);
+            allocator.destroy(block_ptr.*);
+        }
+        entry.value.pages.deinit();
+        allocator.destroy(entry.value);
+    }
 }
 
 fn btr_node_ptr_set_child_page_no(rec: *rec_t, page_no: ulint) void {
@@ -249,31 +287,52 @@ pub fn btr_get_next_user_rec(rec: ?*rec_t, mtr: ?*mtr_t) ?*rec_t {
 }
 
 pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction: byte, level: ulint, mtr: *mtr_t) ?*buf_block_t {
-    _ = index;
     _ = hint_page_no;
     _ = file_direction;
-    _ = level;
     _ = mtr;
-    return null;
+    const state = index_state_get(index) orelse return null;
+    const allocator = std.heap.page_allocator;
+    const page_obj = allocator.create(page_t) catch return null;
+    page_obj.* = .{};
+    page_obj.page_no = state.next_page_no;
+    state.next_page_no += 1;
+    page.page_init(page_obj);
+    page_obj.header.level = level;
+
+    const block = allocator.create(buf_block_t) catch {
+        allocator.destroy(page_obj);
+        return null;
+    };
+    block.* = .{ .frame = page_obj, .page_zip = null };
+
+    state.pages.put(page_obj.page_no, block) catch {
+        allocator.destroy(block);
+        allocator.destroy(page_obj);
+        return null;
+    };
+
+    return block;
 }
 
 pub fn btr_get_size(index: *dict_index_t, flag: ulint) ulint {
-    _ = index;
     _ = flag;
-    return 0;
+    const state = index_states.get(index) orelse return 0;
+    return @intCast(state.pages.count());
 }
 
 pub fn btr_page_free_low(index: *dict_index_t, block: *buf_block_t, level: ulint, mtr: *mtr_t) void {
-    _ = index;
-    _ = block;
     _ = level;
     _ = mtr;
+    const state = index_states.get(index) orelse return;
+    const page_no = block.frame.page_no;
+    if (state.pages.fetchRemove(page_no)) |entry| {
+        std.heap.page_allocator.destroy(entry.value.frame);
+        std.heap.page_allocator.destroy(entry.value);
+    }
 }
 
 pub fn btr_page_free(index: *dict_index_t, block: *buf_block_t, mtr: *mtr_t) void {
-    _ = index;
-    _ = block;
-    _ = mtr;
+    btr_page_free_low(index, block, 0, mtr);
 }
 
 pub fn btr_create(type_: ulint, space: ulint, zip_size: ulint, index_id: dulint, index: *dict_index_t, mtr: *mtr_t) ulint {
@@ -1101,6 +1160,30 @@ test "btr node pointer and father lookup" {
     btr_page_get_father(btr_cursor2.index.?, &child_block, &mtr, &btr_cursor2);
     try std.testing.expect(btr_cursor2.block == &parent_block);
     try std.testing.expect(btr_cursor2.rec == &node_ptr);
+}
+
+test "btr page alloc free and size" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    const block1 = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, 1), block1.frame.page_no);
+    try std.testing.expectEqual(@as(ulint, 1), btr_get_size(index, 0));
+
+    const block2 = btr_page_alloc(index, 0, 0, 0, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, 2), block2.frame.page_no);
+    try std.testing.expectEqual(@as(ulint, 2), btr_get_size(index, 0));
+
+    btr_page_free(index, block1, &mtr);
+    try std.testing.expectEqual(@as(ulint, 1), btr_get_size(index, 0));
+
+    btr_page_free(index, block2, &mtr);
+    try std.testing.expectEqual(@as(ulint, 0), btr_get_size(index, 0));
+
+    index_state_remove(index);
 }
 
 test "btr external field prefix copy" {
