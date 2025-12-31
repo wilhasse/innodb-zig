@@ -72,7 +72,10 @@ pub const mtr_t = page.mtr_t;
 pub const buf_block_t = page.buf_block_t;
 pub const page_t = page.page_t;
 pub const page_zip_des_t = page.page_zip_des_t;
-pub const upd_t = struct {};
+pub const upd_t = struct {
+    new_key: i64 = 0,
+    size_change: bool = false,
+};
 pub const que_thr_t = struct {};
 pub const big_rec_t = struct {};
 pub const mem_heap_t = struct {};
@@ -1034,6 +1037,21 @@ pub fn btr_cur_parse_update_in_place(
     return ptr;
 }
 
+pub fn btr_cur_update_alloc_zip(
+    page_zip: ?*page_zip_des_t,
+    block: *buf_block_t,
+    index: *dict_index_t,
+    update: *const upd_t,
+    mtr: *mtr_t,
+) ibool {
+    _ = page_zip;
+    _ = block;
+    _ = index;
+    _ = update;
+    _ = mtr;
+    return compat.FALSE;
+}
+
 pub fn btr_cur_update_in_place(
     flags: ulint,
     cursor: *btr_cur_t,
@@ -1043,11 +1061,17 @@ pub fn btr_cur_update_in_place(
     mtr: *mtr_t,
 ) ulint {
     _ = flags;
-    _ = cursor;
-    _ = update;
     _ = cmpl_info;
     _ = thr;
     _ = mtr;
+    const rec = cursor.rec orelse return 1;
+    if (rec.is_infimum or rec.is_supremum) {
+        return 1;
+    }
+    if (update.size_change) {
+        return 1;
+    }
+    rec.key = update.new_key;
     return 0;
 }
 
@@ -1059,13 +1083,10 @@ pub fn btr_cur_optimistic_update(
     thr: *que_thr_t,
     mtr: *mtr_t,
 ) ulint {
-    _ = flags;
-    _ = cursor;
-    _ = update;
-    _ = cmpl_info;
-    _ = thr;
-    _ = mtr;
-    return 0;
+    if (update.size_change) {
+        return 1;
+    }
+    return btr_cur_update_in_place(flags, cursor, update, cmpl_info, thr, mtr);
 }
 
 pub fn btr_cur_pessimistic_update(
@@ -1078,14 +1099,33 @@ pub fn btr_cur_pessimistic_update(
     thr: *que_thr_t,
     mtr: *mtr_t,
 ) ulint {
-    _ = flags;
-    _ = cursor;
-    _ = heap;
-    _ = update;
-    _ = cmpl_info;
-    _ = thr;
-    _ = mtr;
+    heap.* = null;
     big_rec.* = null;
+    if (!update.size_change) {
+        return btr_cur_update_in_place(flags, cursor, update, cmpl_info, thr, mtr);
+    }
+
+    const index = cursor.index orelse return 1;
+    const block = cursor.block orelse return 1;
+    const rec = cursor.rec orelse return 1;
+    if (rec.is_infimum or rec.is_supremum) {
+        return 1;
+    }
+
+    var page_cursor = page.page_cur_t{ .block = block, .rec = rec };
+    var offsets: ulint = 0;
+    page.page_cur_delete_rec(&page_cursor, index, &offsets, mtr);
+    cursor.rec = page_cursor.rec;
+
+    var new_key = update.new_key;
+    var fields = [_]data.dfield_t{.{ .data = &new_key, .len = @intCast(@sizeOf(i64)) }};
+    var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+    var rec_out: ?*rec_t = null;
+    var big_out: ?*big_rec_t = null;
+    if (btr_cur_optimistic_insert(0, cursor, &tuple, &rec_out, &big_out, 0, null, mtr) != 0 or rec_out == null) {
+        return 1;
+    }
+    cursor.rec = rec_out;
     return 0;
 }
 
@@ -1939,6 +1979,60 @@ test "btr delete mark and delete visibility" {
     }
     const expected_final = [_]i64{1};
     try std.testing.expectEqualSlices(i64, expected_final[0..], values.items);
+
+    index_state_remove(index);
+}
+
+test "btr update paths" {
+    const allocator = std.heap.page_allocator;
+    const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
+    index.* = .{};
+    defer allocator.destroy(index);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, 1, 0, .{ .high = 0, .low = 800 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    var key_val: i64 = 1;
+    while (key_val <= 3) : (key_val += 1) {
+        var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    const rec1 = page_first_user_rec(root_block.frame) orelse return error.OutOfMemory;
+    const rec2 = btr_get_next_user_rec(rec1, null) orelse return error.OutOfMemory;
+    const rec3 = btr_get_next_user_rec(rec2, null) orelse return error.OutOfMemory;
+
+    var update_in_place = upd_t{ .new_key = 4, .size_change = false };
+    var thr = que_thr_t{};
+    cursor.rec = rec2;
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_update(0, &cursor, &update_in_place, 0, &thr, &mtr));
+    try std.testing.expectEqual(@as(i64, 4), rec2.key);
+
+    var update_size = upd_t{ .new_key = 0, .size_change = true };
+    var heap: ?*mem_heap_t = null;
+    var big: ?*big_rec_t = null;
+    cursor.rec = rec3;
+    try std.testing.expectEqual(@as(ulint, 0), btr_cur_pessimistic_update(0, &cursor, &heap, &big, &update_size, 0, &thr, &mtr));
+
+    var values = std.ArrayList(i64).init(allocator);
+    defer values.deinit();
+    var rec_opt = btr_get_next_user_rec(page.page_get_infimum_rec(root_block.frame), null);
+    while (rec_opt) |rec| {
+        values.append(rec.key) catch return error.OutOfMemory;
+        rec_opt = btr_get_next_user_rec(rec, null);
+    }
+    const expected = [_]i64{ 0, 1, 4 };
+    try std.testing.expectEqualSlices(i64, expected[0..], values.items);
 
     index_state_remove(index);
 }
