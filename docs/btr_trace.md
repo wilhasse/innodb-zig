@@ -36,3 +36,20 @@ Each line is one operation:
 The unit test `btr trace output hash` locks the output via a stable FNV-1a hash.
 If you intentionally change the trace behavior, update the expected hash in
 `src/tests/ib_btr_trace.zig`.
+
+## Zig vs C comparison
+
+The script `scripts/compare_btr_trace.sh` builds/runs the Zig trace tool and a
+small C harness against the embedded InnoDB source tree, then diffs the output.
+
+Environment variables:
+- `C_ROOT`: path to the embedded InnoDB C tree (default `/home/cslog/oss-embedded-innodb`)
+- `SEED`: RNG seed (default `0xC0FFEE`)
+- `OPS`: operation count (default `60`)
+- `WORKDIR`: where to run the C harness (default: temp dir under `tmp/`)
+
+Example:
+
+```
+scripts/compare_btr_trace.sh
+```
