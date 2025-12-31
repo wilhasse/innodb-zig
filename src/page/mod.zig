@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const data = @import("../data/mod.zig");
 const dict = @import("../dict/mod.zig");
+const fil = @import("../fil/mod.zig");
 const fsp = @import("../fsp/mod.zig");
 const mach = @import("../mach/mod.zig");
 
@@ -19,6 +20,9 @@ pub const PAGE_CUR_L: ulint = 3;
 pub const PAGE_CUR_LE: ulint = 4;
 
 pub const PAGE_HEADER: ulint = fsp.FSEG_PAGE_DATA;
+pub const PAGE_DIR: ulint = fil.FIL_PAGE_DATA_END;
+pub const PAGE_DIR_SLOT_SIZE: ulint = 2;
+pub const PAGE_EMPTY_DIR_START: ulint = PAGE_DIR + 2 * PAGE_DIR_SLOT_SIZE;
 
 pub const PAGE_N_DIR_SLOTS: ulint = 0;
 pub const PAGE_HEAP_TOP: ulint = 2;
@@ -136,6 +140,20 @@ pub fn page_get_index_id_bytes(page: [*]const byte) compat.Dulint {
 
 pub fn page_set_index_id_bytes(page: [*]byte, id: compat.Dulint) void {
     mach.mach_write_to_8(page + PAGE_HEADER + PAGE_INDEX_ID, id);
+}
+
+pub fn page_dir_get_nth_slot(page: [*]const byte, n: ulint) [*]const byte {
+    const offs = compat.UNIV_PAGE_SIZE - PAGE_DIR - (n + 1) * PAGE_DIR_SLOT_SIZE;
+    return page + @as(usize, @intCast(offs));
+}
+
+pub fn page_dir_get_nth_slot_val(page: [*]const byte, n: ulint) ulint {
+    return mach.mach_read_from_2(page_dir_get_nth_slot(page, n));
+}
+
+pub fn page_dir_set_nth_slot(page: [*]byte, n: ulint, val: ulint) void {
+    const slot = page_dir_get_nth_slot(@as([*]const byte, page), n);
+    mach.mach_write_to_2(@constCast(slot), val);
 }
 
 pub const page_t = struct {
@@ -945,4 +963,15 @@ test "page header byte helpers" {
     const read_id = page_get_index_id_bytes(page_bytes);
     try std.testing.expectEqual(id.high, read_id.high);
     try std.testing.expectEqual(id.low, read_id.low);
+}
+
+test "page dir slot byte helpers" {
+    var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const page_bytes = buf[0..].ptr;
+
+    page_dir_set_nth_slot(page_bytes, 0, 123);
+    try std.testing.expectEqual(@as(ulint, 123), page_dir_get_nth_slot_val(page_bytes, 0));
+
+    page_dir_set_nth_slot(page_bytes, 3, 456);
+    try std.testing.expectEqual(@as(ulint, 456), page_dir_get_nth_slot_val(page_bytes, 3));
 }
