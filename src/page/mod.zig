@@ -1502,3 +1502,93 @@ test "page cursor bytes walks directory slots" {
     const f3b_len = data.dfield_get_len(&out_field);
     try std.testing.expectEqualStrings("three", @as([*]const byte, @ptrCast(f3b_ptr))[0..@as(usize, @intCast(f3b_len))]);
 }
+
+test "page bytes insert/delete/reorg cursor scan" {
+    var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const page = buf[0..];
+    page_header_set_field_bytes(page.ptr, PAGE_HEAP_TOP, 200);
+    page_header_set_field_bytes(page.ptr, PAGE_N_HEAP, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_RECS, 0);
+    page_header_set_field_bytes(page.ptr, PAGE_N_DIR_SLOTS, 0);
+    page_garbage_set_bytes(page.ptr, 0);
+
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = 0, .max_len = 10, .nullable = false }};
+    const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1 + 1;
+
+    var field1 = data.dfield_t{};
+    data.dfield_set_data(&field1, "a".ptr, 1);
+    var tuple1 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field1)[0..1] };
+    var rec1_buf = [_]byte{0} ** 16;
+    const rec1_len: ulint = header_len + 1;
+    const rec1_storage = rec1_buf[0..@as(usize, @intCast(rec1_len))];
+    const rec1_ptr = @as([*]byte, @ptrCast(rec1_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec1_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple1);
+
+    var field2 = data.dfield_t{};
+    data.dfield_set_data(&field2, "bb".ptr, 2);
+    var tuple2 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field2)[0..1] };
+    var rec2_buf = [_]byte{0} ** 16;
+    const rec2_len: ulint = header_len + 2;
+    const rec2_storage = rec2_buf[0..@as(usize, @intCast(rec2_len))];
+    const rec2_ptr = @as([*]byte, @ptrCast(rec2_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec2_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple2);
+
+    var field3 = data.dfield_t{};
+    data.dfield_set_data(&field3, "ccc".ptr, 3);
+    var tuple3 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field3)[0..1] };
+    var rec3_buf = [_]byte{0} ** 16;
+    const rec3_len: ulint = header_len + 3;
+    const rec3_storage = rec3_buf[0..@as(usize, @intCast(rec3_len))];
+    const rec3_ptr = @as([*]byte, @ptrCast(rec3_storage[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec3_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple3);
+
+    const off1 = page_bytes_insert_append(page, rec1_storage) orelse return error.TestExpectedEqual;
+    const off2 = page_bytes_insert_append(page, rec2_storage) orelse return error.TestExpectedEqual;
+    const off3 = page_bytes_insert_append(page, rec3_storage) orelse return error.TestExpectedEqual;
+
+    const rec1_offs = off1 + header_len;
+    const rec2_offs = off2 + header_len;
+    const rec3_offs = off3 + header_len;
+
+    page_header_set_field_bytes(page.ptr, PAGE_N_DIR_SLOTS, 3);
+    page_dir_set_nth_slot(page.ptr, 0, rec1_offs);
+    page_dir_set_nth_slot(page.ptr, 1, rec2_offs);
+    page_dir_set_nth_slot(page.ptr, 2, rec3_offs);
+
+    var size_offsets = [_]ulint{0} ** 16;
+    rec_mod.rec_init_offsets_compact(rec2_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, size_offsets[0..]);
+    const rec2_extra = size_offsets[rec_mod.REC_OFFS_HEADER_SIZE] & rec_mod.REC_OFFS_MASK;
+    var rec2_field_len: ulint = 0;
+    const rec2_last_offs = rec_mod.rec_get_nth_field_offs(size_offsets[0..], 0, &rec2_field_len);
+    const rec2_total = rec2_extra + rec2_last_offs + rec2_field_len;
+    page_rec_delete_bytes(page.ptr, rec2_offs, rec2_total);
+
+    try std.testing.expect(page_reorganize_bytes(page, &meta));
+
+    var cur = page_cur_bytes_t{};
+    page_cur_bytes_set_before_first(page, &cur);
+    page_cur_bytes_move_to_next(&cur);
+    const p1 = page_cur_bytes_get_rec_ptr(&cur) orelse return error.TestExpectedEqual;
+    var offsets = [_]ulint{0} ** 16;
+    rec_mod.rec_init_offsets_compact(p1, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+    var out_field = data.dfield_t{};
+    var out_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&out_field)[0..1] };
+    rec_mod.rec_decode_to_dtuple(p1, offsets[0..], &out_tuple);
+    const f1_ptr = data.dfield_get_data(&out_field).?;
+    const f1_len = data.dfield_get_len(&out_field);
+    try std.testing.expectEqualStrings("a", @as([*]const byte, @ptrCast(f1_ptr))[0..@as(usize, @intCast(f1_len))]);
+
+    page_cur_bytes_move_to_next(&cur);
+    const p2 = page_cur_bytes_get_rec_ptr(&cur) orelse return error.TestExpectedEqual;
+    @memset(offsets[0..], 0);
+    rec_mod.rec_init_offsets_compact(p2, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+    out_field = .{};
+    out_tuple = .{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&out_field)[0..1] };
+    rec_mod.rec_decode_to_dtuple(p2, offsets[0..], &out_tuple);
+    const f2_ptr = data.dfield_get_data(&out_field).?;
+    const f2_len = data.dfield_get_len(&out_field);
+    try std.testing.expectEqualStrings("ccc", @as([*]const byte, @ptrCast(f2_ptr))[0..@as(usize, @intCast(f2_len))]);
+
+    page_cur_bytes_move_to_next(&cur);
+    try std.testing.expect(page_cur_bytes_is_after_last(&cur));
+}
