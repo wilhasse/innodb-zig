@@ -667,6 +667,28 @@ pub fn rec_encode_compact(rec: [*]byte, extra: ulint, fields: []const FieldMeta,
     return @as(ulint, @intCast(@intFromPtr(end) - @intFromPtr(rec)));
 }
 
+pub fn rec_decode_to_dtuple(rec: [*]const byte, offsets: []const ulint, tuple: *data.dtuple_t) void {
+    const n_fields = rec_offs_n_fields(offsets);
+    std.debug.assert(tuple.n_fields >= n_fields);
+    tuple.n_fields = n_fields;
+    tuple.n_fields_cmp = n_fields;
+
+    var i: ulint = 0;
+    while (i < n_fields) : (i += 1) {
+        var len: ulint = 0;
+        const ptr = rec_get_nth_field(rec, offsets, i, &len);
+        const field = data.dtuple_get_nth_field(tuple, i);
+        if (len == compat.UNIV_SQL_NULL) {
+            data.dfield_set_null(field);
+            continue;
+        }
+        data.dfield_set_data(field, ptr, len);
+        if (rec_offs_nth_extern(offsets, i) != 0) {
+            data.dfield_set_ext(field);
+        }
+    }
+}
+
 test "rec constants match C defaults" {
     try std.testing.expectEqual(@as(ulint, 1023), REC_MAX_N_FIELDS);
     try std.testing.expectEqual(@as(ulint, 16383), REC_MAX_HEAP_NO);
@@ -852,4 +874,79 @@ test "rec encode compact varlen/null/prefix" {
     const f3 = rec_get_nth_field(@as([*]const byte, rec), offsets[0..], 3, &len);
     try std.testing.expectEqual(@as(ulint, 200), len);
     try std.testing.expect(std.mem.allEqual(u8, f3[0..200], 'x'));
+}
+
+test "rec decode fixed-length tuple" {
+    var in_fields = [_]data.dfield_t{
+        .{ .type = .{ .mtype = data.DATA_BINARY, .prtype = data.DATA_BINARY_TYPE } },
+        .{ .type = .{ .mtype = data.DATA_CHAR, .prtype = 0 } },
+    };
+    data.dfield_set_data(&in_fields[0], "ab".ptr, 2);
+    data.dfield_set_data(&in_fields[1], "wxyz".ptr, 4);
+    var in_tuple = data.dtuple_t{ .n_fields = 2, .n_fields_cmp = 2, .fields = in_fields[0..] };
+
+    const lens = [_]ulint{ 2, 4 };
+    var rec_buf = [_]byte{0} ** 8;
+    _ = rec_encode_fixed(&in_tuple, &lens, rec_buf[0..]);
+
+    var offsets = [_]ulint{0} ** 16;
+    rec_init_offsets_fixed(&lens, offsets[0..], true);
+
+    var out_fields = [_]data.dfield_t{
+        .{ .type = in_fields[0].type },
+        .{ .type = in_fields[1].type },
+    };
+    var out_tuple = data.dtuple_t{ .n_fields = 2, .n_fields_cmp = 2, .fields = out_fields[0..] };
+    rec_decode_to_dtuple(rec_buf[0..].ptr, offsets[0..], &out_tuple);
+
+    const f0 = data.dfield_get_data(&out_fields[0]).?;
+    try std.testing.expectEqualStrings("ab", @as([*]const byte, @ptrCast(f0))[0..2]);
+    const f1 = data.dfield_get_data(&out_fields[1]).?;
+    try std.testing.expectEqualStrings("wxyz", @as([*]const byte, @ptrCast(f1))[0..4]);
+}
+
+test "rec decode compact varlen/null/prefix" {
+    var fields = [_]data.dfield_t{
+        .{ .type = .{ .mtype = data.DATA_VARCHAR, .prtype = 0 } },
+        .{ .type = .{ .mtype = data.DATA_VARCHAR, .prtype = 0 } },
+        .{ .type = .{ .mtype = data.DATA_BINARY, .prtype = data.DATA_BINARY_TYPE } },
+        .{ .type = .{ .mtype = data.DATA_BLOB, .prtype = 0 } },
+    };
+    data.dfield_set_data(&fields[0], "hello".ptr, 3);
+    data.dfield_set_null(&fields[1]);
+    data.dfield_set_data(&fields[2], "OK".ptr, 2);
+    var blob = [_]byte{'x'} ** 200;
+    data.dfield_set_data(&fields[3], blob[0..].ptr, blob.len);
+    var in_tuple = data.dtuple_t{ .n_fields = 4, .n_fields_cmp = 4, .fields = fields[0..] };
+
+    const meta = [_]FieldMeta{
+        .{ .fixed_len = 0, .max_len = 10, .nullable = false },
+        .{ .fixed_len = 0, .max_len = 10, .nullable = true },
+        .{ .fixed_len = 2, .nullable = false },
+        .{ .fixed_len = 0, .max_len = 300, .nullable = false, .is_blob = true },
+    };
+
+    var buf = [_]byte{0} ** 512;
+    const rec = @as([*]byte, @ptrCast(&buf[256]));
+    _ = rec_encode_compact(rec, REC_N_NEW_EXTRA_BYTES, &meta, &in_tuple);
+
+    var offsets = [_]ulint{0} ** 32;
+    rec_init_offsets_compact(@as([*]const byte, rec), REC_N_NEW_EXTRA_BYTES, &meta, offsets[0..]);
+
+    var out_fields = [_]data.dfield_t{
+        .{ .type = fields[0].type },
+        .{ .type = fields[1].type },
+        .{ .type = fields[2].type },
+        .{ .type = fields[3].type },
+    };
+    var out_tuple = data.dtuple_t{ .n_fields = 4, .n_fields_cmp = 4, .fields = out_fields[0..] };
+    rec_decode_to_dtuple(@as([*]const byte, rec), offsets[0..], &out_tuple);
+
+    const f0 = data.dfield_get_data(&out_fields[0]).?;
+    try std.testing.expectEqualStrings("hel", @as([*]const byte, @ptrCast(f0))[0..3]);
+    try std.testing.expectEqual(@as(ulint, compat.UNIV_SQL_NULL), data.dfield_get_len(&out_fields[1]));
+    const f2 = data.dfield_get_data(&out_fields[2]).?;
+    try std.testing.expectEqualStrings("OK", @as([*]const byte, @ptrCast(f2))[0..2]);
+    const f3 = data.dfield_get_data(&out_fields[3]).?;
+    try std.testing.expect(std.mem.allEqual(u8, @as([*]const byte, @ptrCast(f3))[0..200], 'x'));
 }
