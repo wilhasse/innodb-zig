@@ -156,6 +156,31 @@ pub fn page_dir_set_nth_slot(page: [*]byte, n: ulint, val: ulint) void {
     mach.mach_write_to_2(@constCast(slot), val);
 }
 
+pub fn page_free_get_bytes(page: [*]const byte) ulint {
+    return page_header_get_field_bytes(page, PAGE_FREE);
+}
+
+pub fn page_free_set_bytes(page: [*]byte, offs: ulint) void {
+    page_header_set_field_bytes(page, PAGE_FREE, offs);
+}
+
+pub fn page_garbage_get_bytes(page: [*]const byte) ulint {
+    return page_header_get_field_bytes(page, PAGE_GARBAGE);
+}
+
+pub fn page_garbage_set_bytes(page: [*]byte, val: ulint) void {
+    page_header_set_field_bytes(page, PAGE_GARBAGE, val);
+}
+
+pub fn page_garbage_add_bytes(page: [*]byte, delta: ulint) void {
+    page_garbage_set_bytes(page, page_garbage_get_bytes(page) + delta);
+}
+
+pub fn page_free_push_bytes(page: [*]byte, rec_offs: ulint, rec_size: ulint) void {
+    page_free_set_bytes(page, rec_offs);
+    page_garbage_add_bytes(page, rec_size);
+}
+
 pub const page_t = struct {
     header: PageHeader = .{},
     infimum: rec_t = .{ .is_infimum = true },
@@ -974,4 +999,20 @@ test "page dir slot byte helpers" {
 
     page_dir_set_nth_slot(page_bytes, 3, 456);
     try std.testing.expectEqual(@as(ulint, 456), page_dir_get_nth_slot_val(page_bytes, 3));
+}
+
+test "page free list and garbage byte helpers" {
+    var buf = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const page_bytes = buf[0..].ptr;
+
+    page_free_set_bytes(page_bytes, 120);
+    try std.testing.expectEqual(@as(ulint, 120), page_free_get_bytes(page_bytes));
+
+    page_garbage_set_bytes(page_bytes, 0);
+    page_free_push_bytes(page_bytes, 200, 32);
+    try std.testing.expectEqual(@as(ulint, 200), page_free_get_bytes(page_bytes));
+    try std.testing.expectEqual(@as(ulint, 32), page_garbage_get_bytes(page_bytes));
+
+    page_garbage_add_bytes(page_bytes, 16);
+    try std.testing.expectEqual(@as(ulint, 48), page_garbage_get_bytes(page_bytes));
 }
