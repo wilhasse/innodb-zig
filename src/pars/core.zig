@@ -155,6 +155,63 @@ pub fn pars_order_by(column: *pars.sym_node_t, asc: *const pars.pars_res_word_t)
     return node;
 }
 
+fn pars_expr_op_to_token(op: pars.parser.BinaryOp) i32 {
+    return switch (op) {
+        .and_op => pars.PARS_AND_TOKEN,
+        .or_op => pars.PARS_OR_TOKEN,
+        .eq => '=',
+        .ne => pars.PARS_NE_TOKEN,
+        .ge => pars.PARS_GE_TOKEN,
+        .le => pars.PARS_LE_TOKEN,
+    };
+}
+
+fn pars_expr_to_que_node(expr: *pars.parser.Expr, sym_tab: *pars.sym_tab_t) *que.que_node_t {
+    return switch (expr.*) {
+        .ident => |name| {
+            const node = pars.sym.sym_tab_add_id(sym_tab, name, @as(compat.ulint, @intCast(name.len)));
+            return &node.common;
+        },
+        .int_lit => |value| {
+            const node = pars.sym.sym_tab_add_int_lit(sym_tab, @as(compat.ulint, @intCast(value)));
+            return &node.common;
+        },
+        .str_lit => |value| {
+            const node = pars.sym.sym_tab_add_str_lit(sym_tab, value, @as(compat.ulint, @intCast(value.len)));
+            return &node.common;
+        },
+        .binary => |binary| {
+            const left = pars_expr_to_que_node(binary.left, sym_tab);
+            const right = pars_expr_to_que_node(binary.right, sym_tab);
+            const func = pars_op(pars_expr_op_to_token(binary.op), left, right);
+            left.parent = &func.common;
+            right.parent = &func.common;
+            return &func.common;
+        },
+    };
+}
+
+pub fn pars_sql(sql: []const u8, allocator: std.mem.Allocator) !*que.que_t {
+    var parser = try pars.parser.Parser.init(sql, allocator);
+    defer parser.deinit();
+    const expr = try parser.parseExpression();
+    defer {
+        expr.deinit(allocator);
+        allocator.destroy(expr);
+    }
+
+    const sym_tab = pars.sym.sym_tab_create(allocator);
+    pars_sym_tab_global = sym_tab;
+
+    const root = pars_expr_to_que_node(expr, sym_tab);
+    const graph = que.que_fork_create(null, null, 0, allocator);
+    const thr = que.que_thr_create(graph, allocator);
+    thr.child = root;
+    root.parent = &graph.common;
+    sym_tab.query_graph = graph;
+    return graph;
+}
+
 test "pars var init sets star denoter" {
     pars_star_denoter = 0;
     pars_var_init();
@@ -188,4 +245,41 @@ test "pars order by asc" {
     defer std.heap.page_allocator.destroy(node);
     try std.testing.expect(node.column == &column);
     try std.testing.expectEqual(compat.TRUE, node.asc);
+}
+
+test "pars sql builds query graph from expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    pars_sym_tab_global = null;
+    const graph = try pars_sql("a = 1 AND b <> 'x'", arena.allocator());
+    try std.testing.expect(pars_sym_tab_global != null);
+    try std.testing.expect(pars_sym_tab_global.?.query_graph == graph);
+
+    const thr = graph.thrs_head.?;
+    const root = thr.child.?;
+    try std.testing.expectEqual(que.QUE_NODE_FUNC, root.type);
+
+    const root_func: *pars.func_node_t = @ptrCast(root);
+    try std.testing.expectEqual(@as(i32, pars.PARS_AND_TOKEN), root_func.func);
+
+    const left = root_func.args.?;
+    const right = left.brother.?;
+    const left_func: *pars.func_node_t = @ptrCast(left);
+    const right_func: *pars.func_node_t = @ptrCast(right);
+    try std.testing.expectEqual(@as(i32, '='), left_func.func);
+    try std.testing.expectEqual(@as(i32, pars.PARS_NE_TOKEN), right_func.func);
+
+    const left_name: *pars.sym_node_t = @ptrCast(left_func.args.?);
+    try std.testing.expectEqualStrings("a", left_name.name);
+    const left_value = left_name.common.brother.?;
+    try std.testing.expectEqual(@as(compat.ulint, 4), data.dfield_get_len(&left_value.val));
+
+    const right_name: *pars.sym_node_t = @ptrCast(right_func.args.?);
+    try std.testing.expectEqualStrings("b", right_name.name);
+    const right_value = right_name.common.brother.?;
+    const str_len = data.dfield_get_len(&right_value.val);
+    const str_ptr = data.dfield_get_data(&right_value.val).?;
+    const str_slice = @as([*]const u8, @ptrCast(str_ptr))[0..@as(usize, @intCast(str_len))];
+    try std.testing.expectEqualStrings("x", str_slice);
 }
