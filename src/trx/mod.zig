@@ -20,3 +20,4 @@ pub const rseg = @import("rseg.zig");
 pub const sys = @import("sys.zig");
 pub const core = @import("core.zig");
 pub const undo = @import("undo.zig");
+pub const xa = @import("xa.zig");
