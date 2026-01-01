@@ -245,6 +245,50 @@ pub fn log_sys_close() void {
     }
 }
 
+fn log_write_bytes(sys: *log_t, lsn: ib_uint64_t, data: []const u8) !void {
+    if (data.len == 0) {
+        return;
+    }
+    const capacity = @as(u64, @intCast(sys.file_size - LOG_FILE_HDR_SIZE));
+    var remaining = data;
+    var cur_lsn = lsn;
+
+    while (remaining.len > 0) {
+        var file_offset: ib_int64_t = 0;
+        const file_no = log_calc_where_lsn_is(
+            &file_offset,
+            sys.first_header_lsn,
+            cur_lsn,
+            sys.n_files,
+            sys.file_size,
+        );
+        if (file_no >= sys.files.items.len) {
+            return LogError.InvalidLogFileSize;
+        }
+        const file = &sys.files.items[@as(usize, @intCast(file_no))].handle;
+        const offset = @as(u64, @intCast(file_offset));
+        const used = @as(u64, @intCast(file_offset - LOG_FILE_HDR_SIZE));
+        const available = capacity - used;
+        const chunk_len = @min(@as(u64, @intCast(remaining.len)), available);
+        const chunk = remaining[0..@as(usize, @intCast(chunk_len))];
+        const written = try file.writeAt(chunk, offset);
+        if (written != chunk.len) {
+            return LogError.ShortWrite;
+        }
+        remaining = remaining[chunk.len..];
+        cur_lsn += chunk_len;
+    }
+}
+
+pub fn log_append_bytes(data: []const u8) ?ib_uint64_t {
+    const sys = log_sys orelse return null;
+    const start_lsn = sys.current_lsn;
+    log_write_bytes(sys, start_lsn, data) catch return null;
+    sys.current_lsn = start_lsn + @as(ib_uint64_t, @intCast(data.len));
+    sys.flushed_lsn = sys.current_lsn;
+    return start_lsn;
+}
+
 pub fn log_fsp_current_free_limit_set_and_checkpoint(limit: ulint) void {
     log_fsp_current_free_limit = limit;
 }
@@ -531,6 +575,67 @@ test "log sys init creates and reopens log headers" {
     try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 2, 1024 * 1024, 0));
     try std.testing.expectEqual(prev_flushed, log_sys.?.flushed_lsn);
     log_sys_close();
+}
+
+test "log append writes at header offset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 0));
+    defer log_sys_close();
+
+    const payload = "hello";
+    const start = log_append_bytes(payload) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(ib_uint64_t, 0), start);
+
+    const path = try log_make_file_name(std.testing.allocator, base, 0);
+    defer std.testing.allocator.free(path);
+    const handle = try os_file.open(path, .open, .read_write);
+    defer handle.close();
+    var buf: [5]u8 = undefined;
+    const read = try handle.readAt(buf[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
+    try std.testing.expectEqual(@as(usize, payload.len), read);
+    try std.testing.expect(std.mem.eql(u8, buf[0..], payload));
+}
+
+test "log append wraps across files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 2, LOG_FILE_HDR_SIZE + 16, 0));
+    defer log_sys_close();
+
+    var payload: [24]u8 = undefined;
+    for (payload, 0..) |*b, idx| {
+        b.* = @as(u8, @intCast(idx));
+    }
+    _ = log_append_bytes(payload[0..]) orelse return error.UnexpectedNull;
+
+    const path0 = try log_make_file_name(std.testing.allocator, base, 0);
+    defer std.testing.allocator.free(path0);
+    const handle0 = try os_file.open(path0, .open, .read_write);
+    defer handle0.close();
+    var buf0: [16]u8 = undefined;
+    const read0 = try handle0.readAt(buf0[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
+    try std.testing.expectEqual(@as(usize, 16), read0);
+    try std.testing.expect(std.mem.eql(u8, buf0[0..], payload[0..16]));
+
+    const path1 = try log_make_file_name(std.testing.allocator, base, 1);
+    defer std.testing.allocator.free(path1);
+    const handle1 = try os_file.open(path1, .open, .read_write);
+    defer handle1.close();
+    var buf1: [8]u8 = undefined;
+    const read1 = try handle1.readAt(buf1[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
+    try std.testing.expectEqual(@as(usize, 8), read1);
+    try std.testing.expect(std.mem.eql(u8, buf1[0..], payload[16..24]));
 }
 
 test "log_calc_where_lsn_is positions lsn" {
