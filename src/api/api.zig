@@ -947,6 +947,9 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     buf_mod.buf_LRU_var_init();
     buf_mod.buf_var_init();
     _ = buf_mod.buf_pool_init();
+    if (buf_mod.buf_page_cleaner_start() == compat.FALSE) {
+        return .DB_ERROR;
+    }
     log_mod.log_set_adaptive_flush_callback(buf_mod.buf_adaptive_flush);
     if (log_mod.log_writer_start(log_mod.LOG_WRITER_SLEEP_US) == compat.FALSE) {
         return .DB_ERROR;
@@ -987,6 +990,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
 
 pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
+    buf_mod.buf_page_cleaner_stop();
     fil.fil_set_doublewrite_handler(null);
     if (!cfg_started) {
         lock_mod.lock_sys_close();

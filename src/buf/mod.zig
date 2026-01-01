@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const fil = @import("../fil/mod.zig");
 const log_mod = @import("../log/mod.zig");
+const os_thread = @import("../os/thread.zig");
 
 pub const module_name = "buf";
 
@@ -147,6 +148,10 @@ pub var buf_pool_instances: ulint = 0;
 var buf_pool_array: []buf_pool_t = &[_]buf_pool_t{};
 pub var buf_debug_prints: ibool = compat.FALSE;
 pub var srv_buf_pool_write_requests: ulint = 0;
+pub var buf_page_cleaner_sleep_us: u64 = 100_000;
+var buf_page_cleaner_stop_flag = std.atomic.Value(bool).init(false);
+var buf_page_cleaner_thread: ?os_thread.Thread = null;
+var buf_page_cleaner_loops = std.atomic.Value(u64).init(0);
 
 pub fn buf_var_init() void {
     srv_buf_pool_write_requests = 0;
@@ -901,6 +906,36 @@ pub fn buf_adaptive_flush() void {
     _ = buf_flush_batch(.BUF_FLUSH_LIST, target, 0);
 }
 
+fn buf_page_cleaner_run() void {
+    while (!buf_page_cleaner_stop_flag.load(.seq_cst)) {
+        buf_adaptive_flush();
+        buf_flush_free_margin();
+        _ = buf_page_cleaner_loops.fetchAdd(1, .seq_cst);
+        os_thread.sleepMicros(buf_page_cleaner_sleep_us);
+    }
+}
+
+pub fn buf_page_cleaner_start() ibool {
+    if (buf_page_cleaner_thread != null) {
+        return compat.TRUE;
+    }
+    buf_page_cleaner_stop_flag.store(false, .seq_cst);
+    buf_page_cleaner_thread = os_thread.spawn(buf_page_cleaner_run, .{}) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn buf_page_cleaner_stop() void {
+    if (buf_page_cleaner_thread) |thread| {
+        buf_page_cleaner_stop_flag.store(true, .seq_cst);
+        thread.join();
+        buf_page_cleaner_thread = null;
+    }
+}
+
+pub fn buf_page_cleaner_get_loops() u64 {
+    return buf_page_cleaner_loops.load(.seq_cst);
+}
+
 pub fn buf_flush_validate() ibool {
     return compat.TRUE;
 }
@@ -1458,4 +1493,20 @@ test "buf flush init writes lsn and checksums" {
     const stored_old = std.mem.readInt(u32, page[end_off .. end_off + 4], .big);
     const computed_old = @as(u32, @intCast(buf_calc_page_old_checksum(page[0..].ptr)));
     try std.testing.expectEqual(computed_old, stored_old);
+}
+
+test "buf page cleaner thread runs" {
+    const prev_sleep = buf_page_cleaner_sleep_us;
+    buf_page_cleaner_sleep_us = 1_000;
+    defer buf_page_cleaner_sleep_us = prev_sleep;
+
+    _ = buf_page_cleaner_start();
+    defer buf_page_cleaner_stop();
+
+    var attempts: usize = 0;
+    while (attempts < 100 and buf_page_cleaner_get_loops() == 0) : (attempts += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(buf_page_cleaner_get_loops() > 0);
 }
