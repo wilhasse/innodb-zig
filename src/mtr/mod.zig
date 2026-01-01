@@ -3,6 +3,7 @@ const compat = @import("../ut/compat.zig");
 const dyn = @import("../dyn/mod.zig");
 const mach = @import("../mach/mod.zig");
 const log = @import("../log/mod.zig");
+const fil = @import("../fil/mod.zig");
 
 pub const module_name = "mtr";
 
@@ -30,6 +31,10 @@ pub const MLOG_1BYTE: ulint = 1;
 pub const MLOG_2BYTES: ulint = 2;
 pub const MLOG_4BYTES: ulint = 4;
 pub const MLOG_8BYTES: ulint = 8;
+pub const MLOG_WRITE_STRING: byte = 30;
+pub const MLOG_FILE_CREATE: byte = 33;
+pub const MLOG_FILE_RENAME: byte = 34;
+pub const MLOG_FILE_DELETE: byte = 35;
 pub const MLOG_BIGGEST_TYPE: byte = 51;
 
 pub const mtr_t = struct {
@@ -94,6 +99,66 @@ pub fn mtr_set_savepoint(mtr: *mtr_t) ulint {
     return dyn.dyn_array_get_data_size(&mtr.memo);
 }
 
+fn page_base_ptr(ptr: [*]const byte) [*]const byte {
+    const addr = @intFromPtr(ptr);
+    const mask = @as(usize, @intCast(compat.UNIV_PAGE_SIZE - 1));
+    return @as([*]const byte, @ptrFromInt(addr & ~mask));
+}
+
+fn page_offset(ptr: [*]const byte) ulint {
+    const addr = @intFromPtr(ptr);
+    const mask = @as(usize, @intCast(compat.UNIV_PAGE_SIZE - 1));
+    return @as(ulint, @intCast(addr & mask));
+}
+
+pub fn mlog_open(mtr: *mtr_t, size: ulint) ?[*]byte {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    std.debug.assert(size > 0);
+    std.debug.assert(size < dyn.DYN_ARRAY_DATA_SIZE);
+    mtr.modifications = compat.TRUE;
+    if (mtr_get_log_mode(mtr) == MTR_LOG_NONE) {
+        return null;
+    }
+    if (mtr.log.magic_n != dyn.DYN_BLOCK_MAGIC_N) {
+        _ = dyn.dyn_array_create(&mtr.log);
+    }
+    return dyn.dyn_array_open(&mtr.log, size);
+}
+
+pub fn mlog_close(mtr: *mtr_t, ptr: [*]byte) void {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    std.debug.assert(mtr_get_log_mode(mtr) != MTR_LOG_NONE);
+    dyn.dyn_array_close(&mtr.log, ptr);
+}
+
+pub fn mlog_catenate_ulint(mtr: *mtr_t, val: ulint, type_: ulint) void {
+    if (mtr_get_log_mode(mtr) == MTR_LOG_NONE) {
+        return;
+    }
+    if (mtr.log.magic_n != dyn.DYN_BLOCK_MAGIC_N) {
+        _ = dyn.dyn_array_create(&mtr.log);
+    }
+    const ptr = dyn.dyn_array_push(&mtr.log, type_);
+    switch (type_) {
+        MLOG_1BYTE => mach.mach_write_to_1(ptr, val),
+        MLOG_2BYTES => mach.mach_write_to_2(ptr, val),
+        MLOG_4BYTES => mach.mach_write_to_4(ptr, val),
+        else => std.debug.panic("mlog_catenate_ulint: invalid type {d}", .{type_}),
+    }
+}
+
+pub fn mlog_catenate_ulint_compressed(mtr: *mtr_t, val: ulint) void {
+    const log_ptr = mlog_open(mtr, 10) orelse return;
+    const next = log_ptr + mach.mach_write_compressed(log_ptr, val);
+    mlog_close(mtr, next);
+}
+
+pub fn mlog_catenate_dulint_compressed(mtr: *mtr_t, val: dulint) void {
+    const log_ptr = mlog_open(mtr, 15) orelse return;
+    const next = log_ptr + mach.mach_dulint_write_compressed(log_ptr, val);
+    mlog_close(mtr, next);
+}
+
 pub fn mlog_catenate_string(mtr: *mtr_t, str: [*]const byte, len: ulint) void {
     if (mtr_get_log_mode(mtr) == MTR_LOG_NONE) {
         return;
@@ -102,6 +167,95 @@ pub fn mlog_catenate_string(mtr: *mtr_t, str: [*]const byte, len: ulint) void {
         _ = dyn.dyn_array_create(&mtr.log);
     }
     dyn.dyn_push_string(&mtr.log, str, len);
+}
+
+pub fn mlog_write_initial_log_record_fast(
+    ptr: [*]const byte,
+    type_: byte,
+    log_ptr: [*]byte,
+    mtr: *mtr_t,
+) [*]byte {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    std.debug.assert(type_ <= MLOG_BIGGEST_TYPE);
+    const page = page_base_ptr(ptr);
+    const space = mach.mach_read_from_4(page + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+    const page_no = mach.mach_read_from_4(page + fil.FIL_PAGE_OFFSET);
+    mach.mach_write_to_1(log_ptr, type_);
+    var next = log_ptr + 1;
+    next += mach.mach_write_compressed(next, space);
+    next += mach.mach_write_compressed(next, page_no);
+    mtr.n_log_recs += 1;
+    return next;
+}
+
+pub fn mlog_write_initial_log_record(ptr: [*]const byte, type_: byte, mtr: *mtr_t) void {
+    std.debug.assert(type_ <= MLOG_BIGGEST_TYPE);
+    std.debug.assert(type_ > MLOG_8BYTES);
+    const log_ptr = mlog_open(mtr, 11) orelse return;
+    const next = mlog_write_initial_log_record_fast(ptr, type_, log_ptr, mtr);
+    mlog_close(mtr, next);
+}
+
+pub fn mlog_write_initial_log_record_for_file_op(
+    type_: ulint,
+    space_id: ulint,
+    page_no: ulint,
+    log_ptr: [*]byte,
+    mtr: *mtr_t,
+) [*]byte {
+    std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
+    mach.mach_write_to_1(log_ptr, @as(byte, @intCast(type_)));
+    var next = log_ptr + 1;
+    next += mach.mach_write_compressed(next, space_id);
+    next += mach.mach_write_compressed(next, page_no);
+    mtr.n_log_recs += 1;
+    return next;
+}
+
+pub fn mlog_write_ulint(ptr: [*]byte, val: ulint, type_: byte, mtr: *mtr_t) void {
+    switch (type_) {
+        MLOG_1BYTE => mach.mach_write_to_1(ptr, val),
+        MLOG_2BYTES => mach.mach_write_to_2(ptr, val),
+        MLOG_4BYTES => mach.mach_write_to_4(ptr, val),
+        else => std.debug.panic("mlog_write_ulint: invalid type {d}", .{type_}),
+    }
+
+    const log_ptr = mlog_open(mtr, 11 + 2 + 5) orelse return;
+    var next = mlog_write_initial_log_record_fast(ptr, type_, log_ptr, mtr);
+    mach.mach_write_to_2(next, page_offset(ptr));
+    next += 2;
+    next += mach.mach_write_compressed(next, val);
+    mlog_close(mtr, next);
+}
+
+pub fn mlog_write_dulint(ptr: [*]byte, val: dulint, mtr: *mtr_t) void {
+    mach.mach_write_to_8(ptr, val);
+    const log_ptr = mlog_open(mtr, 11 + 2 + 9) orelse return;
+    var next = mlog_write_initial_log_record_fast(ptr, MLOG_8BYTES, log_ptr, mtr);
+    mach.mach_write_to_2(next, page_offset(ptr));
+    next += 2;
+    next += mach.mach_dulint_write_compressed(next, val);
+    mlog_close(mtr, next);
+}
+
+pub fn mlog_write_string(ptr: [*]byte, str: [*]const byte, len: ulint, mtr: *mtr_t) void {
+    std.debug.assert(len <= compat.UNIV_PAGE_SIZE);
+    const dst = ptr[0..@as(usize, @intCast(len))];
+    const src = str[0..@as(usize, @intCast(len))];
+    std.mem.copyForwards(byte, dst, src);
+    mlog_log_string(ptr, len, mtr);
+}
+
+pub fn mlog_log_string(ptr: [*]byte, len: ulint, mtr: *mtr_t) void {
+    std.debug.assert(len <= compat.UNIV_PAGE_SIZE);
+    const log_ptr = mlog_open(mtr, 30) orelse return;
+    var next = mlog_write_initial_log_record_fast(ptr, MLOG_WRITE_STRING, log_ptr, mtr);
+    mach.mach_write_to_2(next, page_offset(ptr));
+    next += 2;
+    mach.mach_write_to_2(next, len);
+    next += 2;
+    mlog_close(mtr, next);
+    mlog_catenate_string(mtr, ptr, len);
 }
 
 pub fn mlog_parse_initial_log_record(
@@ -198,6 +352,36 @@ pub fn mlog_parse_nbytes(
     return next;
 }
 
+pub fn mlog_parse_string(
+    ptr: [*]byte,
+    end_ptr: [*]byte,
+    page: ?[*]byte,
+    page_zip: ?*anyopaque,
+) ?[*]byte {
+    _ = page_zip;
+    if (@intFromPtr(end_ptr) < @intFromPtr(ptr + 4)) {
+        return null;
+    }
+    const offset = mach.mach_read_from_2(ptr);
+    const len = mach.mach_read_from_2(ptr + 2);
+    const next = ptr + 4;
+    if (offset >= compat.UNIV_PAGE_SIZE or len + offset > compat.UNIV_PAGE_SIZE) {
+        if (log.recv_sys) |sys| {
+            sys.found_corrupt_log = compat.TRUE;
+        }
+        return null;
+    }
+    if (@intFromPtr(end_ptr) < @intFromPtr(next + len)) {
+        return null;
+    }
+    if (page) |buf| {
+        const dst = buf[offset..offset + len];
+        const src = next[0..len];
+        std.mem.copyForwards(byte, dst, src);
+    }
+    return next + len;
+}
+
 test "mlog_parse_initial_log_record reads header fields" {
     var buf: [16]byte = .{0} ** 16;
     buf[0] = MLOG_1BYTE;
@@ -258,4 +442,125 @@ test "mtr start/commit and memo push" {
 
     mtr_commit(&mtr);
     try std.testing.expect(mtr.state == MTR_COMMITTED);
+}
+
+fn mlog_collect_bytes(allocator: std.mem.Allocator, arr: *dyn.dyn_array_t) ![]u8 {
+    const size = dyn.dyn_array_get_data_size(arr);
+    const buf = try allocator.alloc(u8, @as(usize, @intCast(size)));
+    var i: ulint = 0;
+    while (i < size) : (i += 1) {
+        buf[@as(usize, @intCast(i))] = dyn.dyn_array_get_element(arr, i)[0];
+    }
+    return buf;
+}
+
+test "mlog_write_ulint logs page update" {
+    const allocator = std.testing.allocator;
+    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    defer allocator.free(page_mem);
+    @memset(page_mem, 0);
+
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 7);
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_OFFSET, 42);
+
+    var mtr = mtr_t{};
+    _ = mtr_start(&mtr);
+    defer mtr_commit(&mtr);
+
+    const target = page_mem.ptr + 128;
+    mlog_write_ulint(target, 0xAB, MLOG_1BYTE, &mtr);
+    try std.testing.expectEqual(@as(byte, 0xAB), target[0]);
+
+    const log_bytes = try mlog_collect_bytes(allocator, &mtr.log);
+    defer allocator.free(log_bytes);
+
+    var out_type: byte = 0;
+    var out_space: ulint = 0;
+    var out_page: ulint = 0;
+    const end_ptr = log_bytes.ptr + log_bytes.len;
+    const after_hdr = mlog_parse_initial_log_record(log_bytes.ptr, end_ptr, &out_type, &out_space, &out_page) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(byte, MLOG_1BYTE), out_type);
+    try std.testing.expectEqual(@as(ulint, 7), out_space);
+    try std.testing.expectEqual(@as(ulint, 42), out_page);
+
+    var apply_page = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const after = mlog_parse_nbytes(out_type, after_hdr, end_ptr, apply_page[0..].ptr, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(after == end_ptr);
+    try std.testing.expectEqual(@as(byte, 0xAB), apply_page[128]);
+}
+
+test "mlog_write_dulint logs 8-byte update" {
+    const allocator = std.testing.allocator;
+    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    defer allocator.free(page_mem);
+    @memset(page_mem, 0);
+
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 3);
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_OFFSET, 9);
+
+    var mtr = mtr_t{};
+    _ = mtr_start(&mtr);
+    defer mtr_commit(&mtr);
+
+    const target = page_mem.ptr + 256;
+    const value = dulint{ .high = 0x1, .low = 0x22334455 };
+    mlog_write_dulint(target, value, &mtr);
+    const stored = mach.mach_read_from_8(target);
+    try std.testing.expectEqual(value.high, stored.high);
+    try std.testing.expectEqual(value.low, stored.low);
+
+    const log_bytes = try mlog_collect_bytes(allocator, &mtr.log);
+    defer allocator.free(log_bytes);
+
+    var out_type: byte = 0;
+    var out_space: ulint = 0;
+    var out_page: ulint = 0;
+    const end_ptr = log_bytes.ptr + log_bytes.len;
+    const after_hdr = mlog_parse_initial_log_record(log_bytes.ptr, end_ptr, &out_type, &out_space, &out_page) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(byte, MLOG_8BYTES), out_type);
+    try std.testing.expectEqual(@as(ulint, 3), out_space);
+    try std.testing.expectEqual(@as(ulint, 9), out_page);
+
+    var apply_page = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const after = mlog_parse_nbytes(out_type, after_hdr, end_ptr, apply_page[0..].ptr, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(after == end_ptr);
+    const out = mach.mach_read_from_8(apply_page[0..].ptr + 256);
+    try std.testing.expectEqual(value.high, out.high);
+    try std.testing.expectEqual(value.low, out.low);
+}
+
+test "mlog_write_string logs payload" {
+    const allocator = std.testing.allocator;
+    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    defer allocator.free(page_mem);
+    @memset(page_mem, 0);
+
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 2);
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_OFFSET, 7);
+
+    var mtr = mtr_t{};
+    _ = mtr_start(&mtr);
+    defer mtr_commit(&mtr);
+
+    const msg = "redo";
+    const target = page_mem.ptr + 64;
+    mlog_write_string(target, msg.ptr, msg.len, &mtr);
+    try std.testing.expectEqualStrings(msg, target[0..msg.len]);
+
+    const log_bytes = try mlog_collect_bytes(allocator, &mtr.log);
+    defer allocator.free(log_bytes);
+
+    var out_type: byte = 0;
+    var out_space: ulint = 0;
+    var out_page: ulint = 0;
+    const end_ptr = log_bytes.ptr + log_bytes.len;
+    const after_hdr = mlog_parse_initial_log_record(log_bytes.ptr, end_ptr, &out_type, &out_space, &out_page) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(byte, MLOG_WRITE_STRING), out_type);
+    try std.testing.expectEqual(@as(ulint, 2), out_space);
+    try std.testing.expectEqual(@as(ulint, 7), out_page);
+
+    var apply_page = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const after = mlog_parse_string(after_hdr, end_ptr, apply_page[0..].ptr, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(after == end_ptr);
+    try std.testing.expectEqualStrings(msg, apply_page[64 .. 64 + msg.len]);
 }
