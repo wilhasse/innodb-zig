@@ -337,6 +337,41 @@ fn log_write_bytes(sys: *log_t, lsn: ib_uint64_t, data: []const u8) !void {
     }
 }
 
+fn log_read_bytes(sys: *log_t, lsn: ib_uint64_t, dest: []u8) !void {
+    if (dest.len == 0) {
+        return;
+    }
+    const capacity = @as(u64, @intCast(sys.file_size - LOG_FILE_HDR_SIZE));
+    var remaining = dest;
+    var cur_lsn = lsn;
+
+    while (remaining.len > 0) {
+        var file_offset: ib_int64_t = 0;
+        const file_no = log_calc_where_lsn_is(
+            &file_offset,
+            sys.first_header_lsn,
+            cur_lsn,
+            sys.n_files,
+            sys.file_size,
+        );
+        if (file_no >= sys.files.items.len) {
+            return LogError.InvalidLogFileSize;
+        }
+        const file = &sys.files.items[@as(usize, @intCast(file_no))].handle;
+        const offset = @as(u64, @intCast(file_offset));
+        const used = @as(u64, @intCast(file_offset - LOG_FILE_HDR_SIZE));
+        const available = capacity - used;
+        const chunk_len = @min(@as(u64, @intCast(remaining.len)), available);
+        const chunk = remaining[0..@as(usize, @intCast(chunk_len))];
+        const read = try file.readAt(chunk, offset);
+        if (read != chunk.len) {
+            return LogError.ShortRead;
+        }
+        remaining = remaining[chunk.len..];
+        cur_lsn += chunk_len;
+    }
+}
+
 fn log_persist_header(sys: *log_t, clean_shutdown: bool) !void {
     const header = LogHeader{
         .start_lsn = sys.first_header_lsn,
@@ -446,6 +481,7 @@ pub const recv_t = struct {
     type_: u8 = 0,
     len: ulint = 0,
     data: ?*recv_data_t = null,
+    payload: ?[]u8 = null,
     start_lsn: ib_uint64_t = 0,
     end_lsn: ib_uint64_t = 0,
     next: ?*recv_t = null,
@@ -545,6 +581,7 @@ pub fn recv_sys_close() void {
 pub fn recv_sys_mem_free() void {
     if (recv_sys) |sys| {
         if (sys.addr_hash) |hash| {
+            recv_clear_hash(sys);
             ha.hash_table_free(hash);
             sys.addr_hash = null;
         }
@@ -590,6 +627,150 @@ pub fn recv_sys_init(available_memory: ulint) void {
 
     sys.found_corrupt_log = compat.FALSE;
     recv_max_page_lsn = 0;
+}
+
+fn recv_calc_fold(space: ulint, page_no: ulint) ulint {
+    const fold = (@as(u64, @intCast(space)) << 32) | @as(u64, @intCast(page_no));
+    return @as(ulint, @intCast(fold));
+}
+
+fn recv_free_rec_list(head: ?*recv_t) void {
+    var cur = head;
+    while (cur) |rec| {
+        const next = rec.next;
+        if (rec.payload) |payload| {
+            std.heap.page_allocator.free(payload);
+        }
+        std.heap.page_allocator.destroy(rec);
+        cur = next;
+    }
+}
+
+fn recv_addr_free(addr: *recv_addr_t) void {
+    recv_free_rec_list(addr.rec_list_head);
+    std.heap.page_allocator.destroy(addr);
+}
+
+fn recv_clear_hash(sys: *recv_sys_t) void {
+    const hash = sys.addr_hash orelse return;
+    var i: ulint = 0;
+    while (i < ha.hash_get_n_cells(hash)) : (i += 1) {
+        const cell = ha.hash_get_nth_cell(hash, i);
+        var node_opt: ?*ha.ha_node_t = if (cell.node) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        while (node_opt) |node| {
+            const next = node.next;
+            if (node.data) |data| {
+                const addr: *recv_addr_t = @ptrCast(@alignCast(data));
+                recv_addr_free(addr);
+            }
+            std.heap.page_allocator.destroy(node);
+            node_opt = next;
+        }
+        cell.node = null;
+    }
+    sys.n_addrs = 0;
+}
+
+fn recv_addr_get_or_create(sys: *recv_sys_t, space: ulint, page_no: ulint) ?*recv_addr_t {
+    const hash = sys.addr_hash orelse return null;
+    const fold = recv_calc_fold(space, page_no);
+    if (ha.ha_search_and_get_data(hash, fold)) |data| {
+        return @ptrCast(@alignCast(data));
+    }
+    const addr = std.heap.page_allocator.create(recv_addr_t) catch return null;
+    addr.* = .{
+        .state = .RECV_NOT_PROCESSED,
+        .space = space,
+        .page_no = page_no,
+        .rec_list_head = null,
+    };
+    if (ha.ha_insert_for_fold_func(hash, fold, addr) == compat.FALSE) {
+        std.heap.page_allocator.destroy(addr);
+        return null;
+    }
+    sys.n_addrs += 1;
+    return addr;
+}
+
+pub fn recv_scan_log_recs(available_memory: ulint) ibool {
+    const log_state = log_sys orelse return compat.FALSE;
+    recv_sys_create();
+    const sys = recv_sys orelse return compat.FALSE;
+    if (sys.buf == null) {
+        recv_sys_init(available_memory);
+    }
+    if (sys.addr_hash == null) {
+        return compat.FALSE;
+    }
+
+    const start_lsn = if (sys.parse_start_lsn != 0) sys.parse_start_lsn else log_state.checkpoint_lsn;
+    const end_lsn = log_state.flushed_lsn;
+    if (start_lsn >= end_lsn) {
+        return compat.TRUE;
+    }
+
+    var lsn = start_lsn;
+    var header_buf: [REDO_RECORD_HEADER_SIZE]u8 = undefined;
+
+    while (lsn + REDO_RECORD_HEADER_SIZE <= end_lsn) {
+        log_read_bytes(log_state, lsn, header_buf[0..]) catch {
+            sys.found_corrupt_log = compat.TRUE;
+            return compat.FALSE;
+        };
+
+        const type_ = header_buf[0];
+        const space = std.mem.readInt(u32, header_buf[1..5], .big);
+        const page_no = std.mem.readInt(u32, header_buf[5..9], .big);
+        const payload_len = std.mem.readInt(u32, header_buf[9..13], .big);
+        const total_len = REDO_RECORD_HEADER_SIZE + @as(usize, @intCast(payload_len));
+        if (lsn + @as(ib_uint64_t, @intCast(total_len)) > end_lsn) {
+            break;
+        }
+
+        var payload_buf = std.heap.page_allocator.alloc(u8, @as(usize, @intCast(payload_len))) catch return compat.FALSE;
+        if (payload_len > 0) {
+            log_read_bytes(
+                log_state,
+                lsn + REDO_RECORD_HEADER_SIZE,
+                payload_buf[0..@as(usize, @intCast(payload_len))],
+            ) catch {
+                sys.found_corrupt_log = compat.TRUE;
+                std.heap.page_allocator.free(payload_buf);
+                return compat.FALSE;
+            };
+        }
+
+        const rec = std.heap.page_allocator.create(recv_t) catch {
+            std.heap.page_allocator.free(payload_buf);
+            return compat.FALSE;
+        };
+        rec.* = .{
+            .type_ = type_,
+            .len = @as(ulint, @intCast(payload_len)),
+            .data = null,
+            .payload = payload_buf,
+            .start_lsn = lsn,
+            .end_lsn = lsn + @as(ib_uint64_t, @intCast(total_len)),
+            .next = null,
+        };
+
+        const addr = recv_addr_get_or_create(sys, @as(ulint, space), @as(ulint, page_no)) orelse {
+            std.heap.page_allocator.destroy(rec);
+            std.heap.page_allocator.free(payload_buf);
+            return compat.FALSE;
+        };
+        rec.next = addr.rec_list_head;
+        addr.rec_list_head = rec;
+
+        lsn = rec.end_lsn;
+        sys.scanned_lsn = lsn;
+        sys.recovered_lsn = lsn;
+    }
+
+    sys.apply_log_recs = compat.TRUE;
+    recv_recovery_on = compat.TRUE;
+    recv_needed_recovery = compat.TRUE;
+    return compat.TRUE;
 }
 
 pub fn recv_recovery_is_on() ibool {
@@ -771,6 +952,51 @@ test "redo record encode/decode roundtrip" {
     try std.testing.expectEqual(rec.page_no, decoded.page_no);
     try std.testing.expect(std.mem.eql(u8, decoded.payload, payload[0..]));
     try std.testing.expectEqual(written, decoded.len);
+}
+
+test "recv scan log recs populates addr hash" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    recv_sys_var_init();
+    defer recv_sys_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 0));
+    defer log_sys_close();
+
+    const payload = [_]u8{ 0xAA, 0xBB };
+    const rec = RedoRecord{
+        .type_ = 1,
+        .space = 7,
+        .page_no = 11,
+        .payload = payload[0..],
+    };
+    var buf: [64]u8 = undefined;
+    const rec_len = try redo_record_encode(buf[0..], rec);
+    _ = log_append_bytes(buf[0..rec_len]) orelse return error.UnexpectedNull;
+
+    recv_sys_create();
+    recv_sys_init(1024);
+    defer recv_sys_mem_free();
+
+    try std.testing.expectEqual(compat.TRUE, recv_scan_log_recs(1024));
+    const sys = recv_sys orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(ulint, 1), sys.n_addrs);
+    try std.testing.expectEqual(@as(ib_uint64_t, @intCast(rec_len)), sys.scanned_lsn);
+
+    const fold = recv_calc_fold(7, 11);
+    const addr_ptr = ha.ha_search_and_get_data(sys.addr_hash.?, fold) orelse return error.UnexpectedNull;
+    const addr: *recv_addr_t = @ptrCast(@alignCast(addr_ptr));
+    try std.testing.expectEqual(@as(ulint, 7), addr.space);
+    try std.testing.expectEqual(@as(ulint, 11), addr.page_no);
+    try std.testing.expect(addr.rec_list_head != null);
+    const rec_out = addr.rec_list_head.?;
+    try std.testing.expectEqual(@as(ulint, payload.len), rec_out.len);
+    try std.testing.expect(rec_out.payload != null);
+    try std.testing.expect(std.mem.eql(u8, rec_out.payload.?, payload[0..]));
 }
 
 test "log buffer flush persists flushed lsn" {
