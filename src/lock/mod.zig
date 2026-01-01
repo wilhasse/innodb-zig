@@ -105,6 +105,7 @@ pub const lock_sys_t = struct {
     rec_hash: std.AutoHashMap(LockRecKey, lock_queue_t),
     table_hash: std.AutoHashMap(u64, lock_queue_t),
     trx_hash: std.AutoHashMap(*trx_types.trx_t, std.ArrayListUnmanaged(*lock_t)),
+    waits_for: std.AutoHashMap(*trx_types.trx_t, *trx_types.trx_t),
     allocator: std.mem.Allocator,
 };
 
@@ -209,6 +210,7 @@ pub fn lock_sys_close() void {
         sys.rec_hash.deinit();
         sys.table_hash.deinit();
         sys.trx_hash.deinit();
+        sys.waits_for.deinit();
         std.heap.page_allocator.destroy(sys);
         lock_sys = null;
     }
@@ -225,9 +227,31 @@ pub fn lock_sys_create(n_cells: ulint) void {
         .rec_hash = std.AutoHashMap(LockRecKey, lock_queue_t).init(allocator),
         .table_hash = std.AutoHashMap(u64, lock_queue_t).init(allocator),
         .trx_hash = std.AutoHashMap(*trx_types.trx_t, std.ArrayListUnmanaged(*lock_t)).init(allocator),
+        .waits_for = std.AutoHashMap(*trx_types.trx_t, *trx_types.trx_t).init(allocator),
         .allocator = allocator,
     };
     lock_sys = sys;
+}
+
+fn lock_waits_for_set(sys: *lock_sys_t, waiter: *trx_types.trx_t, blocker: *trx_types.trx_t) void {
+    _ = sys.waits_for.put(waiter, blocker) catch {};
+}
+
+fn lock_waits_for_clear(sys: *lock_sys_t, waiter: *trx_types.trx_t) void {
+    _ = sys.waits_for.remove(waiter);
+}
+
+fn lock_deadlock_detect(sys: *lock_sys_t, start: *trx_types.trx_t, blocking: *trx_types.trx_t) bool {
+    var current = blocking;
+    var steps: usize = 0;
+    while (steps < 1024) : (steps += 1) {
+        if (current == start) {
+            return true;
+        }
+        const next = sys.waits_for.get(current) orelse return false;
+        current = next;
+    }
+    return false;
 }
 
 fn lock_trx_list_add(sys: *lock_sys_t, trx: *trx_types.trx_t, lock: *lock_t) void {
@@ -285,6 +309,11 @@ fn lock_table_create(sys: *lock_sys_t, trx: *trx_types.trx_t, table_id: u64, typ
 }
 
 fn lock_table_remove(sys: *lock_sys_t, lock: *lock_t) void {
+    if (lock_is_wait(lock) == compat.TRUE) {
+        if (lock.trx) |trx| {
+            lock_waits_for_clear(sys, trx);
+        }
+    }
     lock_table_queue_remove(sys, lock);
     if (lock.trx) |trx| {
         lock_trx_list_remove(sys, trx, lock);
@@ -338,6 +367,13 @@ pub fn lock_table(trx: *trx_types.trx_t, table_id: u64, mode: ulint) errors.DbEr
     if (lock_table_other_has_incompatible(sys, trx, table_id, mode, true)) |conflict| {
         const lock = lock_table_create(sys, trx, table_id, mode | LOCK_WAIT) orelse return .DB_OUT_OF_MEMORY;
         lock.wait_for = conflict;
+        if (conflict.trx) |blocking| {
+            lock_waits_for_set(sys, trx, blocking);
+            if (lock_deadlock_detect(sys, trx, blocking)) {
+                lock_table_remove(sys, lock);
+                return .DB_DEADLOCK;
+            }
+        }
         return .DB_LOCK_WAIT;
     }
 
@@ -375,6 +411,11 @@ fn lock_rec_create(sys: *lock_sys_t, trx: *trx_types.trx_t, index: *dict.dict_in
 }
 
 fn lock_rec_remove(sys: *lock_sys_t, lock: *lock_t) void {
+    if (lock_is_wait(lock) == compat.TRUE) {
+        if (lock.trx) |trx| {
+            lock_waits_for_clear(sys, trx);
+        }
+    }
     lock_rec_queue_remove(sys, lock);
     if (lock.trx) |trx| {
         lock_trx_list_remove(sys, trx, lock);
@@ -429,6 +470,13 @@ pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec
     if (lock_rec_other_has_incompatible(sys, trx, key, mode, true)) |conflict| {
         const lock = lock_rec_create(sys, trx, index, rec, mode | LOCK_WAIT) orelse return .DB_OUT_OF_MEMORY;
         lock.wait_for = conflict;
+        if (conflict.trx) |blocking| {
+            lock_waits_for_set(sys, trx, blocking);
+            if (lock_deadlock_detect(sys, trx, blocking)) {
+                lock_rec_remove(sys, lock);
+                return .DB_DEADLOCK;
+            }
+        }
         return .DB_LOCK_WAIT;
     }
 
@@ -601,6 +649,24 @@ test "table lock request and release" {
 
     const sys = lock_sys orelse return error.OutOfMemory;
     try std.testing.expect(sys.table_hash.count() == 0);
+    lock_sys_close();
+}
+
+test "deadlock detection for table locks" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_table(&trx1, 1, LOCK_X));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_table(&trx2, 2, LOCK_X));
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT, lock_table(&trx1, 2, LOCK_X));
+    try std.testing.expectEqual(errors.DbErr.DB_DEADLOCK, lock_table(&trx2, 1, LOCK_X));
+
+    lock_table_release(&trx1, 1);
+    lock_table_release(&trx1, 2);
+    lock_table_release(&trx2, 2);
     lock_sys_close();
 }
 
