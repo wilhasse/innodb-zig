@@ -546,8 +546,29 @@ pub fn fil_extend_tablespaces_to_stored_len() void {}
 
 pub fn fil_extend_space_to_desired_size(actual_size: *ulint, space_id: ulint, size_after_extend: ulint) ibool {
     if (findSpace(space_id)) |space| {
+        if (space.nodes.items.len == 0) {
+            actual_size.* = space.size;
+            return compat.FALSE;
+        }
         if (space.size < size_after_extend) {
+            const grow = size_after_extend - space.size;
+            const last_idx = space.nodes.items.len - 1;
+            var last = &space.nodes.items[last_idx];
+            last.size += grow;
             space.size = size_after_extend;
+
+            var success: ibool = compat.FALSE;
+            const file = os_file.os_file_create_simple(last.name, os_file.OS_FILE_OPEN, os_file.OS_FILE_READ_WRITE, &success);
+            if (success == compat.FALSE or file == null) {
+                actual_size.* = space.size;
+                return compat.FALSE;
+            }
+            defer _ = os_file.os_file_close(file);
+            const bytes = @as(u64, @intCast(last.size)) * @as(u64, compat.UNIV_PAGE_SIZE);
+            if (os_file.os_file_set_size(last.name, file, @as(ulint, @intCast(bytes & 0xFFFF_FFFF)), @as(ulint, @intCast(bytes >> 32))) == compat.FALSE) {
+                actual_size.* = space.size;
+                return compat.FALSE;
+            }
         }
         actual_size.* = space.size;
         return compat.TRUE;
@@ -609,11 +630,24 @@ pub fn fil_io(
     return DB_SUCCESS;
 }
 
-fn fil_first_node(space: *fil_space_t) ?*fil_node_t {
-    if (space.nodes.items.len == 0) {
-        return null;
+const NodeLookup = struct {
+    node: *fil_node_t,
+    page_no: ulint,
+};
+
+fn fil_node_for_page(space: *fil_space_t, page_no: ulint) ?NodeLookup {
+    var offset: ulint = 0;
+    for (space.nodes.items) |*node| {
+        if (node.size == 0) {
+            continue;
+        }
+        const end = offset + node.size;
+        if (page_no < end) {
+            return .{ .node = node, .page_no = page_no - offset };
+        }
+        offset = end;
     }
-    return &space.nodes.items[0];
+    return null;
 }
 
 fn fil_page_in_space(space: *fil_space_t, page_no: ulint) bool {
@@ -631,14 +665,15 @@ pub fn fil_read_page(space_id: ulint, page_no: ulint, buf: [*]byte) ulint {
     if (!fil_page_in_space(space, page_no)) {
         return DB_ERROR;
     }
-    const node = fil_first_node(space) orelse return DB_ERROR;
+    const lookup = fil_node_for_page(space, page_no) orelse return DB_ERROR;
+    const node = lookup.node;
     var success: ibool = compat.FALSE;
     const file = os_file.os_file_create_simple(node.name, os_file.OS_FILE_OPEN, os_file.OS_FILE_READ_WRITE, &success);
     if (success == compat.FALSE or file == null) {
         return DB_ERROR;
     }
     defer _ = os_file.os_file_close(file);
-    if (os_file.os_file_read_page(file, page_no, buf) == compat.FALSE) {
+    if (os_file.os_file_read_page(file, lookup.page_no, buf) == compat.FALSE) {
         return DB_ERROR;
     }
     return DB_SUCCESS;
@@ -655,14 +690,15 @@ pub fn fil_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint
             return DB_ERROR;
         }
     }
-    const node = fil_first_node(space) orelse return DB_ERROR;
+    const lookup = fil_node_for_page(space, page_no) orelse return DB_ERROR;
+    const node = lookup.node;
     var success: ibool = compat.FALSE;
     const file = os_file.os_file_create_simple(node.name, os_file.OS_FILE_OPEN, os_file.OS_FILE_READ_WRITE, &success);
     if (success == compat.FALSE or file == null) {
         return DB_ERROR;
     }
     defer _ = os_file.os_file_close(file);
-    if (os_file.os_file_write_page(node.name, file, page_no, buf) == compat.FALSE) {
+    if (os_file.os_file_write_page(node.name, file, lookup.page_no, buf) == compat.FALSE) {
         return DB_ERROR;
     }
     return DB_SUCCESS;
@@ -782,5 +818,50 @@ test "fil read/write page" {
     var read_page: [compat.UNIV_PAGE_SIZE]byte = undefined;
     @memset(read_page[0..], 0);
     try std.testing.expectEqual(DB_SUCCESS, fil_read_page(space_id, 1, read_page[0..].ptr));
+    try std.testing.expect(std.mem.eql(u8, read_page[0..], write_page[0..]));
+}
+
+test "fil multi-file node mapping" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const prev_path = fil_path_to_client_datadir;
+    fil_path_to_client_datadir = base;
+    defer fil_path_to_client_datadir = prev_path;
+
+    fil_init(0, 32);
+    defer fil_close();
+
+    const file1 = try std.fmt.allocPrint(std.testing.allocator, "{s}/multi1.ibd", .{base});
+    defer std.testing.allocator.free(file1);
+    const file2 = try std.fmt.allocPrint(std.testing.allocator, "{s}/multi2.ibd", .{base});
+    defer std.testing.allocator.free(file2);
+
+    const bytes = @as(u64, 2) * @as(u64, compat.UNIV_PAGE_SIZE);
+    var success: ibool = compat.FALSE;
+    const f1 = os_file.os_file_create_simple(file1, os_file.OS_FILE_CREATE_PATH, os_file.OS_FILE_READ_WRITE, &success);
+    try std.testing.expect(success == compat.TRUE);
+    defer _ = os_file.os_file_close(f1);
+    try std.testing.expect(os_file.os_file_set_size(file1, f1, @as(ulint, @intCast(bytes & 0xFFFF_FFFF)), @as(ulint, @intCast(bytes >> 32))) == compat.TRUE);
+
+    success = compat.FALSE;
+    const f2 = os_file.os_file_create_simple(file2, os_file.OS_FILE_CREATE_PATH, os_file.OS_FILE_READ_WRITE, &success);
+    try std.testing.expect(success == compat.TRUE);
+    defer _ = os_file.os_file_close(f2);
+    try std.testing.expect(os_file.os_file_set_size(file2, f2, @as(ulint, @intCast(bytes & 0xFFFF_FFFF)), @as(ulint, @intCast(bytes >> 32))) == compat.TRUE);
+
+    try std.testing.expect(fil_space_create(file1, 1, 0, FIL_TABLESPACE) == compat.TRUE);
+    fil_node_create(file1, 2, 1, compat.FALSE);
+    fil_node_create(file2, 2, 1, compat.FALSE);
+
+    var write_page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    @memset(write_page[0..], 0xCD);
+    try std.testing.expectEqual(DB_SUCCESS, fil_write_page(1, 3, write_page[0..].ptr));
+
+    var read_page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    @memset(read_page[0..], 0);
+    try std.testing.expectEqual(DB_SUCCESS, fil_read_page(1, 3, read_page[0..].ptr));
     try std.testing.expect(std.mem.eql(u8, read_page[0..], write_page[0..]));
 }

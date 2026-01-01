@@ -170,7 +170,7 @@ pub fn openOrCreateSystemTablespace(data_home_dir: []const u8, data_file_path: [
     var space_ready = space_exists;
     var created_any = false;
 
-    for (files, 0..) |file_spec, idx| {
+    for (files) |file_spec| {
         const full_path = resolveDataPath(allocator, data_home_dir, file_spec.path) catch return compat.FALSE;
         defer allocator.free(full_path);
 
@@ -232,7 +232,7 @@ pub fn openOrCreateSystemTablespace(data_home_dir: []const u8, data_file_path: [
             space_ready = true;
         }
 
-        if (space_ready and idx == 0 and !space_exists) {
+        if (space_ready and !space_exists) {
             fil.fil_node_create(full_path, actual_pages, space_id, compat.FALSE);
         }
     }
