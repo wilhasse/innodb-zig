@@ -109,6 +109,7 @@ pub const buf_page_t = struct {
     dirty: ibool = compat.FALSE,
     modification: ib_uint64_t = 0,
     lru_old: ibool = compat.FALSE,
+    lru_counted: ibool = compat.FALSE,
     last_access: ib_uint64_t = 0,
 };
 
@@ -123,6 +124,8 @@ pub const buf_pool_t = struct {
     oldest_modification: ib_uint64_t = 0,
     free_list_len: ulint = 0,
     dirty_pages: ulint = 0,
+    lru_old_len: ulint = 0,
+    lru_new_len: ulint = 0,
     next_modification: ib_uint64_t = 1,
     next_access: ib_uint64_t = 1,
     pages_created: ulint = 0,
@@ -202,6 +205,8 @@ fn buf_pool_clear_pages(pool: *buf_pool_t) void {
     pool.curr_size = 0;
     pool.dirty_pages = 0;
     pool.oldest_modification = 0;
+    pool.lru_old_len = 0;
+    pool.lru_new_len = 0;
     pool.next_modification = 1;
     pool.next_access = 1;
     pool.pages_created = 0;
@@ -226,11 +231,40 @@ fn buf_pool_recompute_oldest(pool: *buf_pool_t) void {
     pool.oldest_modification = oldest;
 }
 
+fn buf_LRU_set_old(pool: *buf_pool_t, bpage: *buf_page_t, make_old: ibool) void {
+    if (bpage.lru_counted == compat.FALSE) {
+        bpage.lru_old = make_old;
+        bpage.lru_counted = compat.TRUE;
+        if (make_old == compat.TRUE) {
+            pool.lru_old_len += 1;
+        } else {
+            pool.lru_new_len += 1;
+        }
+        return;
+    }
+    if (bpage.lru_old == make_old) {
+        return;
+    }
+    if (bpage.lru_old == compat.TRUE) {
+        if (pool.lru_old_len > 0) {
+            pool.lru_old_len -= 1;
+        }
+    } else if (pool.lru_new_len > 0) {
+        pool.lru_new_len -= 1;
+    }
+    bpage.lru_old = make_old;
+    if (make_old == compat.TRUE) {
+        pool.lru_old_len += 1;
+    } else {
+        pool.lru_new_len += 1;
+    }
+}
+
 fn buf_pool_touch_page(pool: *buf_pool_t, bpage: *buf_page_t, old: ?ibool) void {
     bpage.last_access = pool.next_access;
     pool.next_access += 1;
     if (old) |flag| {
-        bpage.lru_old = flag;
+        buf_LRU_set_old(pool, bpage, flag);
     }
 }
 
@@ -442,7 +476,7 @@ pub fn buf_page_get_gen(
     };
     pool.curr_size += 1;
     pool.pages_created += 1;
-    buf_pool_touch_page(pool, &block.page, compat.FALSE);
+    buf_LRU_add_block(&block.page, compat.FALSE);
     return block;
 }
 
@@ -769,6 +803,15 @@ fn buf_pool_remove_block(pool: *buf_pool_t, key: BufPageKey) void {
         if (pool.curr_size > 0) {
             pool.curr_size -= 1;
         }
+        if (entry.value.page.lru_counted == compat.TRUE) {
+            if (entry.value.page.lru_old == compat.TRUE) {
+                if (pool.lru_old_len > 0) {
+                    pool.lru_old_len -= 1;
+                }
+            } else if (pool.lru_new_len > 0) {
+                pool.lru_new_len -= 1;
+            }
+        }
         pool.free_list_len += 1;
         buf_block_free(entry.value);
         buf_pool_recompute_oldest(pool);
@@ -830,7 +873,15 @@ pub fn buf_LRU_block_free_non_file_page(block: *buf_block_t) void {
 
 pub fn buf_LRU_add_block(bpage: *buf_page_t, old: ibool) void {
     const pool = buf_pool orelse return;
-    buf_pool_touch_page(pool, bpage, old);
+    var make_old = old;
+    if (make_old == compat.FALSE and buf_LRU_old_ratio != 0) {
+        const total = pool.lru_old_len + pool.lru_new_len;
+        const old_pct = if (total == 0) 0 else (pool.lru_old_len * 100) / total;
+        if (old_pct < buf_LRU_old_ratio) {
+            make_old = compat.TRUE;
+        }
+    }
+    buf_pool_touch_page(pool, bpage, make_old);
 }
 
 pub fn buf_unzip_LRU_add_block(block: *buf_block_t, old: ibool) void {
@@ -979,6 +1030,26 @@ test "buf dirty tracking and flush" {
     try std.testing.expectEqual(@as(ulint, 1), flushed);
     try std.testing.expectEqual(compat.FALSE, block.page.dirty);
     try std.testing.expectEqual(@as(ib_uint64_t, 0), buf_pool_get_oldest_modification());
+}
+
+test "buf LRU old/new segmentation" {
+    defer buf_mem_free();
+    _ = buf_pool_init() orelse return error.OutOfMemory;
+
+    buf_LRU_var_init();
+    _ = buf_LRU_old_ratio_update(50, compat.FALSE);
+
+    var mtr = mtr_t{};
+    const b1 = buf_page_get_gen(1, 0, 1, 0, null, BUF_GET, "lru", 0, &mtr) orelse return error.OutOfMemory;
+    const pool = buf_pool orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(ulint, 1), pool.lru_old_len);
+    try std.testing.expectEqual(@as(ulint, 0), pool.lru_new_len);
+    try std.testing.expect(b1.page.lru_old == compat.TRUE);
+
+    const b2 = buf_page_get_gen(1, 0, 2, 0, null, BUF_GET, "lru", 0, &mtr) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(ulint, 1), pool.lru_old_len);
+    try std.testing.expectEqual(@as(ulint, 1), pool.lru_new_len);
+    try std.testing.expect(b2.page.lru_old == compat.FALSE);
 }
 
 test "buf block alloc and frame copy" {
