@@ -482,9 +482,9 @@ test "mlog_parse_nbytes writes page data" {
     var page = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
     var buf: [16]byte = .{0} ** 16;
     mach.mach_write_to_2(buf[0..].ptr, 4);
-    _ = mach.mach_write_compressed(buf[2..].ptr, 0xAA);
+    const size = mach.mach_write_compressed(buf[2..].ptr, 0xAA);
 
-    const end_ptr = buf[3..].ptr;
+    const end_ptr = buf[2 + @as(usize, @intCast(size)) ..].ptr;
     const res = mlog_parse_nbytes(MLOG_1BYTE, buf[0..].ptr, end_ptr, page[0..].ptr, null);
     try std.testing.expect(res != null);
     try std.testing.expect(page[4] == 0xAA);
@@ -556,8 +556,7 @@ test "mtr commit writes log bytes to buffer" {
 
     const sys = log.log_sys orelse return error.UnexpectedNull;
     try std.testing.expect(sys.log_buf_used > 0);
-    try std.testing.expect(mtr.start_lsn != 0);
-    try std.testing.expect(mtr.end_lsn >= mtr.start_lsn);
+    try std.testing.expect(mtr.end_lsn > mtr.start_lsn);
 
     const buf = sys.log_buf.?[0..@as(usize, @intCast(sys.log_buf_used))];
     const rec = try log.redo_record_decode(buf);

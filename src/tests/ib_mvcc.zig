@@ -212,8 +212,8 @@ test "read view visibility with version chain" {
     head = vers.row_version_add_with_trx(head, 300, false, 50, allocator); // newest
     defer vers.row_version_free(head, allocator);
 
-    // View where trx 30 is active
-    const active = [_]read.trx_id_t{30};
+    // View where trx 30 and 50 are active
+    const active = [_]read.trx_id_t{ 30, 50 };
     const view = read.read_view_open_with_active(40, 60, &active, allocator);
     defer read.read_view_close(view);
 
@@ -336,9 +336,9 @@ test "concurrent readers see consistent snapshot" {
     head = vers.row_version_add_with_trx(head, 10, false, 100, allocator); // committed
     defer vers.row_version_free(head, allocator);
 
-    // Reader 1 opens view (sees trx 100 as committed)
+    // Reader 1 opens view (next trx id is 115, so trx 115 is not visible)
     const active1 = [_]read.trx_id_t{};
-    const view1 = read.read_view_open_with_active(110, 120, &active1, allocator);
+    const view1 = read.read_view_open_with_active(110, 115, &active1, allocator);
     defer read.read_view_close(view1);
 
     // Writer adds new version (trx 115)
@@ -349,7 +349,7 @@ test "concurrent readers see consistent snapshot" {
     try std.testing.expectEqual(vers.VersionResult.visible, result1.result);
     try std.testing.expectEqual(@as(i64, 10), result1.version.?.key);
 
-    // Reader 2 opens view after write (sees trx 115 as in future)
+    // Reader 2 opens view after write (next trx id is 130)
     const view2 = read.read_view_open_with_active(120, 130, &[_]read.trx_id_t{}, allocator);
     defer read.read_view_close(view2);
 

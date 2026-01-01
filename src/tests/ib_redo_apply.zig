@@ -18,13 +18,20 @@ test "redo recovery applies MLOG updates to page" {
 
     try std.testing.expectEqual(compat.TRUE, log_mod.log_sys_init(base, 1, 4096, 0));
 
-    var page = [_]u8{0} ** compat.UNIV_PAGE_SIZE;
-    mach.mach_write_to_4(page[0..].ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 1);
-    mach.mach_write_to_4(page[0..].ptr + fil.FIL_PAGE_OFFSET, 7);
+    const allocator = std.testing.allocator;
+    const page_mem = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(compat.UNIV_PAGE_SIZE),
+        compat.UNIV_PAGE_SIZE,
+    );
+    defer allocator.free(page_mem);
+    @memset(page_mem, 0);
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 1);
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_OFFSET, 7);
 
     var mtr = mtr_mod.mtr_t{};
     _ = mtr_mod.mtr_start(&mtr);
-    mtr_mod.mlog_write_ulint(page[200..].ptr, 0x5A, mtr_mod.MLOG_1BYTE, &mtr);
+    mtr_mod.mlog_write_ulint(page_mem.ptr + 200, 0x5A, mtr_mod.MLOG_1BYTE, &mtr);
     mtr_mod.mtr_commit(&mtr);
 
     try std.testing.expectEqual(compat.TRUE, log_mod.log_flush());

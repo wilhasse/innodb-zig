@@ -719,6 +719,7 @@ fn encode_tuple_compact_bytes(tuple: *const dtuple_t) ?RecBytes {
     const header_len = rec_mod.REC_N_NEW_EXTRA_BYTES + 1 + null_bytes;
     const total = header_len + payload;
     const buf = allocator.alloc(u8, @as(usize, @intCast(total))) catch return null;
+    @memset(buf, 0);
     const rec_ptr = @as([*]byte, @ptrCast(buf[@as(usize, @intCast(header_len))..].ptr));
     _ = rec_mod.rec_encode_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, metas, tuple);
     return .{ .buf = buf, .header_len = header_len };
@@ -744,6 +745,7 @@ fn encode_node_ptr_bytes(key: i64, child_page_no: ulint) ?RecBytes {
     const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1;
     const total = header_len + @sizeOf(i64) + @sizeOf(u32);
     const buf = allocator.alloc(u8, @as(usize, @intCast(total))) catch return null;
+    @memset(buf, 0);
     const rec_ptr = @as([*]byte, @ptrCast(buf[@as(usize, @intCast(header_len))..].ptr));
     _ = rec_mod.rec_encode_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple);
     rec_mod.rec_set_status(rec_ptr, rec_mod.REC_STATUS_NODE_PTR);
