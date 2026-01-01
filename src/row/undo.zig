@@ -13,26 +13,30 @@ pub const UndoEntry = struct {
 };
 
 pub const UndoLog = struct {
-    entries: std.ArrayList(UndoEntry),
+    entries: std.ArrayListUnmanaged(UndoEntry),
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) UndoLog {
-        return .{ .entries = std.ArrayList(UndoEntry).init(allocator) };
+        return .{
+            .entries = .{},
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *UndoLog) void {
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     pub fn addInsert(self: *UndoLog, rec: *page.rec_t) void {
-        self.entries.append(.{ .op = .insert, .rec = rec }) catch @panic("addInsert");
+        self.entries.append(self.allocator, .{ .op = .insert, .rec = rec }) catch @panic("addInsert");
     }
 
     pub fn addDelete(self: *UndoLog, rec: *page.rec_t) void {
-        self.entries.append(.{ .op = .delete, .rec = rec }) catch @panic("addDelete");
+        self.entries.append(self.allocator, .{ .op = .delete, .rec = rec }) catch @panic("addDelete");
     }
 
     pub fn addModify(self: *UndoLog, rec: *page.rec_t, old_key: i64) void {
-        self.entries.append(.{ .op = .modify, .rec = rec, .old_key = old_key }) catch @panic("addModify");
+        self.entries.append(self.allocator, .{ .op = .modify, .rec = rec, .old_key = old_key }) catch @panic("addModify");
     }
 
     pub fn apply(self: *UndoLog) void {

@@ -16,6 +16,9 @@ const os_thread = @import("../os/thread.zig");
 const page = @import("../page/mod.zig");
 const buf_mod = @import("../buf/mod.zig");
 const trx_sys = @import("../trx/sys.zig");
+const trx_types = @import("../trx/types.zig");
+const row_undo = @import("../row/undo.zig");
+const trx_undo = @import("../trx/undo.zig");
 const charset = @import("../ut/charset.zig");
 
 const ib_tuple_type_t = enum(u32) {
@@ -60,6 +63,8 @@ const SchemaLock = enum(u8) {
 
 const Savepoint = struct {
     name: []u8,
+    /// Undo number at which savepoint was taken (for rollback)
+    undo_no: trx_types.undo_no_t = trx_types.dulintZero(),
 };
 
 pub const Trx = struct {
@@ -68,6 +73,8 @@ pub const Trx = struct {
     client_thread_id: os_thread.ThreadId,
     schema_lock: SchemaLock,
     savepoints: ArrayList(Savepoint),
+    /// Internal transaction with undo chain
+    inner_trx: ?*trx_types.trx_t = null,
 };
 pub const Cursor = struct {
     allocator: std.mem.Allocator,
@@ -2599,6 +2606,13 @@ pub fn ib_trx_start(ib_trx: ib_trx_t, ib_trx_level: ib_trx_level_t) ib_err_t {
         trx.state = .IB_TRX_ACTIVE;
         trx.isolation_level = ib_trx_level;
         trx.schema_lock = .none;
+
+        // Create internal transaction with undo chain (IBD-213)
+        const inner = std.heap.page_allocator.create(trx_types.trx_t) catch return .DB_OUT_OF_MEMORY;
+        inner.* = .{ .allocator = std.heap.page_allocator };
+        inner.conc_state = .active;
+        trx.inner_trx = inner;
+
         return .DB_SUCCESS;
     }
 
@@ -2631,6 +2645,14 @@ pub fn ib_trx_state(ib_trx: ib_trx_t) ib_trx_state_t {
 pub fn ib_trx_release(ib_trx: ib_trx_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
     savepointsClear(trx);
+
+    // Free internal transaction and undo logs (IBD-213)
+    if (trx.inner_trx) |inner| {
+        trx_undo.trx_undo_free_logs(inner);
+        std.heap.page_allocator.destroy(inner);
+        trx.inner_trx = null;
+    }
+
     std.heap.page_allocator.destroy(trx);
     return .DB_SUCCESS;
 }
@@ -2645,6 +2667,18 @@ pub fn ib_trx_commit(ib_trx: ib_trx_t) ib_err_t {
 pub fn ib_trx_rollback(ib_trx: ib_trx_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
     trx.schema_lock = .none;
+
+    // Apply undo chain for rollback (IBD-213)
+    if (trx.inner_trx) |inner| {
+        const result = row_undo.row_undo_trx(inner, null, null);
+        if (result != .DB_SUCCESS) {
+            // Rollback failed, but still release transaction
+            trx.state = .IB_TRX_NOT_STARTED;
+            _ = ib_trx_release(trx);
+            return result;
+        }
+    }
+
     trx.state = .IB_TRX_NOT_STARTED;
     return ib_trx_release(trx);
 }
@@ -3240,7 +3274,11 @@ pub fn ib_savepoint_take(ib_trx: ib_trx_t, name: ?*const anyopaque, name_len: ib
 
     const copy = std.heap.page_allocator.alloc(u8, slice.len) catch return;
     std.mem.copyForwards(u8, copy, slice);
-    trx.savepoints.append(.{ .name = copy }) catch {
+
+    // Capture undo_no at savepoint time (IBD-213)
+    const undo_no = if (trx.inner_trx) |inner| inner.undo_no else trx_types.dulintZero();
+
+    trx.savepoints.append(.{ .name = copy, .undo_no = undo_no }) catch {
         std.heap.page_allocator.free(copy);
     };
 }
@@ -3268,11 +3306,34 @@ pub fn ib_savepoint_rollback(ib_trx: ib_trx_t, name: ?*const anyopaque, name_len
         if (trx.savepoints.items.len == 0) {
             return .DB_NO_SAVEPOINT;
         }
+        // Rollback all savepoints - use first savepoint's undo_no (IBD-213)
+        if (trx.inner_trx) |inner| {
+            const savept = trx_types.trx_savept_t{
+                .least_undo_no = trx.savepoints.items[0].undo_no,
+            };
+            const result = row_undo.row_undo_to_savepoint(inner, savept, null, null);
+            if (result != .DB_SUCCESS) {
+                return result;
+            }
+        }
         savepointsClear(trx);
         return .DB_SUCCESS;
     }
 
     const idx = savepointFindIndex(trx, slice.?) orelse return .DB_NO_SAVEPOINT;
+
+    // Apply undo chain to savepoint's undo_no (IBD-213)
+    if (trx.inner_trx) |inner| {
+        const savept = trx_types.trx_savept_t{
+            .least_undo_no = trx.savepoints.items[idx].undo_no,
+        };
+        const result = row_undo.row_undo_to_savepoint(inner, savept, null, null);
+        if (result != .DB_SUCCESS) {
+            return result;
+        }
+    }
+
+    // Remove savepoints after the target one
     while (trx.savepoints.items.len > idx + 1) {
         savepointRemoveAt(trx, trx.savepoints.items.len - 1);
     }
