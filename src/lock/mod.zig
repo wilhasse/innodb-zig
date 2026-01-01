@@ -36,6 +36,7 @@ pub const LOCK_ORDINARY: ulint = 0;
 pub const LOCK_GAP: ulint = 512;
 pub const LOCK_REC_NOT_GAP: ulint = 1024;
 pub const LOCK_INSERT_INTENTION: ulint = 2048;
+pub const LOCK_WAIT_POLL_NS: u64 = 1 * std.time.ns_per_ms;
 
 fn lock_mode_bit(mode1: ulint, mode2: ulint) ulint {
     const shift: u6 = @intCast(mode1 * LOCK_NUM + mode2);
@@ -380,6 +381,16 @@ pub fn lock_table(trx: *trx_types.trx_t, table_id: u64, mode: ulint) errors.DbEr
     return .DB_SUCCESS;
 }
 
+pub fn lock_table_wait(trx: *trx_types.trx_t, table_id: u64, mode: ulint, timeout_ns: u64) errors.DbErr {
+    const err = lock_table(trx, table_id, mode);
+    if (err != .DB_LOCK_WAIT) {
+        return err;
+    }
+    const sys = lock_sys orelse return .DB_ERROR;
+    const wait_lock = lock_table_find_wait_lock(sys, trx, table_id) orelse return .DB_ERROR;
+    return lock_wait_suspend_thread(sys, wait_lock, timeout_ns);
+}
+
 pub fn lock_table_release(trx: *trx_types.trx_t, table_id: u64) void {
     const sys = lock_sys orelse return;
     const queue = sys.table_hash.getPtr(table_id) orelse return;
@@ -454,6 +465,102 @@ fn lock_rec_other_has_incompatible(
     return null;
 }
 
+fn lock_table_find_wait_lock(sys: *lock_sys_t, trx: *trx_types.trx_t, table_id: u64) ?*lock_t {
+    const queue = sys.table_hash.getPtr(table_id) orelse return null;
+    var current = queue.head;
+    while (current) |lock| {
+        if (lock.trx == trx and lock_is_wait(lock) == compat.TRUE) {
+            return lock;
+        }
+        current = lock.next;
+    }
+    return null;
+}
+
+fn lock_rec_find_wait_lock(sys: *lock_sys_t, trx: *trx_types.trx_t, key: LockRecKey) ?*lock_t {
+    const queue = sys.rec_hash.getPtr(key) orelse return null;
+    var current = queue.head;
+    while (current) |lock| {
+        if (lock.trx == trx and lock_is_wait(lock) == compat.TRUE) {
+            return lock;
+        }
+        current = lock.next;
+    }
+    return null;
+}
+
+fn lock_wait_can_grant(sys: *lock_sys_t, wait_lock: *lock_t) bool {
+    const mode = lock_get_mode(wait_lock);
+    switch (lock_get_type_low(wait_lock)) {
+        LOCK_TABLE => {
+            const queue = sys.table_hash.getPtr(wait_lock.table_id) orelse return true;
+            var current = queue.head;
+            while (current) |lock| {
+                if (lock != wait_lock and lock_is_wait(lock) == compat.FALSE and lock.trx != wait_lock.trx) {
+                    if (lock_mode_compatible(lock_get_mode(lock), mode) == compat.FALSE) {
+                        return false;
+                    }
+                }
+                current = lock.next;
+            }
+            return true;
+        },
+        LOCK_REC => {
+            const key = LockRecKey{
+                .space = wait_lock.space,
+                .page_no = wait_lock.page_no,
+                .rec_offset = wait_lock.rec_bit,
+            };
+            const queue = sys.rec_hash.getPtr(key) orelse return true;
+            var current = queue.head;
+            while (current) |lock| {
+                if (lock != wait_lock and lock_is_wait(lock) == compat.FALSE and lock.trx != wait_lock.trx) {
+                    if (lock_mode_compatible(lock_get_mode(lock), mode) == compat.FALSE) {
+                        return false;
+                    }
+                }
+                current = lock.next;
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn lock_wait_grant(sys: *lock_sys_t, wait_lock: *lock_t) void {
+    wait_lock.type_mode &= ~LOCK_WAIT;
+    wait_lock.wait_for = null;
+    if (wait_lock.trx) |trx| {
+        lock_waits_for_clear(sys, trx);
+    }
+}
+
+fn lock_wait_cancel(sys: *lock_sys_t, wait_lock: *lock_t) void {
+    switch (lock_get_type_low(wait_lock)) {
+        LOCK_TABLE => lock_table_remove(sys, wait_lock),
+        LOCK_REC => lock_rec_remove(sys, wait_lock),
+        else => {},
+    }
+}
+
+fn lock_wait_suspend_thread(sys: *lock_sys_t, wait_lock: *lock_t, timeout_ns: u64) errors.DbErr {
+    const start = @as(u64, @intCast(std.time.nanoTimestamp()));
+    while (true) {
+        if (lock_wait_can_grant(sys, wait_lock)) {
+            lock_wait_grant(sys, wait_lock);
+            return .DB_SUCCESS;
+        }
+        if (timeout_ns != 0) {
+            const now = @as(u64, @intCast(std.time.nanoTimestamp()));
+            if (now - start >= timeout_ns) {
+                lock_wait_cancel(sys, wait_lock);
+                return .DB_LOCK_WAIT_TIMEOUT;
+            }
+        }
+        std.Thread.sleep(LOCK_WAIT_POLL_NS);
+    }
+}
+
 pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t, mode: ulint) errors.DbErr {
     if (mode >= LOCK_NUM) {
         return .DB_ERROR;
@@ -481,6 +588,23 @@ pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec
 
     _ = lock_rec_create(sys, trx, index, rec, mode) orelse return .DB_OUT_OF_MEMORY;
     return .DB_SUCCESS;
+}
+
+pub fn lock_rec_wait(
+    trx: *trx_types.trx_t,
+    index: *dict.dict_index_t,
+    rec: *page.rec_t,
+    mode: ulint,
+    timeout_ns: u64,
+) errors.DbErr {
+    const err = lock_rec(trx, index, rec, mode);
+    if (err != .DB_LOCK_WAIT) {
+        return err;
+    }
+    const sys = lock_sys orelse return .DB_ERROR;
+    const key = lock_rec_key_from(index, rec) orelse return .DB_ERROR;
+    const wait_lock = lock_rec_find_wait_lock(sys, trx, key) orelse return .DB_ERROR;
+    return lock_wait_suspend_thread(sys, wait_lock, timeout_ns);
 }
 
 pub fn lock_rec_release(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t) void {
@@ -707,5 +831,46 @@ test "record lock request and release" {
 
     const sys = lock_sys orelse return error.OutOfMemory;
     try std.testing.expect(sys.rec_hash.count() == 0);
+    lock_sys_close();
+}
+
+test "lock table wait grants after release" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_table(&trx1, 5, LOCK_X));
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT, lock_table(&trx2, 5, LOCK_S));
+
+    const sys = lock_sys orelse return error.OutOfMemory;
+    const wait_lock = lock_table_find_wait_lock(sys, &trx2, 5) orelse return error.OutOfMemory;
+
+    lock_table_release(&trx1, 5);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_wait_suspend_thread(sys, wait_lock, 0));
+    try std.testing.expect(lock_is_wait(wait_lock) == compat.FALSE);
+
+    lock_table_release(&trx2, 5);
+    lock_sys_close();
+}
+
+test "lock table wait timeout removes wait lock" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_table(&trx1, 9, LOCK_X));
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT, lock_table(&trx2, 9, LOCK_S));
+
+    const sys = lock_sys orelse return error.OutOfMemory;
+    const wait_lock = lock_table_find_wait_lock(sys, &trx2, 9) orelse return error.OutOfMemory;
+    const res = lock_wait_suspend_thread(sys, wait_lock, 5 * std.time.ns_per_ms);
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT_TIMEOUT, res);
+
+    try std.testing.expect(lock_table_find_wait_lock(sys, &trx2, 9) == null);
+    lock_table_release(&trx1, 9);
     lock_sys_close();
 }
