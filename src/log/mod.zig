@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayList = std.array_list.Managed;
 const compat = @import("../ut/compat.zig");
 const ha = @import("../ha/mod.zig");
 const os_file = @import("../os/file.zig");
@@ -10,6 +11,7 @@ pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
 pub const ib_int64_t = compat.ib_int64_t;
 pub const ib_uint64_t = compat.ib_uint64_t;
+pub const byte = compat.byte;
 
 pub const OS_FILE_LOG_BLOCK_SIZE: ulint = 512;
 pub const LOG_FILE_HDR_SIZE: ib_int64_t = @as(ib_int64_t, @intCast(4 * OS_FILE_LOG_BLOCK_SIZE));
@@ -79,7 +81,7 @@ pub const log_t = struct {
     log_dir_owned: bool = false,
     n_files: ulint = 0,
     file_size: ib_int64_t = 0,
-    files: std.ArrayList(LogFile) = std.ArrayList(LogFile).init(std.heap.page_allocator),
+    files: ArrayList(LogFile) = ArrayList(LogFile).init(std.heap.page_allocator),
     log_buf: ?[]u8 = null,
     log_buf_used: ulint = 0,
     log_buf_lsn: ib_uint64_t = 0,
@@ -210,7 +212,7 @@ pub fn log_sys_init(log_dir: []const u8, n_files: ulint, log_file_size: ib_int64
         .log_dir_owned = false,
         .n_files = n_files,
         .file_size = log_file_size,
-        .files = std.ArrayList(LogFile).init(allocator),
+        .files = ArrayList(LogFile).init(allocator),
         .log_buf = null,
         .log_buf_used = 0,
         .log_buf_lsn = 0,
@@ -241,7 +243,7 @@ pub fn log_sys_init(log_dir: []const u8, n_files: ulint, log_file_size: ib_int64
         var keep_path = false;
         defer if (!keep_path) allocator.free(path);
         const exists = os_file.exists(path);
-        const handle = os_file.open(path, if (exists) .open else .create, .read_write) catch return compat.FALSE;
+        var handle = os_file.open(path, if (exists) .open else .create, .read_write) catch return compat.FALSE;
         var keep_handle = false;
         defer if (!keep_handle) handle.close();
 
@@ -944,7 +946,7 @@ test "log sys init creates and reopens log headers" {
 
     const path = try log_make_file_name(std.testing.allocator, base, 0);
     defer std.testing.allocator.free(path);
-    const handle = try os_file.open(path, .open, .read_write);
+    var handle = try os_file.open(path, .open, .read_write);
     defer handle.close();
     const header = try log_read_header(&handle);
     try std.testing.expectEqual(LOG_FILE_MAGIC, header.magic);
@@ -976,7 +978,7 @@ test "log append writes at header offset" {
 
     const path = try log_make_file_name(std.testing.allocator, base, 0);
     defer std.testing.allocator.free(path);
-    const handle = try os_file.open(path, .open, .read_write);
+    var handle = try os_file.open(path, .open, .read_write);
     defer handle.close();
     var buf: [5]u8 = undefined;
     const read = try handle.readAt(buf[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
@@ -996,14 +998,14 @@ test "log append wraps across files" {
     defer log_sys_close();
 
     var payload: [24]u8 = undefined;
-    for (payload, 0..) |*b, idx| {
+    for (payload[0..], 0..) |*b, idx| {
         b.* = @as(u8, @intCast(idx));
     }
     _ = log_append_bytes(payload[0..]) orelse return error.UnexpectedNull;
 
     const path0 = try log_make_file_name(std.testing.allocator, base, 0);
     defer std.testing.allocator.free(path0);
-    const handle0 = try os_file.open(path0, .open, .read_write);
+    var handle0 = try os_file.open(path0, .open, .read_write);
     defer handle0.close();
     var buf0: [16]u8 = undefined;
     const read0 = try handle0.readAt(buf0[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
@@ -1012,7 +1014,7 @@ test "log append wraps across files" {
 
     const path1 = try log_make_file_name(std.testing.allocator, base, 1);
     defer std.testing.allocator.free(path1);
-    const handle1 = try os_file.open(path1, .open, .read_write);
+    var handle1 = try os_file.open(path1, .open, .read_write);
     defer handle1.close();
     var buf1: [8]u8 = undefined;
     const read1 = try handle1.readAt(buf1[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
