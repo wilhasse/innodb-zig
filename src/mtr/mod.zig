@@ -31,6 +31,7 @@ pub const MLOG_1BYTE: ulint = 1;
 pub const MLOG_2BYTES: ulint = 2;
 pub const MLOG_4BYTES: ulint = 4;
 pub const MLOG_8BYTES: ulint = 8;
+pub const MLOG_MULTI_REC_END: byte = 31;
 pub const MLOG_WRITE_STRING: byte = 30;
 pub const MLOG_FILE_CREATE: byte = 33;
 pub const MLOG_FILE_RENAME: byte = 34;
@@ -59,15 +60,54 @@ pub fn mtr_start(mtr: *mtr_t) *mtr_t {
     mtr.log_mode = MTR_LOG_ALL;
     mtr.modifications = compat.FALSE;
     mtr.n_log_recs = 0;
+    mtr.start_lsn = 0;
+    mtr.end_lsn = 0;
     mtr.state = MTR_ACTIVE;
     mtr.magic_n = MTR_MAGIC_N;
     return mtr;
+}
+
+fn mtr_log_reserve_and_write(mtr: *mtr_t) void {
+    const mlog = &mtr.log;
+    if (mtr.n_log_recs > 1) {
+        mlog_catenate_ulint(mtr, MLOG_MULTI_REC_END, MLOG_1BYTE);
+    } else {
+        const first = dyn.dyn_block_get_data(mlog);
+        first[0] = @as(byte, @intCast(@as(ulint, first[0]) | MLOG_SINGLE_REC_FLAG));
+    }
+
+    var total: u64 = 0;
+    var start_lsn: ?u64 = null;
+    var block: ?*dyn.dyn_block_t = dyn.dyn_array_get_first_block(mlog);
+    while (block) |cur| {
+        const used = dyn.dyn_block_get_used(cur);
+        if (used > 0) {
+            const data = dyn.dyn_block_get_data(cur)[0..@as(usize, @intCast(used))];
+            const lsn = log.log_append_bytes(data) orelse return;
+            if (start_lsn == null) {
+                start_lsn = lsn;
+            }
+            total += used;
+        }
+        block = dyn.dyn_array_get_next_block(mlog, cur);
+    }
+    if (start_lsn) |lsn| {
+        mtr.start_lsn = lsn;
+        mtr.end_lsn = lsn + total;
+    }
 }
 
 pub fn mtr_commit(mtr: *mtr_t) void {
     std.debug.assert(mtr.magic_n == MTR_MAGIC_N);
     std.debug.assert(mtr.state == MTR_ACTIVE);
     mtr.state = MTR_COMMITTING;
+    if (mtr.modifications == compat.TRUE and mtr.n_log_recs > 0 and mtr.log_mode != MTR_LOG_NONE) {
+        if (log.recv_no_log_write == compat.FALSE and log.log_sys != null) {
+            if (mtr.log.magic_n == dyn.DYN_BLOCK_MAGIC_N and dyn.dyn_array_get_data_size(&mtr.log) > 0) {
+                mtr_log_reserve_and_write(mtr);
+            }
+        }
+    }
     if (mtr.memo.magic_n == dyn.DYN_BLOCK_MAGIC_N) {
         dyn.dyn_array_free(&mtr.memo);
     }
@@ -442,6 +482,52 @@ test "mtr start/commit and memo push" {
 
     mtr_commit(&mtr);
     try std.testing.expect(mtr.state == MTR_COMMITTED);
+}
+
+test "mtr commit writes log bytes to buffer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log.log_var_init();
+    defer log.log_var_init();
+
+    try std.testing.expectEqual(compat.TRUE, log.log_sys_init(base, 1, 1024 * 1024, 256));
+    defer log.log_sys_close();
+
+    const allocator = std.testing.allocator;
+    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    defer allocator.free(page_mem);
+    @memset(page_mem, 0);
+
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 5);
+    mach.mach_write_to_4(page_mem.ptr + fil.FIL_PAGE_OFFSET, 17);
+
+    var mtr = mtr_t{};
+    _ = mtr_start(&mtr);
+    const target = page_mem.ptr + 128;
+    mlog_write_ulint(target, 0xCC, MLOG_1BYTE, &mtr);
+    mtr_commit(&mtr);
+
+    const sys = log.log_sys orelse return error.UnexpectedNull;
+    try std.testing.expect(sys.log_buf_used > 0);
+    try std.testing.expect(mtr.start_lsn != 0);
+    try std.testing.expect(mtr.end_lsn >= mtr.start_lsn);
+
+    const buf = sys.log_buf.?[0..@as(usize, @intCast(sys.log_buf_used))];
+    var expected: [32]u8 = undefined;
+    var pos: usize = 0;
+    expected[pos] = @as(byte, @intCast(MLOG_SINGLE_REC_FLAG | MLOG_1BYTE));
+    pos += 1;
+    pos += @as(usize, @intCast(mach.mach_write_compressed(expected[pos..].ptr, 5)));
+    pos += @as(usize, @intCast(mach.mach_write_compressed(expected[pos..].ptr, 17)));
+    mach.mach_write_to_2(expected[pos..].ptr, 128);
+    pos += 2;
+    pos += @as(usize, @intCast(mach.mach_write_compressed(expected[pos..].ptr, 0xCC)));
+
+    try std.testing.expectEqualSlices(u8, expected[0..pos], buf[0..pos]);
 }
 
 fn mlog_collect_bytes(allocator: std.mem.Allocator, arr: *dyn.dyn_array_t) ![]u8 {
