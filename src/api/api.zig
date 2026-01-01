@@ -1849,10 +1849,175 @@ fn indexKeyEqual(table: *const CatalogTable, index: *const CatalogIndex, a: *Tup
     return true;
 }
 
+fn indexKeyEqualByIndex(index: *const CatalogIndex, a: *Tuple, b: *Tuple) bool {
+    if (a.cols.len != index.columns.items.len or b.cols.len != index.columns.items.len) {
+        return false;
+    }
+    for (index.columns.items, 0..) |icol, idx| {
+        const col_a = &a.cols[idx];
+        const col_b = &b.cols[idx];
+        if (!columnPrefixEqual(col_a, col_b, icol.prefix_len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn columnOrderContains(order: []const usize, col_idx: usize) bool {
+    for (order) |val| {
+        if (val == col_idx) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn indexKeyColumnOrder(
+    table: *const CatalogTable,
+    index: *const CatalogIndex,
+    allocator: std.mem.Allocator,
+) ?[]usize {
+    var cols = ArrayList(usize).init(allocator);
+    defer cols.deinit();
+
+    for (index.columns.items) |icol| {
+        const col_idx = catalogFindColumnIndex(table, icol.name) orelse return null;
+        cols.append(col_idx) catch return null;
+    }
+
+    const slice = allocator.alloc(usize, cols.items.len) catch return null;
+    std.mem.copyForwards(usize, slice, cols.items);
+    return slice;
+}
+
+fn indexRecordColumnOrder(
+    table: *const CatalogTable,
+    index: *const CatalogIndex,
+    allocator: std.mem.Allocator,
+) ?[]usize {
+    var cols = ArrayList(usize).init(allocator);
+    defer cols.deinit();
+
+    if (index.clustered) {
+        for (table.columns.items, 0..) |_, idx| {
+            cols.append(idx) catch return null;
+        }
+    } else {
+        for (index.columns.items) |icol| {
+            const col_idx = catalogFindColumnIndex(table, icol.name) orelse return null;
+            cols.append(col_idx) catch return null;
+        }
+        if (catalogClusteredIndex(@constCast(table))) |clustered| {
+            for (clustered.columns.items) |icol| {
+                const col_idx = catalogFindColumnIndex(table, icol.name) orelse return null;
+                if (!columnOrderContains(cols.items, col_idx)) {
+                    cols.append(col_idx) catch return null;
+                }
+            }
+        }
+    }
+
+    const slice = allocator.alloc(usize, cols.items.len) catch return null;
+    std.mem.copyForwards(usize, slice, cols.items);
+    return slice;
+}
+
+fn tupleCreateFromColumnOrder(
+    table: *const CatalogTable,
+    order: []const usize,
+    tuple_type: ib_tuple_type_t,
+) ?*Tuple {
+    const allocator = std.heap.page_allocator;
+    if (order.len == 0) {
+        return null;
+    }
+    const metas = allocator.alloc(ib_col_meta_t, order.len) catch return null;
+    defer allocator.free(metas);
+
+    for (order, 0..) |col_idx, idx| {
+        if (col_idx >= table.columns.items.len) {
+            return null;
+        }
+        metas[idx] = catalogColumnMeta(table.columns.items[col_idx]);
+    }
+
+    return tupleCreate(allocator, tuple_type, metas) catch null;
+}
+
+fn copyColumnData(allocator: std.mem.Allocator, dst: *Column, src: *const Column) bool {
+    if (src.data) |data| {
+        const buf = allocator.alloc(u8, data.len) catch return false;
+        std.mem.copyForwards(u8, buf, data);
+        if (dst.data) |old| {
+            allocator.free(old);
+        }
+        dst.data = buf;
+        return true;
+    }
+    if (dst.data) |old| {
+        allocator.free(old);
+    }
+    dst.data = null;
+    return true;
+}
+
+fn fillTupleFromRowByOrder(dst: *Tuple, row: *Tuple, order: []const usize) bool {
+    if (dst.cols.len != order.len) {
+        return false;
+    }
+    for (order, 0..) |col_idx, idx| {
+        const src_col = tupleColumn(row, @intCast(col_idx)) orelse return false;
+        const dst_col = &dst.cols[idx];
+        if (!copyColumnData(dst.allocator, dst_col, src_col)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn indexKeyTupleFromRow(table: *const CatalogTable, index: *const CatalogIndex, row: *Tuple) ?*Tuple {
+    const allocator = std.heap.page_allocator;
+    const order = indexKeyColumnOrder(table, index, allocator) orelse return null;
+    defer allocator.free(order);
+    const tuple = tupleCreateFromColumnOrder(table, order, .TPL_ROW) orelse return null;
+    if (!fillTupleFromRowByOrder(tuple, row, order)) {
+        tupleDestroy(tuple);
+        return null;
+    }
+    return tuple;
+}
+
+fn indexRecordTupleFromRow(table: *const CatalogTable, index: *const CatalogIndex, row: *Tuple) ?*Tuple {
+    const allocator = std.heap.page_allocator;
+    const order = indexRecordColumnOrder(table, index, allocator) orelse return null;
+    defer allocator.free(order);
+    const tuple = tupleCreateFromColumnOrder(table, order, .TPL_ROW) orelse return null;
+    if (!fillTupleFromRowByOrder(tuple, row, order)) {
+        tupleDestroy(tuple);
+        return null;
+    }
+    return tuple;
+}
+
+fn findColumnPosInOrder(order: []const usize, col_idx: usize) ?usize {
+    for (order, 0..) |val, idx| {
+        if (val == col_idx) {
+            return idx;
+        }
+    }
+    return null;
+}
+
 fn tupleKeyCompare(a: *Tuple, b: *Tuple) i32 {
     const col_a = tupleColumn(a, 0) orelse return 0;
     const col_b = tupleColumn(b, 0) orelse return 0;
     return columnCompare(col_a, col_b);
+}
+
+fn tupleCompareByIndexFirstTuple(key: *Tuple, row: *Tuple) i32 {
+    const col_key = tupleColumn(key, 0) orelse return 0;
+    const col_row = tupleColumn(row, 0) orelse return 0;
+    return columnCompare(col_key, col_row);
 }
 
 fn tupleCheckNotNull(tuple: *Tuple) bool {
@@ -1996,8 +2161,16 @@ fn encodeTupleToRecBytes(tuple: *Tuple, allocator: std.mem.Allocator) ?RecBytes 
     return .{ .buf = buf, .offset = sizes.header };
 }
 
-fn assignRecBytes(rec: *page.rec_t, tuple: *Tuple) bool {
-    const new_bytes = encodeTupleToRecBytes(tuple, std.heap.page_allocator) orelse return false;
+fn assignRecBytesForIndex(table: *const CatalogTable, index: *const CatalogIndex, rec: *page.rec_t, row: *Tuple) bool {
+    var record_tuple: ?*Tuple = null;
+    defer if (record_tuple) |tuple| tupleDestroy(tuple);
+
+    const tuple_ptr = if (index.clustered) row else blk: {
+        record_tuple = indexRecordTupleFromRow(table, index, row);
+        break :blk record_tuple orelse return false;
+    };
+
+    const new_bytes = encodeTupleToRecBytes(tuple_ptr, std.heap.page_allocator) orelse return false;
     if (rec.rec_bytes) |old| {
         std.heap.page_allocator.free(old);
     }
@@ -2070,6 +2243,30 @@ fn cursorActiveIndex(cursor: *Cursor) ?*CatalogIndex {
         return catalogFindIndexByName(table, name);
     }
     return catalogClusteredIndex(table);
+}
+
+fn clusteredRecFromSecondary(table: *CatalogTable, index: *const CatalogIndex, rec: *page.rec_t) ?*page.rec_t {
+    if (index.clustered) {
+        return rec;
+    }
+    const clustered = catalogClusteredIndex(table) orelse return null;
+    if (clustered.columns.items.len == 0) {
+        return null;
+    }
+    const allocator = std.heap.page_allocator;
+    const order = indexRecordColumnOrder(table, index, allocator) orelse return null;
+    defer allocator.free(order);
+    const scratch = tupleCreateFromColumnOrder(table, order, .TPL_ROW) orelse return null;
+    defer tupleDestroy(scratch);
+    if (!decodeRecToTuple(rec, scratch)) {
+        return null;
+    }
+    const first_col = clustered.columns.items[0];
+    const col_idx = catalogFindColumnIndex(table, first_col.name) orelse return null;
+    const pos = findColumnPosInOrder(order, col_idx) orelse return null;
+    const col = &scratch.cols[pos];
+    const key_val = columnKeyValue(col, first_col.prefix_len);
+    return btr.btr_find_rec_by_key(clustered.btr_index, key_val);
 }
 
 fn bytesPrefixKey(bytes: []const u8, prefix_len: ib_ulint_t) i64 {
@@ -2167,15 +2364,25 @@ fn btrIndexLastRec(index: *const CatalogIndex) ?*page.rec_t {
 }
 
 fn btrFindRecForTuple(table: *CatalogTable, index: *const CatalogIndex, tuple: *Tuple) ?*page.rec_t {
-    const scratch = tupleCreateFromCatalogColumns(table, .TPL_ROW) orelse return null;
+    const allocator = std.heap.page_allocator;
+    const order = indexRecordColumnOrder(table, index, allocator) orelse return null;
+    defer allocator.free(order);
+    const scratch = tupleCreateFromColumnOrder(table, order, .TPL_ROW) orelse return null;
     defer tupleDestroy(scratch);
+    var target_owned: ?*Tuple = null;
+    defer if (target_owned) |owned| tupleDestroy(owned);
+
+    const target = if (index.clustered) tuple else blk: {
+        target_owned = indexRecordTupleFromRow(table, index, tuple);
+        break :blk target_owned orelse return null;
+    };
     var rec_opt = btrIndexFirstRec(index);
     while (rec_opt) |rec| {
         if (!decodeRecToTuple(rec, scratch)) {
             rec_opt = btr.btr_get_next_user_rec(rec, null);
             continue;
         }
-        if (tupleEqual(scratch, tuple)) {
+        if (tupleEqual(scratch, target)) {
             return rec;
         }
         rec_opt = btr.btr_get_next_user_rec(rec, null);
@@ -2184,7 +2391,17 @@ fn btrFindRecForTuple(table: *CatalogTable, index: *const CatalogIndex, tuple: *
 }
 
 fn btrIndexHasDuplicateKey(table: *const CatalogTable, index: *const CatalogIndex, tuple: *Tuple, ignore: ?*Tuple) bool {
-    const scratch = tupleCreateFromCatalogColumns(@constCast(table), .TPL_ROW) orelse return false;
+    const key_tuple = indexKeyTupleFromRow(table, index, tuple) orelse return false;
+    defer tupleDestroy(key_tuple);
+    var ignore_tuple: ?*Tuple = null;
+    defer if (ignore_tuple) |owned| tupleDestroy(owned);
+    if (ignore) |row| {
+        ignore_tuple = indexKeyTupleFromRow(table, index, row);
+        if (ignore_tuple == null) {
+            return false;
+        }
+    }
+    const scratch = tupleCreateFromCatalogIndex(@constCast(table), @constCast(index), .TPL_ROW) orelse return false;
     defer tupleDestroy(scratch);
     var rec_opt = btrIndexFirstRec(index);
     while (rec_opt) |rec| {
@@ -2192,11 +2409,11 @@ fn btrIndexHasDuplicateKey(table: *const CatalogTable, index: *const CatalogInde
             rec_opt = btr.btr_get_next_user_rec(rec, null);
             continue;
         }
-        if (ignore != null and tupleEqual(scratch, ignore.?)) {
+        if (ignore_tuple != null and indexKeyEqualByIndex(index, scratch, ignore_tuple.?)) {
             rec_opt = btr.btr_get_next_user_rec(rec, null);
             continue;
         }
-        if (indexKeyEqual(table, index, scratch, tuple)) {
+        if (indexKeyEqualByIndex(index, scratch, key_tuple)) {
             return true;
         }
         rec_opt = btr.btr_get_next_user_rec(rec, null);
@@ -2222,7 +2439,13 @@ fn btrInsertTupleIntoIndex(table: *const CatalogTable, index: *CatalogIndex, tup
     var field: data_mod.dfield_t = .{};
     var dtuple: data_mod.dtuple_t = .{};
     const entry = btrTupleForKey(&key_storage, &dtuple, &field);
-    const rec_bytes = encodeTupleToRecBytes(tuple, std.heap.page_allocator) orelse return null;
+    var record_tuple: ?*Tuple = null;
+    defer if (record_tuple) |owned| tupleDestroy(owned);
+    const tuple_ptr = if (index.clustered) tuple else blk: {
+        record_tuple = indexRecordTupleFromRow(table, index, tuple);
+        break :blk record_tuple orelse return null;
+    };
+    const rec_bytes = encodeTupleToRecBytes(tuple_ptr, std.heap.page_allocator) orelse return null;
     var bytes_assigned = false;
     defer {
         if (!bytes_assigned) {
@@ -3128,6 +3351,7 @@ pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl
     }
     const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
     const current_rec = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    const active_index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
     if (cursor.lock_mode != .IB_LOCK_NONE) {
         if (cursorInnerTrx(cursor)) |inner| {
             if (tableLockModeToInternal(cursor.lock_mode)) |mode| {
@@ -3143,9 +3367,13 @@ pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl
             }
         }
     }
+    var row_rec = current_rec;
+    if (!active_index.clustered) {
+        row_rec = clusteredRecFromSecondary(table, active_index, current_rec) orelse return .DB_RECORD_NOT_FOUND;
+    }
     const row = tupleCreateFromCatalogColumns(table, .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
     defer tupleDestroy(row);
-    if (!decodeRecToTuple(current_rec, row)) {
+    if (!decodeRecToTuple(row_rec, row)) {
         return .DB_RECORD_NOT_FOUND;
     }
 
@@ -3172,7 +3400,7 @@ pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl
     for (table.indexes.items, 0..) |*idx, i| {
         if (!key_changed[i]) {
             if (btrFindRecForTuple(table, idx, row)) |same_rec| {
-                if (!assignRecBytes(same_rec, new_tuple)) {
+                if (!assignRecBytesForIndex(table, idx, same_rec, new_tuple)) {
                     return .DB_OUT_OF_MEMORY;
                 }
                 if (active != null and active.? == idx) {
@@ -3215,9 +3443,14 @@ pub fn ib_cursor_delete_row(ib_crsr: ib_crsr_t) ib_err_t {
             }
         }
     }
+    const active_index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
+    var row_rec = rec;
+    if (!active_index.clustered) {
+        row_rec = clusteredRecFromSecondary(table, active_index, rec) orelse return .DB_RECORD_NOT_FOUND;
+    }
     const row = tupleCreateFromCatalogColumns(table, .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
     defer tupleDestroy(row);
-    if (!decodeRecToTuple(rec, row)) {
+    if (!decodeRecToTuple(row_rec, row)) {
         return .DB_RECORD_NOT_FOUND;
     }
 
@@ -3320,9 +3553,8 @@ pub fn ib_cursor_moveto(
     if (tuple.tuple_type != .TPL_KEY) {
         return .DB_DATA_MISMATCH;
     }
-    const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
     const index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
-    const scratch = tupleCreateFromCatalogColumns(@constCast(table), .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
+    const scratch = tupleCreateFromCatalogIndex(cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND, index, .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
     defer tupleDestroy(scratch);
 
     var candidate: ?*page.rec_t = null;
@@ -3332,7 +3564,7 @@ pub fn ib_cursor_moveto(
             rec_opt = btr.btr_get_next_user_rec(rec, null);
             continue;
         }
-        const cmp = tupleCompareByIndexFirst(table, index, tuple, scratch);
+        const cmp = tupleCompareByIndexFirstTuple(tuple, scratch);
         switch (ib_srch_mode) {
             .IB_CUR_GE => {
                 if (cmp <= 0) {
@@ -3371,7 +3603,7 @@ pub fn ib_cursor_moveto(
     if (!decodeRecToTuple(chosen, scratch)) {
         return .DB_RECORD_NOT_FOUND;
     }
-    result.* = tupleCompareByIndexFirst(table, index, tuple, scratch);
+    result.* = tupleCompareByIndexFirstTuple(tuple, scratch);
     return .DB_SUCCESS;
 }
 
@@ -5110,6 +5342,83 @@ test "cursor moveto positions and read row" {
     var out: ib_i32_t = 0;
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_read_i32(row_tpl, 0, &out));
     try std.testing.expectEqual(@as(ib_i32_t, 42), out);
+}
+
+test "secondary index read uses indexed column" {
+    var tbl_sch: ib_tbl_sch_t = null;
+    var idx_sch: ib_idx_sch_t = null;
+    var sec_sch: ib_idx_sch_t = null;
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_schema_create("db/sec1", &tbl_sch, .IB_TBL_COMPACT, 0));
+    defer ib_table_schema_delete(tbl_sch);
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "id", .IB_INT, .IB_COL_NONE, 0, @sizeOf(ib_i32_t)),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_table_schema_add_col(tbl_sch, "name", .IB_VARCHAR, .IB_COL_NONE, 0, 10),
+    );
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_schema_add_index(tbl_sch, "PRIMARY", &idx_sch));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(idx_sch, "id", 0));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_set_clustered(idx_sch));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_schema_add_index(tbl_sch, "idx_name", &sec_sch));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_index_schema_add_col(sec_sch, "name", 0));
+
+    const trx = ib_trx_begin(.IB_TRX_REPEATABLE_READ) orelse return error.OutOfMemory;
+    errdefer _ = ib_trx_rollback(trx);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_schema_lock_exclusive(trx));
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_create(trx, tbl_sch, &table_id));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_trx_commit(trx));
+    defer dropTestTable("db/sec1") catch {};
+
+    var table_crsr: ib_crsr_t = null;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_open_table("db/sec1", null, &table_crsr));
+    defer _ = ib_cursor_close(table_crsr);
+
+    const metas = [_]ib_col_meta_t{
+        .{
+            .type = .IB_INT,
+            .attr = .IB_COL_NONE,
+            .type_len = @intCast(@sizeOf(ib_i32_t)),
+            .client_type = 0,
+            .charset = null,
+        },
+        .{
+            .type = .IB_VARCHAR,
+            .attr = .IB_COL_NONE,
+            .type_len = 0,
+            .client_type = 0,
+            .charset = null,
+        },
+    };
+    const insert_tpl = try tupleCreate(std.heap.page_allocator, .TPL_ROW, &metas);
+    defer ib_tuple_delete(insert_tpl);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_tuple_write_i32(insert_tpl, 0, 1));
+    const name = "bob";
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_col_set_value(insert_tpl, 1, name.ptr, name.len));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_insert_row(table_crsr, insert_tpl));
+
+    var idx_crsr: ib_crsr_t = null;
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        ib_cursor_open_index_using_name(table_crsr, "idx_name", &idx_crsr),
+    );
+    defer _ = ib_cursor_close(idx_crsr);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_first(idx_crsr));
+    const sec_row = ib_sec_read_tuple_create(idx_crsr) orelse return error.OutOfMemory;
+    defer ib_tuple_delete(sec_row);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_read_row(idx_crsr, sec_row));
+
+    const out_len = ib_col_get_len(sec_row, 0);
+    const out_ptr = ib_col_get_value(sec_row, 0) orelse return error.TestUnexpectedResult;
+    const out = @as([*]const u8, @ptrCast(out_ptr))[0..@intCast(out_len)];
+    try std.testing.expect(std.mem.eql(u8, out, name));
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_cursor_delete_row(idx_crsr));
+    try std.testing.expectEqual(errors.DbErr.DB_RECORD_NOT_FOUND, ib_cursor_first(table_crsr));
 }
 
 test "cursor open index variants" {
