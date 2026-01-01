@@ -10,7 +10,8 @@ pub fn srv_shutdown(srv: *core.SrvCore) void {
 }
 
 test "srv startup/shutdown" {
-    var srv = core.SrvCore{};
+    var srv = core.SrvCore.init(std.testing.allocator);
+    defer srv.deinit();
     srv_startup(&srv);
     try std.testing.expect(srv.state == .running);
     srv_shutdown(&srv);
