@@ -923,7 +923,7 @@ pub fn buf_LRU_validate() ibool {
 
 pub fn buf_LRU_print() void {}
 
-pub fn buf_read_page(space: ulint, zip_size: ulint, offset: ulint) ibool {
+fn buf_read_page_low(space: ulint, zip_size: ulint, offset: ulint, do_read_ahead: ibool) ibool {
     const pool = buf_pool_init() orelse return compat.FALSE;
     pool.read_requests += 1;
     const key = BufPageKey{ .space = space, .page_no = offset };
@@ -955,7 +955,14 @@ pub fn buf_read_page(space: ulint, zip_size: ulint, offset: ulint) ibool {
     _ = log_mod.recv_apply_log_recs(space, offset, block.frame.ptr);
     pool.pages_read += 1;
     buf_pool_touch_page(pool, &block.page, compat.FALSE);
+    if (do_read_ahead == compat.TRUE) {
+        _ = buf_read_ahead_linear(space, zip_size, offset);
+    }
     return compat.TRUE;
+}
+
+pub fn buf_read_page(space: ulint, zip_size: ulint, offset: ulint) ibool {
+    return buf_read_page_low(space, zip_size, offset, compat.TRUE);
 }
 
 pub fn buf_read_ahead_linear(space: ulint, zip_size: ulint, offset: ulint) ulint {
@@ -967,7 +974,7 @@ pub fn buf_read_ahead_linear(space: ulint, zip_size: ulint, offset: ulint) ulint
         return 0;
     }
     const next_page = offset + 1;
-    if (buf_read_page(space, zip_size, next_page) == compat.TRUE) {
+    if (buf_read_page_low(space, zip_size, next_page, compat.FALSE) == compat.TRUE) {
         return 1;
     }
     return 0;
@@ -1116,6 +1123,28 @@ test "buf LRU helpers" {
 test "buf read stubs" {
     try std.testing.expectEqual(compat.FALSE, buf_read_page(0, 0, 0));
     try std.testing.expectEqual(@as(ulint, 0), buf_read_ahead_linear(0, 0, 0));
+}
+
+test "buf read integrates read-ahead" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const prev_dir = fil.fil_path_to_client_datadir;
+    fil.fil_path_to_client_datadir = base;
+    defer fil.fil_path_to_client_datadir = prev_dir;
+
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+    defer buf_mem_free();
+
+    var space_id: ulint = 0;
+    const create_err = fil.fil_create_new_single_table_tablespace(&space_id, "ra_test", compat.FALSE, 0, 4);
+    try std.testing.expectEqual(fil.DB_SUCCESS, create_err);
+
+    try std.testing.expectEqual(compat.TRUE, buf_read_page(space_id, 0, 0));
+    try std.testing.expect(buf_page_get_zip(space_id, 0, 1) != null);
 }
 
 test "buf flush list tracks dirty pages" {
