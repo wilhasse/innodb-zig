@@ -7,6 +7,7 @@ const data_mod = @import("../data/mod.zig");
 const dict = @import("../dict/mod.zig");
 const errors = @import("../ut/errors.zig");
 const fil = @import("../fil/mod.zig");
+const fil_sys = @import("../fil/sys.zig");
 const fsp = @import("../fsp/mod.zig");
 const rec_mod = @import("../rec/mod.zig");
 const log = @import("../ut/log.zig");
@@ -943,6 +944,11 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     buf_mod.buf_var_init();
     _ = buf_mod.buf_pool_init();
     fsp.fsp_init();
+    const data_home_dir = if (cfgFind("data_home_dir")) |cfg_var| cfg_var.value.IB_CFG_TEXT else "./";
+    const data_file_path = if (cfgFind("data_file_path")) |cfg_var| cfg_var.value.IB_CFG_TEXT else "ibdata1:32M:autoextend";
+    if (fil_sys.openOrCreateSystemTablespace(data_home_dir, data_file_path) == compat.FALSE) {
+        return .DB_ERROR;
+    }
     trx_sys.trx_sys_var_init();
     lock_mod.lock_var_init();
     _ = trx_sys.trx_sys_init_at_db_start(std.heap.page_allocator);
