@@ -194,6 +194,23 @@ fn lock_rec_key_from(index: *dict.dict_index_t, rec: *page.rec_t) ?LockRecKey {
     };
 }
 
+fn lock_rec_is_gap_only(type_mode: ulint) bool {
+    const gap_flags = type_mode & (LOCK_GAP | LOCK_INSERT_INTENTION);
+    return gap_flags != 0 and (type_mode & LOCK_REC_NOT_GAP) == 0;
+}
+
+fn lock_rec_conflicts(existing: *const lock_t, new_type_mode: ulint) bool {
+    const new_mode = new_type_mode & LOCK_MODE_MASK;
+    const existing_mode = lock_get_mode(existing);
+    if (lock_mode_compatible(existing_mode, new_mode) == compat.TRUE) {
+        return false;
+    }
+    if (lock_rec_is_gap_only(existing.type_mode) and lock_rec_is_gap_only(new_type_mode)) {
+        return false;
+    }
+    return true;
+}
+
 pub fn lock_var_init() void {
     if (lock_sys != null) {
         return;
@@ -449,13 +466,13 @@ fn lock_rec_other_has_incompatible(
     sys: *lock_sys_t,
     trx: *trx_types.trx_t,
     key: LockRecKey,
-    mode: ulint,
+    type_mode: ulint,
     include_wait: bool,
 ) ?*lock_t {
     const queue = sys.rec_hash.getPtr(key) orelse return null;
     var current = queue.tail;
     while (current) |lock| {
-        if (lock.trx != trx and lock_mode_compatible(lock_get_mode(lock), mode) == compat.FALSE) {
+        if (lock.trx != trx and lock_rec_conflicts(lock, type_mode)) {
             if (include_wait or lock_is_wait(lock) == compat.FALSE) {
                 return lock;
             }
@@ -561,20 +578,31 @@ fn lock_wait_suspend_thread(sys: *lock_sys_t, wait_lock: *lock_t, timeout_ns: u6
     }
 }
 
-pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t, mode: ulint) errors.DbErr {
+pub fn lock_rec_with_flags(
+    trx: *trx_types.trx_t,
+    index: *dict.dict_index_t,
+    rec: *page.rec_t,
+    mode: ulint,
+    flags: ulint,
+) errors.DbErr {
     if (mode >= LOCK_NUM) {
+        return .DB_ERROR;
+    }
+    const allowed = LOCK_GAP | LOCK_REC_NOT_GAP | LOCK_INSERT_INTENTION;
+    if ((flags & ~allowed) != 0) {
         return .DB_ERROR;
     }
     const key = lock_rec_key_from(index, rec) orelse return .DB_ERROR;
     lock_sys_create(0);
     const sys = lock_sys orelse return .DB_ERROR;
+    const type_mode = mode | flags;
 
     if (lock_rec_has(sys, trx, key, mode)) {
         return .DB_SUCCESS;
     }
 
-    if (lock_rec_other_has_incompatible(sys, trx, key, mode, true)) |conflict| {
-        const lock = lock_rec_create(sys, trx, index, rec, mode | LOCK_WAIT) orelse return .DB_OUT_OF_MEMORY;
+    if (lock_rec_other_has_incompatible(sys, trx, key, type_mode, true)) |conflict| {
+        const lock = lock_rec_create(sys, trx, index, rec, type_mode | LOCK_WAIT) orelse return .DB_OUT_OF_MEMORY;
         lock.wait_for = conflict;
         if (conflict.trx) |blocking| {
             lock_waits_for_set(sys, trx, blocking);
@@ -586,8 +614,30 @@ pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec
         return .DB_LOCK_WAIT;
     }
 
-    _ = lock_rec_create(sys, trx, index, rec, mode) orelse return .DB_OUT_OF_MEMORY;
+    _ = lock_rec_create(sys, trx, index, rec, type_mode) orelse return .DB_OUT_OF_MEMORY;
     return .DB_SUCCESS;
+}
+
+pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t, mode: ulint) errors.DbErr {
+    return lock_rec_with_flags(trx, index, rec, mode, LOCK_ORDINARY);
+}
+
+pub fn lock_rec_wait_with_flags(
+    trx: *trx_types.trx_t,
+    index: *dict.dict_index_t,
+    rec: *page.rec_t,
+    mode: ulint,
+    flags: ulint,
+    timeout_ns: u64,
+) errors.DbErr {
+    const err = lock_rec_with_flags(trx, index, rec, mode, flags);
+    if (err != .DB_LOCK_WAIT) {
+        return err;
+    }
+    const sys = lock_sys orelse return .DB_ERROR;
+    const key = lock_rec_key_from(index, rec) orelse return .DB_ERROR;
+    const wait_lock = lock_rec_find_wait_lock(sys, trx, key) orelse return .DB_ERROR;
+    return lock_wait_suspend_thread(sys, wait_lock, timeout_ns);
 }
 
 pub fn lock_rec_wait(
@@ -597,14 +647,7 @@ pub fn lock_rec_wait(
     mode: ulint,
     timeout_ns: u64,
 ) errors.DbErr {
-    const err = lock_rec(trx, index, rec, mode);
-    if (err != .DB_LOCK_WAIT) {
-        return err;
-    }
-    const sys = lock_sys orelse return .DB_ERROR;
-    const key = lock_rec_key_from(index, rec) orelse return .DB_ERROR;
-    const wait_lock = lock_rec_find_wait_lock(sys, trx, key) orelse return .DB_ERROR;
-    return lock_wait_suspend_thread(sys, wait_lock, timeout_ns);
+    return lock_rec_wait_with_flags(trx, index, rec, mode, LOCK_ORDINARY, timeout_ns);
 }
 
 pub fn lock_rec_release(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t) void {
@@ -831,6 +874,51 @@ test "record lock request and release" {
 
     const sys = lock_sys orelse return error.OutOfMemory;
     try std.testing.expect(sys.rec_hash.count() == 0);
+    lock_sys_close();
+}
+
+test "gap and insert intention locks are compatible" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+    var index = dict.dict_index_t{ .space = 7 };
+    var page_obj = page.page_t{ .page_no = 12 };
+    var rec = page.rec_t{ .page = &page_obj, .rec_page_offset = 64 };
+
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        lock_rec_with_flags(&trx1, &index, &rec, LOCK_X, LOCK_GAP),
+    );
+    try std.testing.expectEqual(
+        errors.DbErr.DB_SUCCESS,
+        lock_rec_with_flags(&trx2, &index, &rec, LOCK_X, LOCK_INSERT_INTENTION),
+    );
+
+    lock_rec_release(&trx1, &index, &rec);
+    lock_rec_release(&trx2, &index, &rec);
+    lock_sys_close();
+}
+
+test "next-key locks block insert intention on same record" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+    var index = dict.dict_index_t{ .space = 8 };
+    var page_obj = page.page_t{ .page_no = 15 };
+    var rec = page.rec_t{ .page = &page_obj, .rec_page_offset = 80 };
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_rec(&trx1, &index, &rec, LOCK_X));
+    try std.testing.expectEqual(
+        errors.DbErr.DB_LOCK_WAIT,
+        lock_rec_with_flags(&trx2, &index, &rec, LOCK_X, LOCK_INSERT_INTENTION),
+    );
+
+    lock_rec_release(&trx1, &index, &rec);
+    lock_rec_release(&trx2, &index, &rec);
     lock_sys_close();
 }
 
