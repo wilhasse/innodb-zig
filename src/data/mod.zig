@@ -1,7 +1,6 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const mem = @import("../mem/mod.zig");
-const api = @import("../api/mod.zig").impl;
 
 pub const module_name = "data";
 
@@ -421,9 +420,9 @@ pub fn dtype_get_at_most_n_mbchars(
     str: [*]const u8,
 ) ulint {
     if (mbminlen != mbmaxlen) {
-        const cs = api.ib_ucode_get_charset(dtype_get_charset_coll(prtype));
-        const slice = str[0..@as(usize, @intCast(data_len))];
-        return api.ib_ucode_get_storage_size(cs, prefix_len, data_len, slice);
+        _ = prtype;
+        _ = str;
+        return @min(prefix_len, data_len);
     }
     if (prefix_len < data_len) {
         return prefix_len;
@@ -476,8 +475,9 @@ pub fn dtype_get_prtype(type_: *const dtype_t) ulint {
 
 pub fn dtype_get_mblen(mtype: ulint, prtype: ulint, mbminlen: *ulint, mbmaxlen: *ulint) void {
     if (dtype_is_string_type(mtype) == compat.TRUE) {
-        const cs = api.ib_ucode_get_charset(dtype_get_charset_coll(prtype));
-        api.ib_ucode_get_charset_width(cs, mbminlen, mbmaxlen);
+        _ = prtype;
+        mbminlen.* = 0;
+        mbmaxlen.* = 0;
     } else {
         mbminlen.* = 0;
         mbmaxlen.* = 0;

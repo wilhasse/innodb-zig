@@ -1346,6 +1346,40 @@ pub fn ib_cfg_shutdown() ib_err_t {
 fn srv_export_innodb_status() void {
     export_vars.innodb_page_size = compat.UNIV_PAGE_SIZE;
     export_vars.innodb_have_atomic_builtins = compat.IB_TRUE;
+    if (buf_mod.buf_pool) |pool| {
+        export_vars.innodb_buffer_pool_pages_total = pool.curr_size;
+        export_vars.innodb_buffer_pool_pages_data = pool.curr_size;
+        export_vars.innodb_buffer_pool_pages_dirty = pool.dirty_pages;
+        export_vars.innodb_buffer_pool_pages_free = pool.free_list_len;
+        export_vars.innodb_buffer_pool_read_requests = pool.read_requests;
+        export_vars.innodb_buffer_pool_reads = pool.pages_read;
+        export_vars.innodb_buffer_pool_pages_flushed = pool.pages_flushed;
+        export_vars.innodb_buffer_pool_write_requests = pool.write_requests;
+        export_vars.innodb_pages_created = pool.pages_created;
+        export_vars.innodb_pages_read = pool.pages_read;
+        export_vars.innodb_pages_written = pool.pages_flushed;
+
+        export_vars.innodb_data_reads = pool.pages_read;
+        export_vars.innodb_data_writes = pool.pages_flushed;
+        export_vars.innodb_data_read = pool.pages_read * compat.UNIV_PAGE_SIZE;
+        export_vars.innodb_data_written = pool.pages_flushed * compat.UNIV_PAGE_SIZE;
+    } else {
+        export_vars.innodb_buffer_pool_pages_total = 0;
+        export_vars.innodb_buffer_pool_pages_data = 0;
+        export_vars.innodb_buffer_pool_pages_dirty = 0;
+        export_vars.innodb_buffer_pool_pages_free = 0;
+        export_vars.innodb_buffer_pool_read_requests = 0;
+        export_vars.innodb_buffer_pool_reads = 0;
+        export_vars.innodb_buffer_pool_pages_flushed = 0;
+        export_vars.innodb_buffer_pool_write_requests = 0;
+        export_vars.innodb_pages_created = 0;
+        export_vars.innodb_pages_read = 0;
+        export_vars.innodb_pages_written = 0;
+        export_vars.innodb_data_reads = 0;
+        export_vars.innodb_data_writes = 0;
+        export_vars.innodb_data_read = 0;
+        export_vars.innodb_data_written = 0;
+    }
 }
 
 fn statusLookup(name: []const u8) ?*const StatusVar {
@@ -1421,6 +1455,21 @@ pub fn ib_handle_errors(
     return compat.IB_FALSE;
 }
 
+fn updateRowLockWaitStats(elapsed_ns: u64) void {
+    if (elapsed_ns == 0) {
+        return;
+    }
+    const wait_secs: ib_ulint_t = @intCast((elapsed_ns + std.time.ns_per_s - 1) / std.time.ns_per_s);
+    export_vars.innodb_row_lock_time += @as(ib_i64_t, @intCast(wait_secs));
+    if (wait_secs > export_vars.innodb_row_lock_time_max) {
+        export_vars.innodb_row_lock_time_max = wait_secs;
+    }
+    if (export_vars.innodb_row_lock_waits != 0) {
+        const total = @as(u64, @intCast(export_vars.innodb_row_lock_time));
+        export_vars.innodb_row_lock_time_avg = @as(ib_ulint_t, @intCast(total / export_vars.innodb_row_lock_waits));
+    }
+}
+
 pub fn ib_trx_lock_table_with_retry(ib_trx: ib_trx_t, table: *CatalogTable, mode: ib_lck_mode_t) ib_err_t {
     const trx = ib_trx orelse return .DB_ERROR;
     const inner = trx.inner_trx orelse return .DB_ERROR;
@@ -1428,7 +1477,60 @@ pub fn ib_trx_lock_table_with_retry(ib_trx: ib_trx_t, table: *CatalogTable, mode
     if (table.id == 0) {
         return .DB_TABLE_NOT_FOUND;
     }
-    return lock_mod.lock_table(inner, table.id, internal);
+    var timeout_secs: ib_ulint_t = 60;
+    if (ib_cfg_get("lock_wait_timeout", &timeout_secs) != .DB_SUCCESS) {
+        timeout_secs = 60;
+    }
+    const timeout_ns: u64 = @as(u64, @intCast(timeout_secs)) * std.time.ns_per_s;
+    var wait_started = false;
+    var wait_start_ns: u64 = 0;
+    var backoff_us: u64 = 1_000;
+
+    while (true) {
+        const err = lock_mod.lock_table(inner, table.id, internal);
+        switch (err) {
+            .DB_SUCCESS => {
+                if (wait_started) {
+                    const elapsed = @as(u64, @intCast(std.time.nanoTimestamp())) - wait_start_ns;
+                    updateRowLockWaitStats(elapsed);
+                    if (export_vars.innodb_row_lock_current_waits > 0) {
+                        export_vars.innodb_row_lock_current_waits -= 1;
+                    }
+                }
+                return err;
+            },
+            .DB_LOCK_WAIT => {
+                const now = @as(u64, @intCast(std.time.nanoTimestamp()));
+                if (!wait_started) {
+                    wait_started = true;
+                    wait_start_ns = now;
+                    export_vars.innodb_row_lock_waits += 1;
+                    export_vars.innodb_row_lock_current_waits += 1;
+                }
+                if (timeout_ns != 0 and now - wait_start_ns >= timeout_ns) {
+                    updateRowLockWaitStats(now - wait_start_ns);
+                    if (export_vars.innodb_row_lock_current_waits > 0) {
+                        export_vars.innodb_row_lock_current_waits -= 1;
+                    }
+                    return .DB_LOCK_WAIT_TIMEOUT;
+                }
+                os_thread.sleepMicros(backoff_us);
+                if (backoff_us < 100_000) {
+                    backoff_us *= 2;
+                }
+            },
+            else => {
+                if (wait_started) {
+                    const elapsed = @as(u64, @intCast(std.time.nanoTimestamp())) - wait_start_ns;
+                    updateRowLockWaitStats(elapsed);
+                    if (export_vars.innodb_row_lock_current_waits > 0) {
+                        export_vars.innodb_row_lock_current_waits -= 1;
+                    }
+                }
+                return err;
+            },
+        }
+    }
 }
 
 pub fn ib_update_statistics_if_needed(table: *CatalogTable) void {

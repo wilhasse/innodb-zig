@@ -196,7 +196,9 @@ pub const ind_node_t = struct {
 };
 pub const btr_pcur_t = struct {};
 pub const mtr_t = struct {};
-pub const rec_t = struct {};
+pub const rec_t = struct {
+    index_id: dulint = .{ .high = 0, .low = 0 },
+};
 pub const trx_t = struct {};
 
 pub const TABLE_BUILD_TABLE_DEF: ulint = 1;
@@ -705,40 +707,103 @@ pub fn tab_create_graph_create(table: *dict_table_t, heap: *mem_heap_t, commit: 
 
 pub fn ind_create_graph_create(index: *dict_index_t, heap: *mem_heap_t, commit: ibool) ?*ind_node_t {
     const node = std.heap.page_allocator.create(ind_node_t) catch return null;
-    node.* = .{ .index = index, .state = INDEX_BUILD_INDEX_DEF, .heap = heap };
+    node.* = .{ .index = index, .state = INDEX_BUILD_INDEX_DEF, .table = index.table, .heap = heap };
     _ = commit;
     return node;
 }
 
+fn dict_index_in_table(table: *dict_table_t, index: *dict_index_t) bool {
+    for (table.indexes.items) |item| {
+        if (item == index) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn dict_create_table_step(thr: *que_thr_t) ?*que_thr_t {
+    const node_ptr = thr.node orelse return thr;
+    const node = @as(*tab_node_t, @ptrCast(@alignCast(node_ptr)));
+    switch (node.state) {
+        TABLE_BUILD_TABLE_DEF => node.state = TABLE_BUILD_COL_DEF,
+        TABLE_BUILD_COL_DEF => node.state = TABLE_COMMIT_WORK,
+        TABLE_COMMIT_WORK => node.state = TABLE_ADD_TO_CACHE,
+        TABLE_ADD_TO_CACHE => {
+            if (node.table) |table| {
+                if (!table.cached) {
+                    var heap = mem_heap_t{};
+                    dict_table_add_to_cache(table, node.heap orelse &heap);
+                }
+            }
+            node.state = TABLE_COMPLETED;
+        },
+        TABLE_COMPLETED => {},
+        else => {},
+    }
     return thr;
 }
 
 pub fn dict_create_index_step(thr: *que_thr_t) ?*que_thr_t {
+    const node_ptr = thr.node orelse return thr;
+    const node = @as(*ind_node_t, @ptrCast(@alignCast(node_ptr)));
+    const index = node.index orelse return thr;
+    switch (node.state) {
+        INDEX_BUILD_INDEX_DEF => node.state = INDEX_BUILD_FIELD_DEF,
+        INDEX_BUILD_FIELD_DEF => node.state = INDEX_CREATE_INDEX_TREE,
+        INDEX_CREATE_INDEX_TREE => {
+            if (index.page == 0) {
+                index.page = 1;
+            }
+            index.root_level = 0;
+            node.state = INDEX_COMMIT_WORK;
+        },
+        INDEX_COMMIT_WORK => node.state = INDEX_ADD_TO_CACHE,
+        INDEX_ADD_TO_CACHE => {
+            const table_opt = if (node.table) |tbl| tbl else if (index.table) |tbl| tbl else null;
+            if (table_opt) |tbl| {
+                if (!dict_index_in_table(tbl, index)) {
+                    _ = dict_index_add_to_cache(tbl, index, 0, compat.FALSE);
+                }
+            }
+        },
+        else => {},
+    }
     return thr;
 }
 
 pub fn dict_truncate_index_tree(table: *dict_table_t, space: ulint, pcur: *btr_pcur_t, mtr: *mtr_t) ulint {
-    _ = table;
-    _ = space;
     _ = pcur;
     _ = mtr;
-    return 0;
+    for (table.indexes.items) |index| {
+        if (index.space == space) {
+            index.page = 0;
+            index.root_level = 0;
+        }
+    }
+    return DB_SUCCESS_ULINT;
 }
 
 pub fn dict_drop_index_tree(rec: *rec_t, mtr: *mtr_t) void {
-    _ = rec;
     _ = mtr;
+    if (rec.index_id.high != 0 or rec.index_id.low != 0) {
+        dict_sys_index_remove(rec.index_id);
+    }
 }
 
 pub fn dict_create_or_check_foreign_constraint_tables() ulint {
+    if (!dict_sys.booted) {
+        dict_boot();
+    }
     return DB_SUCCESS_ULINT;
 }
 
 pub fn dict_create_add_foreigns_to_dictionary(start_id: ulint, table: *dict_table_t, trx: *trx_t) ulint {
     _ = start_id;
-    _ = table;
     _ = trx;
+    if (!table.cached) {
+        var heap = mem_heap_t{};
+        dict_table_add_to_cache(table, &heap);
+    }
     return DB_SUCCESS_ULINT;
 }
 
@@ -1603,25 +1668,67 @@ test "dict boot updates row id" {
     try std.testing.expect(dulintGetLow(dict_sys.row_id) > 0);
 }
 
-test "dict create graph stubs" {
-    var table = dict_table_t{ .name = "t1" };
-    var index = dict_index_t{ .name = "idx1" };
+test "dict create graph steps" {
+    dict_var_init();
+    dict_init();
+
+    var table = dict_table_t{ .name = "t1", .id = dulintCreate(0, 101) };
+    var index = dict_index_t{ .name = "idx1", .table = &table, .space = 1 };
     var heap = mem_heap_t{};
 
     const tab_node = tab_create_graph_create(&table, &heap, compat.TRUE) orelse return error.OutOfMemory;
     defer std.heap.page_allocator.destroy(tab_node);
-    try std.testing.expect(tab_node.table == &table);
-    try std.testing.expectEqual(@as(ulint, TABLE_BUILD_TABLE_DEF), tab_node.state);
+    var thr = que_thr_t{ .node = tab_node };
+    _ = dict_create_table_step(&thr);
+    try std.testing.expectEqual(@as(ulint, TABLE_BUILD_COL_DEF), tab_node.state);
+    _ = dict_create_table_step(&thr);
+    try std.testing.expectEqual(@as(ulint, TABLE_COMMIT_WORK), tab_node.state);
+    _ = dict_create_table_step(&thr);
+    _ = dict_create_table_step(&thr);
+    try std.testing.expectEqual(@as(ulint, TABLE_COMPLETED), tab_node.state);
+    try std.testing.expect(table.cached);
+    try std.testing.expect(dict_sys.tables_by_name.get("t1") == &table);
 
     const ind_node = ind_create_graph_create(&index, &heap, compat.FALSE) orelse return error.OutOfMemory;
     defer std.heap.page_allocator.destroy(ind_node);
-    try std.testing.expect(ind_node.index == &index);
-    try std.testing.expectEqual(@as(ulint, INDEX_BUILD_INDEX_DEF), ind_node.state);
+    var ind_thr = que_thr_t{ .node = ind_node };
+    _ = dict_create_index_step(&ind_thr);
+    try std.testing.expectEqual(@as(ulint, INDEX_BUILD_FIELD_DEF), ind_node.state);
+    _ = dict_create_index_step(&ind_thr);
+    try std.testing.expectEqual(@as(ulint, INDEX_CREATE_INDEX_TREE), ind_node.state);
+    _ = dict_create_index_step(&ind_thr);
+    try std.testing.expectEqual(@as(ulint, INDEX_COMMIT_WORK), ind_node.state);
+    _ = dict_create_index_step(&ind_thr);
+    try std.testing.expectEqual(@as(ulint, INDEX_ADD_TO_CACHE), ind_node.state);
+    _ = dict_create_index_step(&ind_thr);
+    try std.testing.expect(table.indexes.items.len == 1);
+    try std.testing.expect(table.indexes.items[0] == &index);
 
-    var thr = que_thr_t{};
-    try std.testing.expect(dict_create_table_step(&thr) == &thr);
-    try std.testing.expect(dict_create_index_step(&thr) == &thr);
     try std.testing.expectEqual(DB_SUCCESS_ULINT, dict_create_or_check_foreign_constraint_tables());
+}
+
+test "dict truncate and drop index tree" {
+    dict_var_init();
+    dict_init();
+
+    var table = dict_table_t{ .name = "t2", .id = dulintCreate(0, 201) };
+    var idx1 = dict_index_t{ .name = "idx_a", .space = 5, .page = 44, .root_level = 2 };
+    var idx2 = dict_index_t{ .name = "idx_b", .space = 6, .page = 55, .root_level = 1 };
+    table.indexes.append(std.heap.page_allocator, &idx1) catch return error.OutOfMemory;
+    table.indexes.append(std.heap.page_allocator, &idx2) catch return error.OutOfMemory;
+
+    var pcur = btr_pcur_t{};
+    var mtr = mtr_t{};
+    try std.testing.expectEqual(DB_SUCCESS_ULINT, dict_truncate_index_tree(&table, 5, &pcur, &mtr));
+    try std.testing.expectEqual(@as(ulint, 0), idx1.page);
+    try std.testing.expectEqual(@as(ulint, 0), idx1.root_level);
+    try std.testing.expectEqual(@as(ulint, 55), idx2.page);
+
+    _ = dict_sys_table_insert(table.name, table.id, table.space, 0, 0);
+    _ = dict_sys_index_insert(table.id, dulintCreate(0, 999), "idx_sys", 0, 5);
+    var rec = rec_t{ .index_id = dulintCreate(0, 999) };
+    dict_drop_index_tree(&rec, &mtr);
+    try std.testing.expect(dict_sys_index_find_by_name(table.name, "idx_sys") == null);
 }
 
 test "dict string helpers" {

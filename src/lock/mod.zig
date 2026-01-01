@@ -17,7 +17,6 @@ pub const lock_mode = enum(u8) {
     LOCK_X,
     LOCK_AUTO_INC,
     LOCK_NONE,
-    LOCK_NUM = LOCK_NONE,
 };
 
 pub const LOCK_IS: ulint = @intFromEnum(lock_mode.LOCK_IS);
@@ -26,7 +25,7 @@ pub const LOCK_S: ulint = @intFromEnum(lock_mode.LOCK_S);
 pub const LOCK_X: ulint = @intFromEnum(lock_mode.LOCK_X);
 pub const LOCK_AUTO_INC: ulint = @intFromEnum(lock_mode.LOCK_AUTO_INC);
 pub const LOCK_NONE: ulint = @intFromEnum(lock_mode.LOCK_NONE);
-pub const LOCK_NUM: ulint = @intFromEnum(lock_mode.LOCK_NUM);
+pub const LOCK_NUM: ulint = @intFromEnum(lock_mode.LOCK_NONE);
 
 pub const LOCK_MODE_MASK: ulint = 0x0F;
 pub const LOCK_TABLE: ulint = 16;
@@ -267,7 +266,7 @@ fn lock_trx_list_remove(sys: *lock_sys_t, trx: *trx_types.trx_t, lock: *lock_t) 
         var idx: usize = 0;
         while (idx < list.items.len) {
             if (list.items[idx] == lock) {
-                _ = list.orderedRemove(sys.allocator, idx);
+                _ = list.orderedRemove(idx);
                 break;
             }
             idx += 1;
