@@ -111,6 +111,7 @@ pub const buf_page_t = struct {
     lru_old: ibool = compat.FALSE,
     lru_counted: ibool = compat.FALSE,
     last_access: ib_uint64_t = 0,
+    pool: ?*buf_pool_t = null,
 };
 
 pub const buf_block_t = struct {
@@ -142,6 +143,8 @@ pub const mtr_t = struct {};
 pub const ib_stream_t = @import("../ut/log.zig").Stream;
 
 pub var buf_pool: ?*buf_pool_t = null;
+pub var buf_pool_instances: ulint = 0;
+var buf_pool_array: []buf_pool_t = &[_]buf_pool_t{};
 pub var buf_debug_prints: ibool = compat.FALSE;
 pub var srv_buf_pool_write_requests: ulint = 0;
 
@@ -272,26 +275,60 @@ pub fn buf_pool_init() ?*buf_pool_t {
     if (buf_pool != null) {
         return buf_pool;
     }
-    const pool = std.heap.page_allocator.create(buf_pool_t) catch return null;
-    pool.* = .{
-        .pages = std.AutoHashMap(BufPageKey, *buf_block_t).init(std.heap.page_allocator),
-    };
-    buf_pool = pool;
-    return pool;
+    return buf_pool_init_instances(1);
+}
+
+pub fn buf_pool_init_instances(count: ulint) ?*buf_pool_t {
+    if (buf_pool != null) {
+        return buf_pool;
+    }
+    const n = if (count == 0) 1 else count;
+    const pools = std.heap.page_allocator.alloc(buf_pool_t, @as(usize, @intCast(n))) catch return null;
+    for (pools) |*pool| {
+        pool.* = .{
+            .pages = std.AutoHashMap(BufPageKey, *buf_block_t).init(std.heap.page_allocator),
+        };
+    }
+    buf_pool_array = pools;
+    buf_pool_instances = n;
+    buf_pool = &pools[0];
+    return buf_pool;
+}
+
+fn buf_pool_get_for_page(space: ulint, page_no: ulint) ?*buf_pool_t {
+    _ = buf_pool_init();
+    if (buf_pool_array.len == 0) {
+        return buf_pool;
+    }
+    if (buf_pool_array.len == 1) {
+        return &buf_pool_array[0];
+    }
+    const idx = @as(usize, @intCast((space ^ page_no) % @as(ulint, @intCast(buf_pool_array.len))));
+    return &buf_pool_array[idx];
 }
 
 pub fn buf_close() void {}
 
 pub fn buf_mem_free() void {
-    if (buf_pool) |pool| {
-        buf_pool_clear_pages(pool);
-        pool.pages.deinit();
-        std.heap.page_allocator.destroy(pool);
-        buf_pool = null;
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            buf_pool_clear_pages(pool);
+            pool.pages.deinit();
+        }
+        std.heap.page_allocator.free(buf_pool_array);
+        buf_pool_array = &[_]buf_pool_t{};
     }
+    buf_pool = null;
+    buf_pool_instances = 0;
 }
 
 pub fn buf_pool_drop_hash_index() void {
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            buf_pool_clear_pages(pool);
+        }
+        return;
+    }
     if (buf_pool) |pool| {
         buf_pool_clear_pages(pool);
     }
@@ -304,11 +341,27 @@ pub fn buf_relocate(bpage: *buf_page_t, dpage: *buf_page_t) void {
 pub fn buf_pool_resize() void {}
 
 pub fn buf_pool_get_curr_size() ulint {
-    return if (buf_pool) |pool| pool.curr_size else 0;
+    if (buf_pool_array.len == 0) {
+        return if (buf_pool) |pool| pool.curr_size else 0;
+    }
+    var total: ulint = 0;
+    for (buf_pool_array) |pool| {
+        total += pool.curr_size;
+    }
+    return total;
 }
 
 pub fn buf_pool_get_oldest_modification() ib_uint64_t {
-    return if (buf_pool) |pool| pool.oldest_modification else 0;
+    if (buf_pool_array.len == 0) {
+        return if (buf_pool) |pool| pool.oldest_modification else 0;
+    }
+    var oldest: ib_uint64_t = 0;
+    for (buf_pool_array) |pool| {
+        if (pool.oldest_modification != 0 and (oldest == 0 or pool.oldest_modification < oldest)) {
+            oldest = pool.oldest_modification;
+        }
+    }
+    return oldest;
 }
 
 pub fn buf_block_alloc(zip_size: ulint) ?*buf_block_t {
@@ -339,16 +392,17 @@ pub fn buf_page_make_young(bpage: *buf_page_t) void {
 }
 
 pub fn buf_page_set_dirty(bpage: *buf_page_t) void {
-    if (buf_pool) |pool| {
+    const pool = if (bpage.pool) |p| p else buf_pool;
+    if (pool) |pool_ptr| {
         if (bpage.dirty == compat.FALSE) {
             bpage.dirty = compat.TRUE;
-            bpage.modification = pool.next_modification;
-            pool.next_modification += 1;
-            pool.dirty_pages += 1;
-            if (pool.oldest_modification == 0 or bpage.modification < pool.oldest_modification) {
-                pool.oldest_modification = bpage.modification;
+            bpage.modification = pool_ptr.next_modification;
+            pool_ptr.next_modification += 1;
+            pool_ptr.dirty_pages += 1;
+            if (pool_ptr.oldest_modification == 0 or bpage.modification < pool_ptr.oldest_modification) {
+                pool_ptr.oldest_modification = bpage.modification;
             }
-            buf_flush_list_add(pool, bpage);
+            buf_flush_list_add(pool_ptr, bpage);
         }
     }
 }
@@ -357,12 +411,13 @@ fn buf_page_clear_dirty(bpage: *buf_page_t) void {
     if (bpage.dirty == compat.TRUE) {
         bpage.dirty = compat.FALSE;
         bpage.modification = 0;
-        if (buf_pool) |pool| {
-            if (pool.dirty_pages > 0) {
-                pool.dirty_pages -= 1;
+        const pool = if (bpage.pool) |p| p else buf_pool;
+        if (pool) |pool_ptr| {
+            if (pool_ptr.dirty_pages > 0) {
+                pool_ptr.dirty_pages -= 1;
             }
-            buf_flush_list_remove(pool, bpage);
-            buf_pool_recompute_oldest(pool);
+            buf_flush_list_remove(pool_ptr, bpage);
+            buf_pool_recompute_oldest(pool_ptr);
         }
     }
 }
@@ -414,7 +469,7 @@ pub fn buf_page_reset_file_page_was_freed(space: ulint, offset: ulint) ?*buf_pag
 
 pub fn buf_page_get_zip(space: ulint, zip_size: ulint, offset: ulint) ?*buf_page_t {
     _ = zip_size;
-    if (buf_pool) |pool| {
+    if (buf_pool_get_for_page(space, offset)) |pool| {
         const key = BufPageKey{ .space = space, .page_no = offset };
         if (pool.pages.get(key)) |block| {
             return &block.page;
@@ -455,10 +510,13 @@ pub fn buf_page_get_gen(
     _ = file;
     _ = line;
     _ = mtr;
-    const pool = buf_pool_init() orelse return null;
+    const pool = buf_pool_get_for_page(space, offset) orelse return null;
     const key = BufPageKey{ .space = space, .page_no = offset };
     if (pool.pages.get(key)) |block| {
         buf_pool_touch_page(pool, &block.page, null);
+        if (block.page.pool == null) {
+            block.page.pool = pool;
+        }
         return block;
     }
     if (mode == BUF_GET_IF_IN_POOL) {
@@ -469,6 +527,7 @@ pub fn buf_page_get_gen(
         .state = .BUF_BLOCK_FILE_PAGE,
         .space = space,
         .page_no = offset,
+        .pool = pool,
     };
     pool.pages.put(key, block) catch {
         buf_block_free(block);
@@ -561,6 +620,12 @@ pub fn buf_page_io_complete(bpage: *buf_page_t) void {
 }
 
 pub fn buf_pool_invalidate() void {
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            buf_pool_clear_pages(pool);
+        }
+        return;
+    }
     if (buf_pool) |pool| {
         buf_pool_clear_pages(pool);
     }
@@ -591,6 +656,9 @@ pub fn buf_print_io(ib_stream: ib_stream_t) void {
 pub fn buf_refresh_io_stats() void {}
 
 pub fn buf_all_freed() ibool {
+    if (buf_pool_array.len != 0) {
+        return compat.FALSE;
+    }
     return if (buf_pool == null) compat.TRUE else compat.FALSE;
 }
 
@@ -599,6 +667,13 @@ pub fn buf_pool_check_no_pending_io() ibool {
 }
 
 pub fn buf_get_free_list_len() ulint {
+    if (buf_pool_array.len != 0) {
+        var total: ulint = 0;
+        for (buf_pool_array) |pool| {
+            total += pool.free_list_len;
+        }
+        return total;
+    }
     return if (buf_pool) |pool| pool.free_list_len else 0;
 }
 
@@ -629,19 +704,38 @@ pub const BUF_READ_ANY_PAGE: ulint = 132;
 
 pub fn buf_flush_remove(bpage: *buf_page_t) void {
     buf_page_clear_dirty(bpage);
-    if (buf_pool) |pool| {
-        buf_pool_recompute_oldest(pool);
+    const pool = if (bpage.pool) |p| p else buf_pool;
+    if (pool) |pool_ptr| {
+        buf_pool_recompute_oldest(pool_ptr);
     }
 }
 
 pub fn buf_flush_write_complete(bpage: *buf_page_t) void {
     buf_page_clear_dirty(bpage);
-    if (buf_pool) |pool| {
-        buf_pool_recompute_oldest(pool);
+    const pool = if (bpage.pool) |p| p else buf_pool;
+    if (pool) |pool_ptr| {
+        buf_pool_recompute_oldest(pool_ptr);
     }
 }
 
 pub fn buf_flush_free_margin() void {
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            if (pool.free_list_len >= BUF_FLUSH_FREE_BLOCK_MARGIN) {
+                continue;
+            }
+            var attempts: ulint = 0;
+            while (pool.free_list_len < BUF_FLUSH_FREE_BLOCK_MARGIN) : (attempts += 1) {
+                if (attempts > pool.curr_size) {
+                    break;
+                }
+                if (buf_LRU_search_and_free_block_pool(pool, 0) == compat.FALSE) {
+                    break;
+                }
+            }
+        }
+        return;
+    }
     if (buf_pool) |pool| {
         if (pool.free_list_len >= BUF_FLUSH_FREE_BLOCK_MARGIN) {
             return;
@@ -651,7 +745,7 @@ pub fn buf_flush_free_margin() void {
             if (attempts > pool.curr_size) {
                 break;
             }
-            if (buf_LRU_search_and_free_block(0) == compat.FALSE) {
+            if (buf_LRU_search_and_free_block_pool(pool, 0) == compat.FALSE) {
                 break;
             }
         }
@@ -669,45 +763,75 @@ pub fn buf_flush_init_for_writing(page: [*]byte, page_zip_: ?*anyopaque, newest_
     std.mem.writeInt(u32, page_slice[end_off .. end_off + 4], @as(u32, @intCast(old_checksum)), .big);
 }
 
-pub fn buf_flush_batch(flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
+fn buf_flush_batch_pool(pool: *buf_pool_t, flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
     _ = lsn_limit;
-    if (buf_pool) |pool| {
-        var flushed: ulint = 0;
-        if (flush_type == .BUF_FLUSH_LIST and pool.flush_list.items.len != 0) {
-            var idx: usize = 0;
-            while (idx < pool.flush_list.items.len) {
-                const bpage = pool.flush_list.items[idx];
-                if (bpage.dirty == compat.TRUE) {
-                    buf_page_clear_dirty(bpage);
-                    flushed += 1;
-                    if (min_n != 0 and flushed >= min_n) {
-                        break;
-                    }
-                } else {
-                    idx += 1;
+    var flushed: ulint = 0;
+    if (flush_type == .BUF_FLUSH_LIST and pool.flush_list.items.len != 0) {
+        var idx: usize = 0;
+        while (idx < pool.flush_list.items.len) {
+            const bpage = pool.flush_list.items[idx];
+            if (bpage.dirty == compat.TRUE) {
+                buf_page_clear_dirty(bpage);
+                flushed += 1;
+                if (min_n != 0 and flushed >= min_n) {
+                    break;
                 }
+            } else {
+                idx += 1;
             }
-        } else {
-            var it = pool.pages.valueIterator();
-            while (it.next()) |block| {
-                if (block.*.page.dirty == compat.TRUE) {
-                    buf_page_clear_dirty(&block.*.page);
-                    flushed += 1;
-                    if (min_n != 0 and flushed >= min_n) {
-                        break;
-                    }
+        }
+    } else {
+        var it = pool.pages.valueIterator();
+        while (it.next()) |block| {
+            if (block.*.page.dirty == compat.TRUE) {
+                buf_page_clear_dirty(&block.*.page);
+                flushed += 1;
+                if (min_n != 0 and flushed >= min_n) {
+                    break;
                 }
             }
         }
-        if (flushed > 0) {
-            buf_pool_recompute_oldest(pool);
-        }
-        pool.pages_flushed += flushed;
-        pool.write_requests += flushed;
-        srv_buf_pool_write_requests = pool.write_requests;
-        return flushed;
     }
-    return 0;
+    if (flushed > 0) {
+        buf_pool_recompute_oldest(pool);
+    }
+    pool.pages_flushed += flushed;
+    pool.write_requests += flushed;
+    return flushed;
+}
+
+pub fn buf_flush_batch(flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
+    if (buf_pool_array.len == 0) {
+        if (buf_pool) |pool| {
+            const flushed = buf_flush_batch_pool(pool, flush_type, min_n, lsn_limit);
+            if (flushed != 0) {
+                srv_buf_pool_write_requests = pool.write_requests;
+            }
+            return flushed;
+        }
+        return 0;
+    }
+    var total: ulint = 0;
+    var remaining = min_n;
+    for (buf_pool_array) |*pool| {
+        const need = if (min_n == 0) 0 else remaining;
+        const flushed = buf_flush_batch_pool(pool, flush_type, need, lsn_limit);
+        total += flushed;
+        if (min_n != 0) {
+            if (flushed >= remaining) {
+                break;
+            }
+            remaining -= flushed;
+        }
+    }
+    if (total != 0) {
+        var writes: ulint = 0;
+        for (buf_pool_array) |pool| {
+            writes += pool.write_requests;
+        }
+        srv_buf_pool_write_requests = writes;
+    }
+    return total;
 }
 
 pub fn buf_flush_wait_batch_end(flush_type: buf_flush) void {
@@ -719,6 +843,14 @@ pub fn buf_flush_ready_for_replace(bpage: *buf_page_t) ibool {
 }
 
 pub fn buf_flush_stat_update() void {
+    if (buf_pool_array.len != 0) {
+        var total: ulint = 0;
+        for (buf_pool_array) |pool| {
+            total += pool.write_requests;
+        }
+        srv_buf_pool_write_requests = total;
+        return;
+    }
     if (buf_pool) |pool| {
         srv_buf_pool_write_requests = pool.write_requests;
     } else {
@@ -751,13 +883,27 @@ pub const BUF_LRU_FREE_SEARCH_LEN: ulint = 5 + 2 * BUF_READ_AHEAD_AREA;
 pub var buf_LRU_old_ratio: ulint = 0;
 
 pub fn buf_LRU_try_free_flushed_blocks() void {
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            var iterations: ulint = 0;
+            while (pool.free_list_len < BUF_FLUSH_FREE_BLOCK_MARGIN) : (iterations += 1) {
+                if (iterations > pool.curr_size) {
+                    break;
+                }
+                if (buf_LRU_search_and_free_block_pool(pool, BUF_LRU_FREE_SEARCH_LEN) == compat.FALSE) {
+                    break;
+                }
+            }
+        }
+        return;
+    }
     if (buf_pool) |pool| {
         var iterations: ulint = 0;
         while (pool.free_list_len < BUF_FLUSH_FREE_BLOCK_MARGIN) : (iterations += 1) {
             if (iterations > pool.curr_size) {
                 break;
             }
-            if (buf_LRU_search_and_free_block(BUF_LRU_FREE_SEARCH_LEN) == compat.FALSE) {
+            if (buf_LRU_search_and_free_block_pool(pool, BUF_LRU_FREE_SEARCH_LEN) == compat.FALSE) {
                 break;
             }
         }
@@ -769,6 +915,22 @@ pub fn buf_LRU_buf_pool_running_out() ibool {
 }
 
 pub fn buf_LRU_invalidate_tablespace(id: ulint) void {
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            var keys: std.ArrayList(BufPageKey) = .{};
+            defer keys.deinit(std.heap.page_allocator);
+            var it = pool.pages.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.*.page.space == id) {
+                    keys.append(std.heap.page_allocator, entry.key_ptr.*) catch {};
+                }
+            }
+            for (keys.items) |key| {
+                buf_pool_remove_block(pool, key);
+            }
+        }
+        return;
+    }
     if (buf_pool) |pool| {
         var keys: std.ArrayList(BufPageKey) = .{};
         defer keys.deinit(std.heap.page_allocator);
@@ -826,14 +988,13 @@ pub fn buf_LRU_free_block(bpage: *buf_page_t, zip: ibool, buf_pool_mutex_release
     if (bpage.dirty == compat.TRUE) {
         return .BUF_LRU_NOT_FREED;
     }
-    const pool = buf_pool orelse return .BUF_LRU_NOT_FREED;
+    const pool = if (bpage.pool) |p| p else buf_pool orelse return .BUF_LRU_NOT_FREED;
     const key = buf_pool_find_block_key(pool, bpage) orelse return .BUF_LRU_NOT_FREED;
     buf_pool_remove_block(pool, key);
     return .BUF_LRU_FREED;
 }
 
-pub fn buf_LRU_search_and_free_block(n_iterations: ulint) ibool {
-    const pool = buf_pool orelse return compat.FALSE;
+fn buf_LRU_search_and_free_block_pool(pool: *buf_pool_t, n_iterations: ulint) ibool {
     var candidate: ?BufPageKey = null;
     var candidate_access: ib_uint64_t = 0;
     var scanned: ulint = 0;
@@ -859,6 +1020,19 @@ pub fn buf_LRU_search_and_free_block(n_iterations: ulint) ibool {
     return compat.FALSE;
 }
 
+pub fn buf_LRU_search_and_free_block(n_iterations: ulint) ibool {
+    if (buf_pool_array.len != 0) {
+        for (buf_pool_array) |*pool| {
+            if (buf_LRU_search_and_free_block_pool(pool, n_iterations) == compat.TRUE) {
+                return compat.TRUE;
+            }
+        }
+        return compat.FALSE;
+    }
+    const pool = buf_pool orelse return compat.FALSE;
+    return buf_LRU_search_and_free_block_pool(pool, n_iterations);
+}
+
 pub fn buf_LRU_get_free_only() ?*buf_block_t {
     return null;
 }
@@ -872,7 +1046,7 @@ pub fn buf_LRU_block_free_non_file_page(block: *buf_block_t) void {
 }
 
 pub fn buf_LRU_add_block(bpage: *buf_page_t, old: ibool) void {
-    const pool = buf_pool orelse return;
+    const pool = if (bpage.pool) |p| p else buf_pool orelse return;
     var make_old = old;
     if (make_old == compat.FALSE and buf_LRU_old_ratio != 0) {
         const total = pool.lru_old_len + pool.lru_new_len;
@@ -890,19 +1064,21 @@ pub fn buf_unzip_LRU_add_block(block: *buf_block_t, old: ibool) void {
 }
 
 pub fn buf_LRU_make_block_young(bpage: *buf_page_t) void {
-    if (buf_pool) |pool| {
-        buf_pool_touch_page(pool, bpage, compat.FALSE);
-    } else {
-        bpage.lru_old = compat.FALSE;
+    const pool = if (bpage.pool) |p| p else buf_pool;
+    if (pool) |pool_ptr| {
+        buf_pool_touch_page(pool_ptr, bpage, compat.FALSE);
+        return;
     }
+    bpage.lru_old = compat.FALSE;
 }
 
 pub fn buf_LRU_make_block_old(bpage: *buf_page_t) void {
-    if (buf_pool) |pool| {
-        buf_pool_touch_page(pool, bpage, compat.TRUE);
-    } else {
-        bpage.lru_old = compat.TRUE;
+    const pool = if (bpage.pool) |p| p else buf_pool;
+    if (pool) |pool_ptr| {
+        buf_pool_touch_page(pool_ptr, bpage, compat.TRUE);
+        return;
     }
+    bpage.lru_old = compat.TRUE;
 }
 
 pub fn buf_LRU_old_ratio_update(old_pct: ulint, adjust: ibool) ulint {
@@ -924,18 +1100,22 @@ pub fn buf_LRU_validate() ibool {
 pub fn buf_LRU_print() void {}
 
 fn buf_read_page_low(space: ulint, zip_size: ulint, offset: ulint, do_read_ahead: ibool) ibool {
-    const pool = buf_pool_init() orelse return compat.FALSE;
+    const pool = buf_pool_get_for_page(space, offset) orelse return compat.FALSE;
     pool.read_requests += 1;
     const key = BufPageKey{ .space = space, .page_no = offset };
     var block: *buf_block_t = undefined;
     if (pool.pages.get(key)) |existing| {
         block = existing;
+        if (block.page.pool == null) {
+            block.page.pool = pool;
+        }
     } else {
         block = buf_block_alloc(zip_size) orelse return compat.FALSE;
         block.page = .{
             .state = .BUF_BLOCK_FILE_PAGE,
             .space = space,
             .page_no = offset,
+            .pool = pool,
         };
         pool.pages.put(key, block) catch {
             buf_block_free(block);
@@ -1018,6 +1198,20 @@ test "buf pool basics" {
     try std.testing.expectEqual(compat.FALSE, buf_all_freed());
     buf_mem_free();
     try std.testing.expectEqual(compat.TRUE, buf_all_freed());
+}
+
+test "buf pool instance mapping" {
+    defer buf_mem_free();
+    _ = buf_pool_init_instances(2) orelse return error.OutOfMemory;
+
+    var mtr = mtr_t{};
+    const b1 = buf_page_get_gen(1, 0, 1, 0, null, BUF_GET, "inst", 0, &mtr) orelse return error.OutOfMemory;
+    const b2 = buf_page_get_gen(2, 0, 1, 0, null, BUF_GET, "inst", 0, &mtr) orelse return error.OutOfMemory;
+
+    try std.testing.expect(b1.page.pool != null);
+    try std.testing.expect(b2.page.pool != null);
+    try std.testing.expect(b1.page.pool.? != b2.page.pool.?);
+    try std.testing.expectEqual(@as(ulint, 2), buf_pool_get_curr_size());
 }
 
 test "buf dirty tracking and flush" {
