@@ -3,8 +3,10 @@ const btr = @import("../btr/mod.zig");
 const compat = @import("../ut/compat.zig");
 const data = @import("../data/mod.zig");
 const ins = @import("ins.zig");
+const read = @import("../read/mod.zig");
+const vers = @import("vers.zig");
 
-pub fn row_sel_simple(index: *btr.dict_index_t, allocator: std.mem.Allocator) []i64 {
+pub fn row_sel_simple(index: *btr.dict_index_t, view: ?*read.read_view_t, allocator: std.mem.Allocator) []i64 {
     var cursor = btr.btr_cur_t{};
     var mtr = btr.mtr_t{};
     btr.btr_cur_open_at_index_side_func(compat.TRUE, index, 0, &cursor, "row", 0, &mtr);
@@ -13,7 +15,19 @@ pub fn row_sel_simple(index: *btr.dict_index_t, allocator: std.mem.Allocator) []
     var list = std.ArrayList(i64).init(allocator);
     defer list.deinit();
     while (node) |rec| {
-        if (!rec.deleted) {
+        if (view) |rv| {
+            if (rec.payload) |payload| {
+                const head: ?*vers.RowVersion = @ptrCast(@alignCast(payload));
+                if (head) |chain| {
+                    const result = vers.row_vers_build_for_consistent_read(chain, rv);
+                    if (result.result == vers.VersionResult.visible and result.version != null and !result.version.?.deleted) {
+                        list.append(result.version.?.key) catch @panic("row_sel_simple");
+                    }
+                }
+            } else if (!rec.deleted) {
+                list.append(rec.key) catch @panic("row_sel_simple");
+            }
+        } else if (!rec.deleted) {
             list.append(rec.key) catch @panic("row_sel_simple");
         }
         node = btr.btr_get_next_user_rec(rec, null);
@@ -40,9 +54,39 @@ test "row select simple collects keys" {
     const rec_b = ins.row_ins_simple_insert(&index, &tuple_b) orelse return error.OutOfMemory;
     rec_b.deleted = true;
 
-    const rows = row_sel_simple(&index, std.testing.allocator);
+    const rows = row_sel_simple(&index, null, std.testing.allocator);
     defer std.testing.allocator.free(rows);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0]);
+    btr.btr_free_index(&index);
+}
+
+test "row select with view uses version chain" {
+    var index = btr.dict_index_t{};
+    var mtr = btr.mtr_t{};
+    _ = btr.btr_create(0, 1, 0, .{ .high = 0, .low = 25 }, &index, &mtr);
+
+    var key_val: i64 = 1;
+    var fields = [_]data.dfield_t{.{ .data = &key_val, .len = @intCast(@sizeOf(i64)) }};
+    var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+    const rec = ins.row_ins_simple_insert(&index, &tuple) orelse return error.OutOfMemory;
+
+    var head: ?*vers.RowVersion = null;
+    head = vers.row_version_add_with_trx(head, 10, false, 10, std.testing.allocator);
+    head = vers.row_version_add_with_trx(head, 20, false, 30, std.testing.allocator);
+    head = vers.row_version_add_with_trx(head, 30, false, 50, std.testing.allocator);
+    defer vers.row_version_free(head, std.testing.allocator);
+
+    rec.payload = @ptrCast(@alignCast(head.?));
+    rec.deleted = true;
+
+    const active = [_]read.trx_id_t{30};
+    const view = read.read_view_open_with_active(40, 60, &active, std.testing.allocator);
+    defer read.read_view_close(view);
+
+    const rows = row_sel_simple(&index, view, std.testing.allocator);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 10), rows[0]);
     btr.btr_free_index(&index);
 }
