@@ -168,6 +168,7 @@ pub fn openOrCreateSystemTablespace(data_home_dir: []const u8, data_file_path: [
     var total_pages: ulint = 0;
     const space_exists = fil.fil_tablespace_exists_in_mem(space_id) == compat.TRUE;
     var space_ready = space_exists;
+    var created_any = false;
 
     for (files, 0..) |file_spec, idx| {
         const full_path = resolveDataPath(allocator, data_home_dir, file_spec.path) catch return compat.FALSE;
@@ -202,6 +203,7 @@ pub fn openOrCreateSystemTablespace(data_home_dir: []const u8, data_file_path: [
             if (os_file.os_file_write(full_path, file_handle, page_buf.ptr, 0, 0, compat.UNIV_PAGE_SIZE) == compat.FALSE) {
                 return compat.FALSE;
             }
+            created_any = true;
         } else {
             var size_low: ulint = 0;
             var size_high: ulint = 0;
@@ -237,7 +239,11 @@ pub fn openOrCreateSystemTablespace(data_home_dir: []const u8, data_file_path: [
 
     if (space_ready) {
         var mtr = fsp.mtr_t{};
-        fsp.fsp_header_init(space_id, total_pages, &mtr);
+        if (created_any) {
+            fsp.fsp_header_init(space_id, total_pages, &mtr);
+        } else {
+            _ = fsp.fsp_header_load(space_id);
+        }
     }
 
     return compat.TRUE;
