@@ -1,5 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
+const dict = @import("../dict/mod.zig");
+const trx_types = @import("../trx/types.zig");
 
 pub const module_name = "lock";
 
@@ -69,9 +71,16 @@ pub fn lock_mode_stronger_or_eq(mode1: ulint, mode2: ulint) ibool {
 }
 
 pub const lock_t = struct {
+    trx: ?*trx_types.trx_t = null,
     type_mode: ulint = 0,
     prev: ?*lock_t = null,
+    next: ?*lock_t = null,
+    index: ?*dict.dict_index_t = null,
+    table_id: u64 = 0,
+    space: ulint = 0,
+    page_no: ulint = 0,
     rec_bit: ulint = compat.ULINT_UNDEFINED,
+    wait_for: ?*lock_t = null,
 };
 
 pub const lock_queue_iterator_t = struct {
@@ -79,8 +88,22 @@ pub const lock_queue_iterator_t = struct {
     bit_no: ulint = compat.ULINT_UNDEFINED,
 };
 
+pub const lock_queue_t = struct {
+    head: ?*lock_t = null,
+    tail: ?*lock_t = null,
+};
+
+const LockRecKey = struct {
+    space: ulint,
+    page_no: ulint,
+    rec_offset: ulint,
+};
+
 pub const lock_sys_t = struct {
-    rec_hash: ?*anyopaque = null,
+    rec_hash: std.AutoHashMap(LockRecKey, lock_queue_t),
+    table_hash: std.AutoHashMap(u64, lock_queue_t),
+    trx_hash: std.AutoHashMap(*trx_types.trx_t, lock_queue_t),
+    allocator: std.mem.Allocator,
 };
 
 pub var lock_sys: ?*lock_sys_t = null;
@@ -110,16 +133,33 @@ pub fn lock_var_init() void {
     if (lock_sys != null) {
         return;
     }
-    const sys = std.heap.page_allocator.create(lock_sys_t) catch return;
-    sys.* = .{};
-    lock_sys = sys;
+    lock_sys_create(0);
 }
 
 pub fn lock_sys_close() void {
     if (lock_sys) |sys| {
+        sys.rec_hash.deinit();
+        sys.table_hash.deinit();
+        sys.trx_hash.deinit();
         std.heap.page_allocator.destroy(sys);
         lock_sys = null;
     }
+}
+
+pub fn lock_sys_create(n_cells: ulint) void {
+    _ = n_cells;
+    if (lock_sys != null) {
+        return;
+    }
+    const allocator = std.heap.page_allocator;
+    const sys = allocator.create(lock_sys_t) catch return;
+    sys.* = .{
+        .rec_hash = std.AutoHashMap(LockRecKey, lock_queue_t).init(allocator),
+        .table_hash = std.AutoHashMap(u64, lock_queue_t).init(allocator),
+        .trx_hash = std.AutoHashMap(*trx_types.trx_t, lock_queue_t).init(allocator),
+        .allocator = allocator,
+    };
+    lock_sys = sys;
 }
 
 pub fn lock_queue_iterator_reset(iter: *lock_queue_iterator_t, lock: *const lock_t, bit_no: ulint) void {
