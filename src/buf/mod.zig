@@ -130,6 +130,7 @@ pub const buf_pool_t = struct {
     read_requests: ulint = 0,
     pages_flushed: ulint = 0,
     write_requests: ulint = 0,
+    flush_list: std.ArrayListUnmanaged(*buf_page_t) = .{},
     pages: std.AutoHashMap(BufPageKey, *buf_block_t) = undefined,
 };
 
@@ -196,6 +197,8 @@ fn buf_pool_clear_pages(pool: *buf_pool_t) void {
         buf_block_free(block.*);
     }
     pool.pages.clearRetainingCapacity();
+    pool.flush_list.deinit(std.heap.page_allocator);
+    pool.flush_list = .{};
     pool.curr_size = 0;
     pool.dirty_pages = 0;
     pool.oldest_modification = 0;
@@ -311,6 +314,7 @@ pub fn buf_page_set_dirty(bpage: *buf_page_t) void {
             if (pool.oldest_modification == 0 or bpage.modification < pool.oldest_modification) {
                 pool.oldest_modification = bpage.modification;
             }
+            buf_flush_list_add(pool, bpage);
         }
     }
 }
@@ -323,6 +327,22 @@ fn buf_page_clear_dirty(bpage: *buf_page_t) void {
             if (pool.dirty_pages > 0) {
                 pool.dirty_pages -= 1;
             }
+            buf_flush_list_remove(pool, bpage);
+            buf_pool_recompute_oldest(pool);
+        }
+    }
+}
+
+fn buf_flush_list_add(pool: *buf_pool_t, bpage: *buf_page_t) void {
+    pool.flush_list.append(std.heap.page_allocator, bpage) catch {};
+}
+
+fn buf_flush_list_remove(pool: *buf_pool_t, bpage: *buf_page_t) void {
+    var idx: usize = 0;
+    while (idx < pool.flush_list.items.len) : (idx += 1) {
+        if (pool.flush_list.items[idx] == bpage) {
+            _ = pool.flush_list.orderedRemove(idx);
+            return;
         }
     }
 }
@@ -616,17 +636,32 @@ pub fn buf_flush_init_for_writing(page: [*]byte, page_zip_: ?*anyopaque, newest_
 }
 
 pub fn buf_flush_batch(flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
-    _ = flush_type;
     _ = lsn_limit;
     if (buf_pool) |pool| {
         var flushed: ulint = 0;
-        var it = pool.pages.valueIterator();
-        while (it.next()) |block| {
-            if (block.*.page.dirty == compat.TRUE) {
-                buf_page_clear_dirty(&block.*.page);
-                flushed += 1;
-                if (min_n != 0 and flushed >= min_n) {
-                    break;
+        if (flush_type == .BUF_FLUSH_LIST and pool.flush_list.items.len != 0) {
+            var idx: usize = 0;
+            while (idx < pool.flush_list.items.len) {
+                const bpage = pool.flush_list.items[idx];
+                if (bpage.dirty == compat.TRUE) {
+                    buf_page_clear_dirty(bpage);
+                    flushed += 1;
+                    if (min_n != 0 and flushed >= min_n) {
+                        break;
+                    }
+                } else {
+                    idx += 1;
+                }
+            }
+        } else {
+            var it = pool.pages.valueIterator();
+            while (it.next()) |block| {
+                if (block.*.page.dirty == compat.TRUE) {
+                    buf_page_clear_dirty(&block.*.page);
+                    flushed += 1;
+                    if (min_n != 0 and flushed >= min_n) {
+                        break;
+                    }
                 }
             }
         }
@@ -1010,6 +1045,18 @@ test "buf LRU helpers" {
 test "buf read stubs" {
     try std.testing.expectEqual(compat.FALSE, buf_read_page(0, 0, 0));
     try std.testing.expectEqual(@as(ulint, 0), buf_read_ahead_linear(0, 0, 0));
+}
+
+test "buf flush list tracks dirty pages" {
+    var mtr = mtr_t{};
+    const block = buf_page_get_gen(1, 0, 42, 0, null, BUF_GET, "flush", 0, &mtr) orelse return error.OutOfMemory;
+    const pool = buf_pool orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(usize, 0), pool.flush_list.items.len);
+    buf_page_set_dirty(&block.page);
+    try std.testing.expectEqual(@as(usize, 1), pool.flush_list.items.len);
+    buf_flush_remove(&block.page);
+    try std.testing.expectEqual(@as(usize, 0), pool.flush_list.items.len);
+    buf_mem_free();
 }
 
 test "buf read applies recv log lsn" {
