@@ -233,6 +233,24 @@ pub fn page_dir_insert_slot_bytes(page: [*]byte, pos: ulint, rec_offs: ulint) bo
     return true;
 }
 
+pub fn page_dir_remove_slot_bytes(page: [*]byte, rec_offs: ulint) bool {
+    const n_slots = page_header_get_field_bytes(page, PAGE_N_DIR_SLOTS);
+    var pos: ulint = 0;
+    while (pos < n_slots) : (pos += 1) {
+        if (page_dir_get_nth_slot_val(page, pos) != rec_offs) {
+            continue;
+        }
+        var i = pos;
+        while (i + 1 < n_slots) : (i += 1) {
+            const next_val = page_dir_get_nth_slot_val(page, i + 1);
+            page_dir_set_nth_slot(page, i, next_val);
+        }
+        page_header_set_field_bytes(page, PAGE_N_DIR_SLOTS, n_slots - 1);
+        return true;
+    }
+    return false;
+}
+
 pub fn page_rec_set_deleted_bytes(page: [*]byte, rec_offs: ulint, deleted: bool) void {
     const rec_ptr = page + @as(usize, @intCast(rec_offs));
     rec_mod.rec_set_deleted_flag_new(rec_ptr, if (deleted) 1 else 0);
@@ -652,9 +670,6 @@ pub fn page_cur_tuple_insert(cursor: *page_cur_t, tuple: *const dtuple_t, index:
 }
 
 pub fn page_cur_rec_insert(cursor: *page_cur_t, rec: *rec_t, index: *dict_index_t, offsets: *ulint, mtr: *mtr_t) ?*rec_t {
-    _ = index;
-    _ = offsets;
-    _ = mtr;
     const current = cursor.rec orelse return null;
     const insert_after = if (current.is_supremum) current.prev orelse current else current;
     const next = insert_after.next;
@@ -667,6 +682,24 @@ pub fn page_cur_rec_insert(cursor: *page_cur_t, rec: *rec_t, index: *dict_index_
     if (cursor.block) |block| {
         block.frame.header.n_recs += 1;
         rec.page = block.frame;
+        if (block.bytes.len != 0 and rec.rec_page_offset == 0) {
+            if (rec.rec_bytes) |rec_bytes| {
+                if (rec.rec_offset != 0) {
+                    const rec_head = page_bytes_insert_append(block.bytes, rec_bytes) orelse {
+                        var del_cursor = page_cur_t{ .block = block, .rec = rec };
+                        page_cur_delete_rec(&del_cursor, index, offsets, mtr);
+                        return null;
+                    };
+                    rec.rec_page_offset = rec_head + rec.rec_offset;
+                    const dir_pos = page_rec_get_n_recs_before(block.frame, rec);
+                    if (!page_dir_insert_slot_bytes(block.bytes.ptr, dir_pos, rec.rec_page_offset)) {
+                        var del_cursor = page_cur_t{ .block = block, .rec = rec };
+                        page_cur_delete_rec(&del_cursor, index, offsets, mtr);
+                        return null;
+                    }
+                }
+            }
+        }
     } else {
         rec.page = insert_after.page;
     }
@@ -747,6 +780,18 @@ pub fn page_cur_delete_rec(cursor: *page_cur_t, index: *dict_index_t, offsets: *
     if (cursor.block) |block| {
         if (block.frame.header.n_recs > 0) {
             block.frame.header.n_recs -= 1;
+        }
+        if (block.bytes.len != 0 and current.rec_page_offset != 0) {
+            if (current.rec_bytes) |rec_bytes| {
+                page_rec_delete_bytes(block.bytes.ptr, current.rec_page_offset, @as(ulint, @intCast(rec_bytes.len)));
+            } else {
+                page_rec_set_deleted_bytes(block.bytes.ptr, current.rec_page_offset, true);
+            }
+            _ = page_dir_remove_slot_bytes(block.bytes.ptr, current.rec_page_offset);
+            const n_recs = page_header_get_field_bytes(block.bytes.ptr, PAGE_N_RECS);
+            if (n_recs > 0) {
+                page_header_set_field_bytes(block.bytes.ptr, PAGE_N_RECS, n_recs - 1);
+            }
         }
     }
     cursor.rec = next;
@@ -1448,6 +1493,60 @@ test "page cursor search uses record bytes" {
     var search_cursor = page_cur_t{};
     _ = page_cur_search(&block, &index, &search_tuple, PAGE_CUR_GE, &search_cursor);
     try std.testing.expect(search_cursor.rec == &rec2);
+}
+
+test "page cursor insert/delete updates directory bytes" {
+    var page = page_t{};
+    page_init(&page);
+
+    var bytes = [_]u8{0} ** compat.UNIV_PAGE_SIZE;
+    page_bytes_reset(bytes[0..]);
+
+    var block = buf_block_t{ .frame = &page, .bytes = bytes[0..] };
+    var cursor = page_cur_t{};
+    var index = dict_index_t{};
+    var mtr = mtr_t{};
+    var offsets: ulint = 0;
+
+    const header_len: ulint = rec_mod.REC_N_NEW_EXTRA_BYTES + 1;
+    const meta = [_]rec_mod.FieldMeta{.{ .fixed_len = @sizeOf(i64), .nullable = false }};
+
+    var key1: i64 = 5;
+    var field1 = data.dfield_t{ .data = &key1, .len = @intCast(@sizeOf(i64)) };
+    var tuple1 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field1)[0..1] };
+    var rec1_buf = [_]byte{0} ** 32;
+    const rec1_ptr = @as([*]byte, @ptrCast(rec1_buf[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec1_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple1);
+    const rec1_slice = rec1_buf[0..@as(usize, @intCast(header_len + @sizeOf(i64)))];
+    var rec1 = rec_t{ .key = key1, .rec_bytes = rec1_slice, .rec_offset = header_len };
+
+    page_cur_set_before_first(&block, &cursor);
+    _ = page_cur_rec_insert(&cursor, &rec1, &index, &offsets, &mtr);
+    try std.testing.expect(rec1.rec_page_offset != 0);
+    try std.testing.expectEqual(@as(ulint, 1), page_header_get_field_bytes(bytes[0..].ptr, PAGE_N_DIR_SLOTS));
+    try std.testing.expectEqual(@as(ulint, 1), page_header_get_field_bytes(bytes[0..].ptr, PAGE_N_RECS));
+    try std.testing.expectEqual(rec1.rec_page_offset, page_dir_get_nth_slot_val(bytes[0..].ptr, 0));
+
+    var key2: i64 = 10;
+    var field2 = data.dfield_t{ .data = &key2, .len = @intCast(@sizeOf(i64)) };
+    var tuple2 = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = (&field2)[0..1] };
+    var rec2_buf = [_]byte{0} ** 32;
+    const rec2_ptr = @as([*]byte, @ptrCast(rec2_buf[@as(usize, @intCast(header_len))..].ptr));
+    _ = rec_mod.rec_encode_compact(rec2_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, &meta, &tuple2);
+    const rec2_slice = rec2_buf[0..@as(usize, @intCast(header_len + @sizeOf(i64)))];
+    var rec2 = rec_t{ .key = key2, .rec_bytes = rec2_slice, .rec_offset = header_len };
+
+    cursor.rec = &rec1;
+    _ = page_cur_rec_insert(&cursor, &rec2, &index, &offsets, &mtr);
+    try std.testing.expect(rec2.rec_page_offset != 0);
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(bytes[0..].ptr, PAGE_N_DIR_SLOTS));
+    try std.testing.expectEqual(@as(ulint, 2), page_header_get_field_bytes(bytes[0..].ptr, PAGE_N_RECS));
+
+    cursor.rec = &rec1;
+    page_cur_delete_rec(&cursor, &index, &offsets, &mtr);
+    try std.testing.expectEqual(@as(ulint, 1), page_header_get_field_bytes(bytes[0..].ptr, PAGE_N_DIR_SLOTS));
+    try std.testing.expectEqual(@as(ulint, 1), page_header_get_field_bytes(bytes[0..].ptr, PAGE_N_RECS));
+    try std.testing.expectEqual(rec2.rec_page_offset, page_dir_get_nth_slot_val(bytes[0..].ptr, 0));
 }
 
 test "page header fields and create" {

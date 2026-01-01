@@ -782,15 +782,17 @@ fn insert_entries(block: *buf_block_t, entries: []const SplitEntry, index: *dict
             return inserted;
         }
         if (bytes) |buf| {
-            if (entry.rec_bytes) |rec_bytes| {
-                if (entry.rec_offset != 0) {
-                    const rec_head = page.page_bytes_insert_append(buf, rec_bytes) orelse return inserted;
-                    rec.rec_bytes = rec_bytes;
-                    rec.rec_offset = entry.rec_offset;
-                    rec.rec_page_offset = rec_head + entry.rec_offset;
-                    const dir_pos = page.page_rec_get_n_recs_before(block.frame, rec);
-                    if (!page.page_dir_insert_slot_bytes(buf.ptr, dir_pos, rec.rec_page_offset)) {
-                        return inserted;
+            if (rec.rec_page_offset == 0) {
+                if (entry.rec_bytes) |rec_bytes| {
+                    if (entry.rec_offset != 0) {
+                        const rec_head = page.page_bytes_insert_append(buf, rec_bytes) orelse return inserted;
+                        rec.rec_bytes = rec_bytes;
+                        rec.rec_offset = entry.rec_offset;
+                        rec.rec_page_offset = rec_head + entry.rec_offset;
+                        const dir_pos = page.page_rec_get_n_recs_before(block.frame, rec);
+                        if (!page.page_dir_insert_slot_bytes(buf.ptr, dir_pos, rec.rec_page_offset)) {
+                            return inserted;
+                        }
                     }
                 }
             }
@@ -909,6 +911,8 @@ fn insert_node_ptr_with_key(parent_block: *buf_block_t, child_block: *buf_block_
         allocator.destroy(node_ptr);
         return;
     };
+    node_ptr.rec_bytes = rec_bytes.buf;
+    node_ptr.rec_offset = rec_bytes.header_len;
 
     var page_cursor = page.page_cur_t{ .block = parent_block, .rec = insert_after };
     var offsets: ulint = 0;
@@ -924,23 +928,23 @@ fn insert_node_ptr_with_key(parent_block: *buf_block_t, child_block: *buf_block_
         allocator.free(rec_bytes.buf);
         return;
     };
-    const rec_head = page.page_bytes_insert_append(bytes, rec_bytes.buf) orelse {
-        var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
-        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
-        allocator.destroy(node_ptr);
-        allocator.free(rec_bytes.buf);
-        return;
-    };
-    node_ptr.rec_bytes = rec_bytes.buf;
-    node_ptr.rec_offset = rec_bytes.header_len;
-    node_ptr.rec_page_offset = rec_head + rec_bytes.header_len;
-    const dir_pos = page.page_rec_get_n_recs_before(parent_block.frame, node_ptr);
-    if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, node_ptr.rec_page_offset)) {
-        var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
-        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
-        allocator.destroy(node_ptr);
-        allocator.free(rec_bytes.buf);
-        return;
+    if (node_ptr.rec_page_offset == 0) {
+        const rec_head = page.page_bytes_insert_append(bytes, rec_bytes.buf) orelse {
+            var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
+            page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+            allocator.destroy(node_ptr);
+            allocator.free(rec_bytes.buf);
+            return;
+        };
+        node_ptr.rec_page_offset = rec_head + rec_bytes.header_len;
+        const dir_pos = page.page_rec_get_n_recs_before(parent_block.frame, node_ptr);
+        if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, node_ptr.rec_page_offset)) {
+            var del_cursor = page.page_cur_t{ .block = parent_block, .rec = node_ptr };
+            page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+            allocator.destroy(node_ptr);
+            allocator.free(rec_bytes.buf);
+            return;
+        }
     }
     child_block.frame.parent_block = parent_block;
 }
@@ -1863,6 +1867,8 @@ fn btr_cur_insert_if_possible(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext:
         allocator.destroy(new_rec);
         return null;
     };
+    new_rec.rec_bytes = rec_bytes.buf;
+    new_rec.rec_offset = rec_bytes.header_len;
     var page_cursor = page.page_cur_t{ .block = block, .rec = insert_after };
     var offsets: ulint = 0;
     if (page.page_cur_rec_insert(&page_cursor, new_rec, index, &offsets, mtr) == null) {
@@ -1877,23 +1883,23 @@ fn btr_cur_insert_if_possible(cursor: *btr_cur_t, tuple: *const dtuple_t, n_ext:
         allocator.free(rec_bytes.buf);
         return null;
     };
-    const rec_head = page.page_bytes_insert_append(bytes, rec_bytes.buf) orelse {
-        var del_cursor = page.page_cur_t{ .block = block, .rec = new_rec };
-        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
-        allocator.destroy(new_rec);
-        allocator.free(rec_bytes.buf);
-        return null;
-    };
-    new_rec.rec_bytes = rec_bytes.buf;
-    new_rec.rec_offset = rec_bytes.header_len;
-    new_rec.rec_page_offset = rec_head + rec_bytes.header_len;
-    const dir_pos = page.page_rec_get_n_recs_before(block.frame, new_rec);
-    if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, new_rec.rec_page_offset)) {
-        var del_cursor = page.page_cur_t{ .block = block, .rec = new_rec };
-        page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
-        allocator.destroy(new_rec);
-        allocator.free(rec_bytes.buf);
-        return null;
+    if (new_rec.rec_page_offset == 0) {
+        const rec_head = page.page_bytes_insert_append(bytes, rec_bytes.buf) orelse {
+            var del_cursor = page.page_cur_t{ .block = block, .rec = new_rec };
+            page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+            allocator.destroy(new_rec);
+            allocator.free(rec_bytes.buf);
+            return null;
+        };
+        new_rec.rec_page_offset = rec_head + rec_bytes.header_len;
+        const dir_pos = page.page_rec_get_n_recs_before(block.frame, new_rec);
+        if (!page.page_dir_insert_slot_bytes(bytes.ptr, dir_pos, new_rec.rec_page_offset)) {
+            var del_cursor = page.page_cur_t{ .block = block, .rec = new_rec };
+            page.page_cur_delete_rec(&del_cursor, index, &offsets, mtr);
+            allocator.destroy(new_rec);
+            allocator.free(rec_bytes.buf);
+            return null;
+        }
     }
     btr_update_parent_min_key(block);
     btr_rebuild_leaf_chain(index);
