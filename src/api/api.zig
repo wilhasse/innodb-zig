@@ -213,6 +213,81 @@ const StatusVar = struct {
     value_ptr: *const anyopaque,
 };
 
+pub const ib_op_t = enum(u8) {
+    insert,
+    copy,
+    join,
+};
+
+pub const ib_op_time_t = struct {
+    times: []u64 = &[_]u64{},
+    count: usize = 0,
+
+    pub fn add(self: *ib_op_time_t, elapsed_us: u64) void {
+        std.debug.assert(self.count < self.times.len);
+        self.times[self.count] = elapsed_us;
+        self.count += 1;
+    }
+
+    pub fn slice(self: *const ib_op_time_t) []const u64 {
+        return self.times[0..self.count];
+    }
+};
+
+pub const ib_op_stats_t = struct {
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    mutex: std.Thread.Mutex = .{},
+    insert: ib_op_time_t = .{},
+    copy: ib_op_time_t = .{},
+    join: ib_op_time_t = .{},
+};
+
+pub fn ib_op_stats_init(stats: *ib_op_stats_t, allocator: std.mem.Allocator, n_threads: usize) ib_err_t {
+    stats.* = .{ .allocator = allocator };
+
+    stats.insert.times = allocator.alloc(u64, n_threads) catch return .DB_OUT_OF_MEMORY;
+    errdefer allocator.free(stats.insert.times);
+    stats.copy.times = allocator.alloc(u64, n_threads) catch return .DB_OUT_OF_MEMORY;
+    errdefer allocator.free(stats.copy.times);
+    stats.join.times = allocator.alloc(u64, n_threads) catch return .DB_OUT_OF_MEMORY;
+    errdefer allocator.free(stats.join.times);
+
+    @memset(stats.insert.times, 0);
+    @memset(stats.copy.times, 0);
+    @memset(stats.join.times, 0);
+    stats.insert.count = 0;
+    stats.copy.count = 0;
+    stats.join.count = 0;
+
+    return .DB_SUCCESS;
+}
+
+pub fn ib_op_stats_deinit(stats: *ib_op_stats_t) void {
+    const allocator = stats.allocator;
+    if (stats.insert.times.len > 0) {
+        allocator.free(stats.insert.times);
+    }
+    if (stats.copy.times.len > 0) {
+        allocator.free(stats.copy.times);
+    }
+    if (stats.join.times.len > 0) {
+        allocator.free(stats.join.times);
+    }
+    stats.* = .{ .allocator = allocator };
+}
+
+pub fn ib_op_stats_collect(stats: *ib_op_stats_t, op: ib_op_t, elapsed_us: u64) void {
+    stats.mutex.lock();
+    defer stats.mutex.unlock();
+
+    const bucket = switch (op) {
+        .insert => &stats.insert,
+        .copy => &stats.copy,
+        .join => &stats.join,
+    };
+    bucket.add(elapsed_us);
+}
+
 const ExportVars = struct {
     innodb_data_pending_reads: ib_ulint_t = 0,
     innodb_data_pending_writes: ib_ulint_t = 0,

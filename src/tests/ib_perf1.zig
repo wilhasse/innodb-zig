@@ -9,27 +9,6 @@ const NumRows: usize = 64;
 const BatchSize: usize = 16;
 const PageSize: usize = 0;
 
-const OpTimes = struct {
-    times: [NumThreads]u64 = [_]u64{0} ** NumThreads,
-    count: usize = 0,
-
-    fn add(self: *OpTimes, elapsed_us: u64) void {
-        std.debug.assert(self.count < self.times.len);
-        self.times[self.count] = elapsed_us;
-        self.count += 1;
-    }
-
-    fn slice(self: *const OpTimes) []const u64 {
-        return self.times[0..self.count];
-    }
-};
-
-const OpStats = struct {
-    insert: OpTimes = .{},
-    copy: OpTimes = .{},
-    join: OpTimes = .{},
-};
-
 fn nowUs() u64 {
     const now = std.time.microTimestamp();
     return if (now < 0) 0 else @as(u64, @intCast(now));
@@ -188,7 +167,7 @@ fn joinOnC1(t1_crsr: api.ib_crsr_t, t2_crsr: api.ib_crsr_t) !usize {
     return count;
 }
 
-fn runWorker(table_id: usize, stats: *OpStats) !void {
+fn runWorker(table_id: usize, stats: *api.ib_op_stats_t) !void {
     var table1_buf: [32]u8 = undefined;
     var table2_buf: [32]u8 = undefined;
     const table1 = try std.fmt.bufPrint(&table1_buf, "T{d}", .{table_id});
@@ -214,7 +193,7 @@ fn runWorker(table_id: usize, stats: *OpStats) !void {
         try insertRows(src_crsr, @intCast(row), batch);
         try expectOk(api.ib_cursor_reset(src_crsr));
     }
-    stats.insert.add(nowUs() - start);
+    api.ib_op_stats_collect(stats, .insert, nowUs() - start);
 
     try expectOk(api.ib_cursor_lock(src_crsr, .IB_LOCK_IS));
     try expectOk(api.ib_cursor_lock(dst_crsr, .IB_LOCK_IX));
@@ -232,7 +211,7 @@ fn runWorker(table_id: usize, stats: *OpStats) !void {
             break;
         }
     }
-    stats.copy.add(nowUs() - start);
+    api.ib_op_stats_collect(stats, .copy, nowUs() - start);
     try std.testing.expectEqual(NumRows, copied);
 
     try expectOk(api.ib_cursor_reset(src_crsr));
@@ -240,7 +219,7 @@ fn runWorker(table_id: usize, stats: *OpStats) !void {
 
     start = nowUs();
     const matched = try joinOnC1(src_crsr, dst_crsr);
-    stats.join.add(nowUs() - start);
+    api.ib_op_stats_collect(stats, .join, nowUs() - start);
     try std.testing.expectEqual(NumRows, matched);
 
     try expectOk(api.ib_trx_commit(trx));
@@ -257,7 +236,9 @@ test "ib perf1 harness" {
 
     try createDatabase();
 
-    var stats = OpStats{};
+    var stats = api.ib_op_stats_t{};
+    try expectOk(api.ib_op_stats_init(&stats, std.testing.allocator, NumThreads));
+    defer api.ib_op_stats_deinit(&stats);
     for (0..NumThreads) |i| {
         try runWorker(i * 2, &stats);
     }
