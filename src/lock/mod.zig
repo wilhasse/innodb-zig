@@ -254,3 +254,21 @@ test "lock mode stronger or equal matrix" {
     try std.testing.expect(lock_mode_stronger_or_eq(LOCK_S, LOCK_IX) == compat.FALSE);
     try std.testing.expect(lock_mode_stronger_or_eq(LOCK_AUTO_INC, LOCK_IS) == compat.FALSE);
 }
+
+test "lock sys hash tables init" {
+    lock_sys_close();
+    lock_sys_create(0);
+    const sys = lock_sys orelse return error.OutOfMemory;
+    try std.testing.expect(sys.rec_hash.count() == 0);
+    try std.testing.expect(sys.table_hash.count() == 0);
+
+    const key = LockRecKey{ .space = 1, .page_no = 2, .rec_offset = 3 };
+    try sys.rec_hash.put(key, .{});
+    try sys.table_hash.put(42, .{});
+    try std.testing.expect(sys.rec_hash.count() == 1);
+    try std.testing.expect(sys.table_hash.count() == 1);
+
+    _ = sys.rec_hash.remove(key);
+    _ = sys.table_hash.remove(42);
+    lock_sys_close();
+}
