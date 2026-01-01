@@ -1,7 +1,10 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const mach = @import("../mach/mod.zig");
+const fil = @import("../fil/mod.zig");
+const buf_mod = @import("../buf/mod.zig");
 const types = @import("types.zig");
+const rseg = @import("rseg.zig");
 
 pub const module_name = "trx.undo";
 
@@ -26,6 +29,18 @@ pub const TRX_UNDO_UPD_EXTERN: ulint = 128; // updated external storage fields
 pub const TRX_UNDO_INSERT_OP: ulint = 1;
 pub const TRX_UNDO_MODIFY_OP: ulint = 2;
 
+pub const TRX_UNDO_PAGE_HDR: ulint = fil.FIL_PAGE_DATA;
+pub const TRX_UNDO_PAGE_HDR_SIZE: ulint = 32;
+pub const TRX_UNDO_PAGE_TYPE: ulint = 0;
+pub const TRX_UNDO_PAGE_RSEG_ID: ulint = 2;
+pub const TRX_UNDO_PAGE_TRX_ID: ulint = 4;
+pub const TRX_UNDO_PAGE_FREE: ulint = 12;
+pub const TRX_UNDO_PAGE_FIRST: ulint = 14;
+pub const TRX_UNDO_PAGE_LAST: ulint = 16;
+pub const TRX_UNDO_PAGE_N_RECS: ulint = 18;
+pub const TRX_UNDO_PAGE_DATA_START: ulint = TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE;
+const TRX_UNDO_PAGE_DATA_END: ulint = compat.UNIV_PAGE_SIZE - fil.FIL_PAGE_END_LSN_OLD_CHKSUM;
+
 /// Undo record type enum for Zig code
 pub const UndoRecType = enum(u8) {
     insert = 11, // TRX_UNDO_INSERT_REC
@@ -47,6 +62,97 @@ pub const UndoRecType = enum(u8) {
         };
     }
 };
+
+const UndoPageHeader = struct {
+    undo_type: ulint = TRX_UNDO_INSERT,
+    rseg_id: ulint = 0,
+    trx_id: trx_id_t = 0,
+    free_offset: ulint = TRX_UNDO_PAGE_DATA_START,
+    first_rec: ulint = 0,
+    last_rec: ulint = 0,
+    n_recs: ulint = 0,
+};
+
+fn undo_page_write_header(page: []byte, header: *const UndoPageHeader) void {
+    mach.mach_write_to_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_TYPE, header.undo_type);
+    mach.mach_write_to_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_RSEG_ID, header.rseg_id);
+    mach.mach_write_to_8(
+        page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_TRX_ID,
+        .{ .high = @intCast(header.trx_id >> 32), .low = @intCast(header.trx_id & 0xFFFFFFFF) },
+    );
+    mach.mach_write_to_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_FREE, header.free_offset);
+    mach.mach_write_to_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_FIRST, header.first_rec);
+    mach.mach_write_to_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_LAST, header.last_rec);
+    mach.mach_write_to_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_N_RECS, header.n_recs);
+}
+
+fn undo_page_read_header(page: []const byte) UndoPageHeader {
+    const trx_id_dul = mach.mach_read_from_8(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_TRX_ID);
+    const trx_id: trx_id_t = (@as(u64, trx_id_dul.high) << 32) | trx_id_dul.low;
+    return .{
+        .undo_type = mach.mach_read_from_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_TYPE),
+        .rseg_id = mach.mach_read_from_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_RSEG_ID),
+        .trx_id = trx_id,
+        .free_offset = mach.mach_read_from_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_FREE),
+        .first_rec = mach.mach_read_from_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_FIRST),
+        .last_rec = mach.mach_read_from_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_LAST),
+        .n_recs = mach.mach_read_from_2(page.ptr + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_N_RECS),
+    };
+}
+
+fn undo_page_init(
+    page: []byte,
+    space_id: ulint,
+    page_no: ulint,
+    undo_type: ulint,
+    rseg_id: ulint,
+    trx_id: trx_id_t,
+    prev_page_no: ulint,
+) UndoPageHeader {
+    @memset(page, 0);
+    mach.mach_write_to_4(page.ptr + fil.FIL_PAGE_OFFSET, page_no);
+    mach.mach_write_to_4(page.ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, space_id);
+    mach.mach_write_to_4(page.ptr + fil.FIL_PAGE_PREV, prev_page_no);
+    mach.mach_write_to_4(page.ptr + fil.FIL_PAGE_NEXT, fil.FIL_NULL);
+    fil.fil_page_set_type(page.ptr, fil.FIL_PAGE_UNDO_LOG);
+
+    var header = UndoPageHeader{
+        .undo_type = undo_type,
+        .rseg_id = rseg_id,
+        .trx_id = trx_id,
+        .free_offset = TRX_UNDO_PAGE_DATA_START,
+        .first_rec = 0,
+        .last_rec = 0,
+        .n_recs = 0,
+    };
+    undo_page_write_header(page, &header);
+    return header;
+}
+
+fn undo_page_append(page: []byte, header: *UndoPageHeader, rec: *const UndoRec, data_len: usize) bool {
+    if (data_len > std.math.maxInt(u16)) {
+        return false;
+    }
+    const encoded_size = rec.encodedSize();
+    const total = @as(ulint, @intCast(encoded_size + 2));
+    if (header.free_offset + total > TRX_UNDO_PAGE_DATA_END) {
+        return false;
+    }
+    const offset = header.free_offset;
+    mach.mach_write_to_2(page.ptr + offset, @as(ulint, @intCast(data_len)));
+    const written = rec.encode(page[offset + 2 ..]);
+    if (written != encoded_size) {
+        return false;
+    }
+    header.free_offset += total;
+    if (header.n_recs == 0) {
+        header.first_rec = offset;
+    }
+    header.last_rec = offset;
+    header.n_recs += 1;
+    undo_page_write_header(page, header);
+    return true;
+}
 
 /// Undo record header - minimal header for each undo record
 /// Layout: [type_cmpl:1][undo_no:compressed][table_id:8][data...]
@@ -223,6 +329,11 @@ pub const trx_undo_t = struct {
     empty: bool = true,
     records: std.ArrayListUnmanaged(types.trx_undo_record_t) = .{},
     allocator: std.mem.Allocator = std.heap.page_allocator,
+    space_id: ulint = fil.FIL_NULL,
+    rseg_id: ulint = 0,
+    first_page_no: ulint = fil.FIL_NULL,
+    last_page_no: ulint = fil.FIL_NULL,
+    last_offset: ulint = 0,
 
     /// Get the undo log as a typed pointer from trx_t's insert_undo/update_undo
     pub fn fromOpaquePtr(ptr: ?*anyopaque) ?*trx_undo_t {
@@ -261,7 +372,33 @@ pub fn trx_undo_mem_free(undo: *trx_undo_t) void {
         }
     }
     undo.records.deinit(undo.allocator);
+    trx_undo_detach_from_rseg(undo);
     undo.allocator.destroy(undo);
+}
+
+fn trx_undo_mem_free_opaque(ptr: *types.trx_undo_t) void {
+    const undo: *trx_undo_t = @ptrCast(@alignCast(ptr));
+    trx_undo_mem_free(undo);
+}
+
+fn trx_undo_list_remove(list: *std.ArrayListUnmanaged(*types.trx_undo_t), undo_ptr: *types.trx_undo_t) void {
+    var idx: usize = 0;
+    while (idx < list.items.len) : (idx += 1) {
+        if (list.items[idx] == undo_ptr) {
+            _ = list.orderedRemove(idx);
+            break;
+        }
+    }
+}
+
+fn trx_undo_detach_from_rseg(undo: *trx_undo_t) void {
+    if (undo.space_id == fil.FIL_NULL) {
+        return;
+    }
+    const rseg_ptr = rseg.trx_rseg_get_on_id(undo.rseg_id) orelse return;
+    const undo_ptr: *types.trx_undo_t = @ptrCast(undo);
+    trx_undo_list_remove(&rseg_ptr.insert_undo_list, undo_ptr);
+    trx_undo_list_remove(&rseg_ptr.update_undo_list, undo_ptr);
 }
 
 pub fn trx_undo_append_record(undo: *trx_undo_t, record: types.trx_undo_record_t) void {
@@ -277,6 +414,10 @@ pub fn trx_undo_append_record(undo: *trx_undo_t, record: types.trx_undo_record_t
     undo.records.append(undo.allocator, copy) catch @panic("trx_undo_append_record");
     undo.top_undo_no = record.undo_no;
     undo.empty = false;
+
+    if (undo.space_id != fil.FIL_NULL) {
+        trx_undo_append_record_persistent(undo, copy);
+    }
 }
 
 pub fn trx_undo_get_prev_rec(undo: *trx_undo_t) ?*types.trx_undo_record_t {
@@ -317,6 +458,104 @@ pub fn trx_undo_truncate_end(undo: *trx_undo_t, limit: undo_no_t) void {
     if (!undo.empty) {
         undo.top_undo_no = undo.records.items[undo.records.items.len - 1].undo_no;
     }
+}
+
+fn trx_undo_pick_rseg(allocator: std.mem.Allocator) ?*rseg.trx_rseg_t {
+    if (rseg.trx_sys.rsegs.len == 0) {
+        rseg.trx_sys_init(allocator);
+    }
+    if (rseg.trx_sys.rseg_list.items.len == 0) {
+        var slot: ulint = 0;
+        _ = rseg.trx_rseg_header_create(0, 0, 128, &slot);
+    }
+    if (rseg.trx_sys.rseg_list.items.len == 0) {
+        return null;
+    }
+    return rseg.trx_sys.rseg_list.items[0];
+}
+
+fn trx_undo_attach_rseg(undo: *trx_undo_t, is_insert: bool, allocator: std.mem.Allocator) void {
+    if (undo.space_id != fil.FIL_NULL) {
+        return;
+    }
+    if (fil.fil_tablespace_exists_in_mem(0) != compat.TRUE) {
+        return;
+    }
+    const rseg_ptr = trx_undo_pick_rseg(allocator) orelse return;
+    rseg.trx_rseg_set_undo_free(trx_undo_mem_free_opaque);
+    undo.space_id = rseg_ptr.space;
+    undo.rseg_id = rseg_ptr.id;
+    const undo_ptr: *types.trx_undo_t = @ptrCast(undo);
+    const rseg_alloc = rseg.trx_sys.allocator;
+    if (is_insert) {
+        rseg_ptr.insert_undo_list.append(rseg_alloc, undo_ptr) catch {};
+    } else {
+        rseg_ptr.update_undo_list.append(rseg_alloc, undo_ptr) catch {};
+    }
+}
+
+fn trx_undo_update_prev_page_next(undo: *trx_undo_t, prev_page_no: ulint, next_page_no: ulint) void {
+    var page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    if (fil.fil_read_page(undo.space_id, prev_page_no, page[0..].ptr) != fil.DB_SUCCESS) {
+        return;
+    }
+    mach.mach_write_to_4(page[0..].ptr + fil.FIL_PAGE_NEXT, next_page_no);
+    buf_mod.buf_flush_init_for_writing(page[0..].ptr, null, 0);
+    _ = fil.fil_write_page(undo.space_id, prev_page_no, page[0..].ptr);
+}
+
+fn trx_undo_alloc_page_no(undo: *trx_undo_t) ?ulint {
+    const rseg_ptr = rseg.trx_rseg_get_on_id(undo.rseg_id) orelse return null;
+    return rseg.trx_rseg_alloc_undo_page(rseg_ptr);
+}
+
+fn trx_undo_append_record_persistent(undo: *trx_undo_t, record: types.trx_undo_record_t) void {
+    const rec_type = if (record.is_insert) UndoRecType.insert else UndoRecType.update_exist;
+    var undo_rec = UndoRec{
+        .header = .{
+            .rec_type = rec_type,
+            .undo_no = record.undo_no,
+            .table_id = types.dulintZero(),
+        },
+        .trx_id = undo.trx_id,
+        .roll_ptr = record.roll_ptr,
+        .data = record.data,
+    };
+
+    var page_buf: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    var page_no = undo.last_page_no;
+    var header: UndoPageHeader = undefined;
+
+    if (page_no == fil.FIL_NULL) {
+        const new_page = trx_undo_alloc_page_no(undo) orelse return;
+        header = undo_page_init(page_buf[0..], undo.space_id, new_page, undo.type, undo.rseg_id, undo.trx_id, fil.FIL_NULL);
+        page_no = new_page;
+        if (!undo_page_append(page_buf[0..], &header, &undo_rec, record.data.len)) {
+            return;
+        }
+    } else {
+        if (fil.fil_read_page(undo.space_id, page_no, page_buf[0..].ptr) != fil.DB_SUCCESS) {
+            return;
+        }
+        header = undo_page_read_header(page_buf[0..]);
+        if (!undo_page_append(page_buf[0..], &header, &undo_rec, record.data.len)) {
+            const new_page = trx_undo_alloc_page_no(undo) orelse return;
+            trx_undo_update_prev_page_next(undo, page_no, new_page);
+            header = undo_page_init(page_buf[0..], undo.space_id, new_page, undo.type, undo.rseg_id, undo.trx_id, page_no);
+            page_no = new_page;
+            if (!undo_page_append(page_buf[0..], &header, &undo_rec, record.data.len)) {
+                return;
+            }
+        }
+    }
+
+    buf_mod.buf_flush_init_for_writing(page_buf[0..].ptr, null, 0);
+    _ = fil.fil_write_page(undo.space_id, page_no, page_buf[0..].ptr);
+    if (undo.first_page_no == fil.FIL_NULL) {
+        undo.first_page_no = page_no;
+    }
+    undo.last_page_no = page_no;
+    undo.last_offset = header.free_offset;
 }
 
 test "trx undo append, prev, pop" {
@@ -479,6 +718,7 @@ pub fn trx_undo_assign_insert(trx: *types.trx_t) *trx_undo_t {
     }
     // Create new insert undo log
     const undo = trx_undo_mem_create(0, TRX_UNDO_INSERT, trx.id, trx.allocator);
+    trx_undo_attach_rseg(undo, true, trx.allocator);
     trx.insert_undo = undo.toOpaquePtr();
     return undo;
 }
@@ -490,6 +730,7 @@ pub fn trx_undo_assign_update(trx: *types.trx_t) *trx_undo_t {
     }
     // Create new update undo log
     const undo = trx_undo_mem_create(0, TRX_UNDO_UPDATE, trx.id, trx.allocator);
+    trx_undo_attach_rseg(undo, false, trx.allocator);
     trx.update_undo = undo.toOpaquePtr();
     return undo;
 }
@@ -683,4 +924,55 @@ test "trx_undo_free_logs cleans up" {
 
     try std.testing.expect(trx.insert_undo == null);
     try std.testing.expect(trx.update_undo == null);
+}
+
+test "trx undo persists records to undo log page" {
+    const fil_sys = @import("../fil/sys.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const data_home = try std.fmt.allocPrint(std.testing.allocator, "{s}/", .{base});
+    defer std.testing.allocator.free(data_home);
+
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+
+    try std.testing.expect(fil_sys.openOrCreateSystemTablespace(data_home, "ibdata1:1M:autoextend") == compat.TRUE);
+
+    rseg.trx_sys_init(std.testing.allocator);
+    defer rseg.trx_sys_deinit();
+
+    var slot: ulint = 0;
+    _ = rseg.trx_rseg_header_create(0, 0, 128, &slot);
+
+    var trx = types.trx_t{
+        .id = 800,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    _ = trx_undo_report_row_operation(&trx, .insert, .{ .high = 0, .low = 1 }, "pk1");
+    _ = trx_undo_report_row_operation(&trx, .insert, .{ .high = 0, .low = 1 }, "pk2");
+
+    const insert_undo = trx_undo_t.fromOpaquePtr(trx.insert_undo).?;
+    try std.testing.expect(insert_undo.first_page_no != fil.FIL_NULL);
+
+    var page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    try std.testing.expectEqual(
+        fil.DB_SUCCESS,
+        fil.fil_read_page(insert_undo.space_id, insert_undo.first_page_no, page[0..].ptr),
+    );
+
+    const header = undo_page_read_header(page[0..]);
+    try std.testing.expectEqual(@as(ulint, 2), header.n_recs);
+
+    const first_off = header.first_rec;
+    const data_len = mach.mach_read_from_2(page[0..].ptr + first_off);
+    const rec_buf = page[first_off + 2 ..];
+    const rec_result = UndoRec.decode(rec_buf, data_len) orelse return error.DecodeFailed;
+    try std.testing.expectEqual(UndoRecType.insert, rec_result.rec.header.rec_type);
+    try std.testing.expectEqualStrings("pk1", rec_result.rec.data);
 }

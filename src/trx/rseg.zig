@@ -1,13 +1,16 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const types = @import("types.zig");
-const undo_mod = @import("undo.zig");
+const fil = @import("../fil/mod.zig");
+const mach = @import("../mach/mod.zig");
+const buf = @import("../buf/mod.zig");
 
 pub const module_name = "trx.rseg";
 
 pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
 pub const trx_id_t = types.trx_id_t;
+pub const byte = compat.byte;
 
 pub const FIL_NULL: ulint = compat.ULINT32_UNDEFINED;
 
@@ -22,10 +25,10 @@ pub const trx_rseg_t = struct {
     page_no: ulint = 0,
     max_size: ulint = 0,
     curr_size: ulint = 0,
-    update_undo_list: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
-    update_undo_cached: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
-    insert_undo_list: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
-    insert_undo_cached: std.ArrayListUnmanaged(*undo_mod.trx_undo_t) = .{},
+    update_undo_list: std.ArrayListUnmanaged(*types.trx_undo_t) = .{},
+    update_undo_cached: std.ArrayListUnmanaged(*types.trx_undo_t) = .{},
+    insert_undo_list: std.ArrayListUnmanaged(*types.trx_undo_t) = .{},
+    insert_undo_cached: std.ArrayListUnmanaged(*types.trx_undo_t) = .{},
     last_page_no: ulint = FIL_NULL,
     last_offset: ulint = 0,
     last_trx_no: trx_id_t = 0,
@@ -36,11 +39,24 @@ pub const trx_sys_t = struct {
     rseg_list: std.ArrayListUnmanaged(*trx_rseg_t) = .{},
     rsegs: []?*trx_rseg_t = &[_]?*trx_rseg_t{},
     rseg_history_len: ulint = 0,
-    next_rseg_page_no: ulint = 1,
+    next_rseg_page_no: ulint = 2,
     allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 pub var trx_sys: trx_sys_t = .{};
+
+pub const UndoFreeFn = *const fn (undo: *types.trx_undo_t) void;
+pub var trx_rseg_undo_free_fn: ?UndoFreeFn = null;
+
+pub fn trx_rseg_set_undo_free(func: ?UndoFreeFn) void {
+    trx_rseg_undo_free_fn = func;
+}
+
+pub const TRX_RSEG_PAGE_HDR: ulint = fil.FIL_PAGE_DATA;
+pub const TRX_RSEG_PAGE_ID: ulint = 0;
+pub const TRX_RSEG_PAGE_MAX_SIZE: ulint = 4;
+pub const TRX_RSEG_PAGE_SPACE: ulint = 8;
+pub const TRX_RSEG_PAGE_LAST_PAGE: ulint = 12;
 
 pub fn trx_sys_init(allocator: std.mem.Allocator) void {
     if (trx_sys.rsegs.len == 0) {
@@ -49,6 +65,7 @@ pub fn trx_sys_init(allocator: std.mem.Allocator) void {
             slot.* = null;
         }
         trx_sys.allocator = allocator;
+        trx_sys.next_rseg_page_no = 2;
     }
     trx_sys.rseg_list.clearRetainingCapacity();
     trx_sys.rseg_history_len = 0;
@@ -113,6 +130,9 @@ pub fn trx_rseg_header_create(
 
     const rseg = trx_rseg_mem_create(idx.?, space, zip_size, page_no);
     rseg.max_size = max_size;
+    if (fil.fil_tablespace_exists_in_mem(space) == compat.TRUE) {
+        trx_rseg_header_write_page(rseg);
+    }
     return page_no;
 }
 
@@ -130,14 +150,18 @@ pub fn trx_rseg_mem_free(rseg: *trx_rseg_t) void {
     while (rseg.update_undo_cached.items.len > 0) {
         const undo = rseg.update_undo_cached.items[rseg.update_undo_cached.items.len - 1];
         rseg.update_undo_cached.items.len -= 1;
-        undo_mod.trx_undo_mem_free(undo);
+        if (trx_rseg_undo_free_fn) |func| {
+            func(undo);
+        }
     }
     rseg.update_undo_cached.deinit(trx_sys.allocator);
 
     while (rseg.insert_undo_cached.items.len > 0) {
         const undo = rseg.insert_undo_cached.items[rseg.insert_undo_cached.items.len - 1];
         rseg.insert_undo_cached.items.len -= 1;
-        undo_mod.trx_undo_mem_free(undo);
+        if (trx_rseg_undo_free_fn) |func| {
+            func(undo);
+        }
     }
     rseg.insert_undo_cached.deinit(trx_sys.allocator);
 
@@ -160,6 +184,27 @@ fn trx_rseg_mem_create(id: ulint, space: ulint, zip_size: ulint, page_no: ulint)
     trx_sys.rseg_list.append(trx_sys.allocator, rseg) catch @panic("trx_rseg_mem_create");
     trx_sys_set_nth_rseg(id, rseg);
     return rseg;
+}
+
+pub fn trx_rseg_alloc_undo_page(rseg: *trx_rseg_t) ulint {
+    const page_no = trx_sys.next_rseg_page_no;
+    trx_sys.next_rseg_page_no += 1;
+    rseg.curr_size += 1;
+    return page_no;
+}
+
+fn trx_rseg_header_write_page(rseg: *const trx_rseg_t) void {
+    var page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    @memset(page[0..], 0);
+    mach.mach_write_to_4(page[0..].ptr + fil.FIL_PAGE_OFFSET, rseg.page_no);
+    mach.mach_write_to_4(page[0..].ptr + fil.FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, rseg.space);
+    fil.fil_page_set_type(page[0..].ptr, fil.FIL_PAGE_TYPE_TRX_SYS);
+    mach.mach_write_to_4(page[0..].ptr + TRX_RSEG_PAGE_HDR + TRX_RSEG_PAGE_ID, rseg.id);
+    mach.mach_write_to_4(page[0..].ptr + TRX_RSEG_PAGE_HDR + TRX_RSEG_PAGE_MAX_SIZE, rseg.max_size);
+    mach.mach_write_to_4(page[0..].ptr + TRX_RSEG_PAGE_HDR + TRX_RSEG_PAGE_SPACE, rseg.space);
+    mach.mach_write_to_4(page[0..].ptr + TRX_RSEG_PAGE_HDR + TRX_RSEG_PAGE_LAST_PAGE, fil.FIL_NULL);
+    buf.buf_flush_init_for_writing(page[0..].ptr, null, 0);
+    _ = fil.fil_write_page(rseg.space, rseg.page_no, page[0..].ptr);
 }
 
 pub fn trx_rseg_list_and_array_init() void {
