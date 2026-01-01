@@ -11,6 +11,7 @@ const fsp = @import("../fsp/mod.zig");
 const rec_mod = @import("../rec/mod.zig");
 const log = @import("../ut/log.zig");
 const log_mod = @import("../log/mod.zig");
+const lock_mod = @import("../lock/mod.zig");
 const os_file = @import("../os/file.zig");
 const os_thread = @import("../os/thread.zig");
 const page = @import("../page/mod.zig");
@@ -943,6 +944,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     _ = buf_mod.buf_pool_init();
     fsp.fsp_init();
     trx_sys.trx_sys_var_init();
+    lock_mod.lock_var_init();
     _ = trx_sys.trx_sys_init_at_db_start(std.heap.page_allocator);
     trx_sys.trx_sys_file_format_init();
     btr.btr_search_sys_create(128);
@@ -958,6 +960,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
 pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
     if (!cfg_started) {
+        lock_mod.lock_sys_close();
         log_mod.log_sys_close();
         buf_mod.buf_close();
         buf_mod.buf_mem_free();
@@ -972,6 +975,7 @@ pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     }
     btr.btr_search_sys_close();
     trx_sys.trx_sys_close();
+    lock_mod.lock_sys_close();
     log_mod.log_shutdown();
     fil.fil_close();
     _ = dict.dict_sys_metadata_save();
@@ -1418,14 +1422,13 @@ pub fn ib_handle_errors(
 }
 
 pub fn ib_trx_lock_table_with_retry(ib_trx: ib_trx_t, table: *CatalogTable, mode: ib_lck_mode_t) ib_err_t {
-    _ = ib_trx orelse return .DB_ERROR;
-    if (mode != .IB_LOCK_S and mode != .IB_LOCK_X) {
-        return .DB_ERROR;
-    }
+    const trx = ib_trx orelse return .DB_ERROR;
+    const inner = trx.inner_trx orelse return .DB_ERROR;
+    const internal = tableLockModeToInternal(mode) orelse return .DB_ERROR;
     if (table.id == 0) {
         return .DB_TABLE_NOT_FOUND;
     }
-    return .DB_SUCCESS;
+    return lock_mod.lock_table(inner, table.id, internal);
 }
 
 pub fn ib_update_statistics_if_needed(table: *CatalogTable) void {
@@ -2788,7 +2791,30 @@ fn cursorLockModeValid(mode: ib_lck_mode_t) bool {
 }
 
 fn tableLockModeValid(mode: ib_lck_mode_t) bool {
-    return mode == .IB_LOCK_IS or mode == .IB_LOCK_IX;
+    return mode == .IB_LOCK_IS or mode == .IB_LOCK_IX or mode == .IB_LOCK_S or mode == .IB_LOCK_X;
+}
+
+fn cursorInnerTrx(cursor: *Cursor) ?*trx_types.trx_t {
+    const trx = cursor.trx orelse return null;
+    return trx.inner_trx;
+}
+
+fn tableLockModeToInternal(mode: ib_lck_mode_t) ?lock_mod.ulint {
+    return switch (mode) {
+        .IB_LOCK_IS => lock_mod.LOCK_IS,
+        .IB_LOCK_IX => lock_mod.LOCK_IX,
+        .IB_LOCK_S => lock_mod.LOCK_S,
+        .IB_LOCK_X => lock_mod.LOCK_X,
+        else => null,
+    };
+}
+
+fn recordLockModeToInternal(mode: ib_lck_mode_t) ?lock_mod.ulint {
+    return switch (mode) {
+        .IB_LOCK_S => lock_mod.LOCK_S,
+        .IB_LOCK_X => lock_mod.LOCK_X,
+        else => null,
+    };
 }
 
 pub fn ib_cursor_open_table_using_id(table_id: ib_id_t, ib_trx: ib_trx_t, ib_crsr: *ib_crsr_t) ib_err_t {
@@ -2896,6 +2922,17 @@ pub fn ib_cursor_read_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
         return .DB_RECORD_NOT_FOUND;
     }
     const rec = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (cursor.lock_mode != .IB_LOCK_NONE) {
+        if (recordLockModeToInternal(cursor.lock_mode)) |mode| {
+            if (cursorInnerTrx(cursor)) |inner| {
+                const index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
+                const lock_err = lock_mod.lock_rec(inner, index.btr_index, rec, mode);
+                if (lock_err != .DB_SUCCESS) {
+                    return lock_err;
+                }
+            }
+        }
+    }
     if (!decodeRecToTuple(rec, tuple)) {
         return .DB_RECORD_NOT_FOUND;
     }
@@ -2913,6 +2950,16 @@ pub fn ib_cursor_insert_row(ib_crsr: ib_crsr_t, ib_tpl: ib_tpl_t) ib_err_t {
     }
 
     const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
+    if (cursor.lock_mode != .IB_LOCK_NONE) {
+        if (tableLockModeToInternal(cursor.lock_mode)) |mode| {
+            if (cursorInnerTrx(cursor)) |inner| {
+                const lock_err = lock_mod.lock_table(inner, table.id, mode);
+                if (lock_err != .DB_SUCCESS) {
+                    return lock_err;
+                }
+            }
+        }
+    }
 
     if (tableHasDuplicateKey(table, tuple, null)) {
         return .DB_DUPLICATE_KEY;
@@ -2957,6 +3004,21 @@ pub fn ib_cursor_update_row(ib_crsr: ib_crsr_t, ib_old_tpl: ib_tpl_t, ib_new_tpl
     }
     const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
     const current_rec = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (cursor.lock_mode != .IB_LOCK_NONE) {
+        if (cursorInnerTrx(cursor)) |inner| {
+            if (tableLockModeToInternal(cursor.lock_mode)) |mode| {
+                const lock_err = lock_mod.lock_table(inner, table.id, mode);
+                if (lock_err != .DB_SUCCESS) {
+                    return lock_err;
+                }
+            }
+            const index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
+            const lock_err = lock_mod.lock_rec(inner, index.btr_index, current_rec, lock_mod.LOCK_X);
+            if (lock_err != .DB_SUCCESS) {
+                return lock_err;
+            }
+        }
+    }
     const row = tupleCreateFromCatalogColumns(table, .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
     defer tupleDestroy(row);
     if (!decodeRecToTuple(current_rec, row)) {
@@ -3014,6 +3076,21 @@ pub fn ib_cursor_delete_row(ib_crsr: ib_crsr_t) ib_err_t {
     const cursor = ib_crsr orelse return .DB_ERROR;
     const table = cursorCatalogTable(cursor) orelse return .DB_TABLE_NOT_FOUND;
     const rec = cursor.position orelse return .DB_RECORD_NOT_FOUND;
+    if (cursor.lock_mode != .IB_LOCK_NONE) {
+        if (cursorInnerTrx(cursor)) |inner| {
+            if (tableLockModeToInternal(cursor.lock_mode)) |mode| {
+                const lock_err = lock_mod.lock_table(inner, table.id, mode);
+                if (lock_err != .DB_SUCCESS) {
+                    return lock_err;
+                }
+            }
+            const index = cursorActiveIndex(cursor) orelse return .DB_TABLE_NOT_FOUND;
+            const lock_err = lock_mod.lock_rec(inner, index.btr_index, rec, lock_mod.LOCK_X);
+            if (lock_err != .DB_SUCCESS) {
+                return lock_err;
+            }
+        }
+    }
     const row = tupleCreateFromCatalogColumns(table, .TPL_ROW) orelse return .DB_OUT_OF_MEMORY;
     defer tupleDestroy(row);
     if (!decodeRecToTuple(rec, row)) {
@@ -3246,7 +3323,8 @@ pub fn ib_cursor_truncate(ib_crsr: *ib_crsr_t, table_id: *ib_id_t) ib_err_t {
 }
 
 pub fn ib_table_lock(ib_trx: ib_trx_t, table_id: ib_id_t, ib_lck_mode: ib_lck_mode_t) ib_err_t {
-    _ = ib_trx orelse return .DB_ERROR;
+    const trx = ib_trx orelse return .DB_ERROR;
+    const inner = trx.inner_trx orelse return .DB_ERROR;
     if (!tableLockModeValid(ib_lck_mode)) {
         return .DB_ERROR;
     }
@@ -3255,7 +3333,8 @@ pub fn ib_table_lock(ib_trx: ib_trx_t, table_id: ib_id_t, ib_lck_mode: ib_lck_mo
     }
     for (table_registry.items) |table| {
         if (table.id == table_id) {
-            return .DB_SUCCESS;
+            const internal = tableLockModeToInternal(ib_lck_mode) orelse return .DB_ERROR;
+            return lock_mod.lock_table(inner, table_id, internal);
         }
     }
     return .DB_TABLE_NOT_FOUND;
@@ -5066,6 +5145,8 @@ test "table schema create and create table" {
 test "table lock uses catalog" {
     const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED);
     defer _ = ib_trx_rollback(trx);
+    const trx2 = ib_trx_begin(.IB_TRX_READ_COMMITTED);
+    defer _ = ib_trx_rollback(trx2);
 
     var tbl_sch: ib_tbl_sch_t = null;
     try std.testing.expectEqual(
@@ -5083,7 +5164,8 @@ test "table lock uses catalog" {
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_lock(trx, table_id, .IB_LOCK_IX));
     try std.testing.expectEqual(errors.DbErr.DB_TABLE_NOT_FOUND, ib_table_lock(trx, 0, .IB_LOCK_IX));
-    try std.testing.expectEqual(errors.DbErr.DB_ERROR, ib_table_lock(trx, table_id, .IB_LOCK_S));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_lock(trx, table_id, .IB_LOCK_S));
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT, ib_table_lock(trx2, table_id, .IB_LOCK_S));
 
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_drop(trx, "db/lock1"));
     ib_table_schema_delete(tbl_sch);
