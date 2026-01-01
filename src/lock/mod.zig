@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const dict = @import("../dict/mod.zig");
+const page = @import("../page/mod.zig");
 const trx_types = @import("../trx/types.zig");
 const errors = @import("../ut/errors.zig");
 
@@ -183,6 +184,15 @@ fn lock_rec_queue_remove(sys: *lock_sys_t, lock: *lock_t) void {
     }
 }
 
+fn lock_rec_key_from(index: *dict.dict_index_t, rec: *page.rec_t) ?LockRecKey {
+    const page_ptr = rec.page orelse return null;
+    return .{
+        .space = index.space,
+        .page_no = page_ptr.page_no,
+        .rec_offset = rec.rec_page_offset,
+    };
+}
+
 pub fn lock_var_init() void {
     if (lock_sys != null) {
         return;
@@ -348,6 +358,98 @@ pub fn lock_table_release(trx: *trx_types.trx_t, table_id: u64) void {
     }
 }
 
+fn lock_rec_create(sys: *lock_sys_t, trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t, type_mode: ulint) ?*lock_t {
+    const key = lock_rec_key_from(index, rec) orelse return null;
+    const lock = sys.allocator.create(lock_t) catch return null;
+    lock.* = .{
+        .trx = trx,
+        .type_mode = type_mode | LOCK_REC,
+        .index = index,
+        .space = key.space,
+        .page_no = key.page_no,
+        .rec_bit = key.rec_offset,
+    };
+    lock_rec_queue_add(sys, lock);
+    lock_trx_list_add(sys, trx, lock);
+    return lock;
+}
+
+fn lock_rec_remove(sys: *lock_sys_t, lock: *lock_t) void {
+    lock_rec_queue_remove(sys, lock);
+    if (lock.trx) |trx| {
+        lock_trx_list_remove(sys, trx, lock);
+    }
+    sys.allocator.destroy(lock);
+}
+
+fn lock_rec_has(sys: *lock_sys_t, trx: *trx_types.trx_t, key: LockRecKey, mode: ulint) bool {
+    const queue = sys.rec_hash.getPtr(key) orelse return false;
+    var current = queue.tail;
+    while (current) |lock| {
+        if (lock.trx == trx and lock_mode_stronger_or_eq(lock_get_mode(lock), mode) == compat.TRUE) {
+            return true;
+        }
+        current = lock.prev;
+    }
+    return false;
+}
+
+fn lock_rec_other_has_incompatible(
+    sys: *lock_sys_t,
+    trx: *trx_types.trx_t,
+    key: LockRecKey,
+    mode: ulint,
+    include_wait: bool,
+) ?*lock_t {
+    const queue = sys.rec_hash.getPtr(key) orelse return null;
+    var current = queue.tail;
+    while (current) |lock| {
+        if (lock.trx != trx and lock_mode_compatible(lock_get_mode(lock), mode) == compat.FALSE) {
+            if (include_wait or lock_is_wait(lock) == compat.FALSE) {
+                return lock;
+            }
+        }
+        current = lock.prev;
+    }
+    return null;
+}
+
+pub fn lock_rec(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t, mode: ulint) errors.DbErr {
+    if (mode >= LOCK_NUM) {
+        return .DB_ERROR;
+    }
+    const key = lock_rec_key_from(index, rec) orelse return .DB_ERROR;
+    lock_sys_create(0);
+    const sys = lock_sys orelse return .DB_ERROR;
+
+    if (lock_rec_has(sys, trx, key, mode)) {
+        return .DB_SUCCESS;
+    }
+
+    if (lock_rec_other_has_incompatible(sys, trx, key, mode, true)) |conflict| {
+        const lock = lock_rec_create(sys, trx, index, rec, mode | LOCK_WAIT) orelse return .DB_OUT_OF_MEMORY;
+        lock.wait_for = conflict;
+        return .DB_LOCK_WAIT;
+    }
+
+    _ = lock_rec_create(sys, trx, index, rec, mode) orelse return .DB_OUT_OF_MEMORY;
+    return .DB_SUCCESS;
+}
+
+pub fn lock_rec_release(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *page.rec_t) void {
+    const key = lock_rec_key_from(index, rec) orelse return;
+    const sys = lock_sys orelse return;
+    const queue = sys.rec_hash.getPtr(key) orelse return;
+    var current = queue.head;
+    while (current) |lock| {
+        const next = lock.next;
+        if (lock.trx == trx) {
+            lock_rec_remove(sys, lock);
+        }
+        current = next;
+    }
+}
+
 pub fn lock_queue_iterator_reset(iter: *lock_queue_iterator_t, lock: *const lock_t, bit_no: ulint) void {
     iter.current_lock = lock;
 
@@ -499,5 +601,26 @@ test "table lock request and release" {
 
     const sys = lock_sys orelse return error.OutOfMemory;
     try std.testing.expect(sys.table_hash.count() == 0);
+    lock_sys_close();
+}
+
+test "record lock request and release" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+    var index = dict.dict_index_t{ .space = 3 };
+    var page_obj = page.page_t{ .page_no = 7 };
+    var rec = page.rec_t{ .page = &page_obj, .rec_page_offset = 128 };
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_rec(&trx1, &index, &rec, LOCK_X));
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT, lock_rec(&trx2, &index, &rec, LOCK_S));
+
+    lock_rec_release(&trx1, &index, &rec);
+    lock_rec_release(&trx2, &index, &rec);
+
+    const sys = lock_sys orelse return error.OutOfMemory;
+    try std.testing.expect(sys.rec_hash.count() == 0);
     lock_sys_close();
 }
