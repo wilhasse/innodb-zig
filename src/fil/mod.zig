@@ -73,6 +73,11 @@ pub var fil_n_pending_log_flushes: ulint = 0;
 pub var fil_n_pending_tablespace_flushes: ulint = 0;
 
 pub var fil_path_to_client_datadir: []const u8 = ".";
+pub var fil_doublewrite_handler: ?*const fn (space_id: ulint, page_no: ulint, buf: [*]const byte) ulint = null;
+
+pub fn fil_set_doublewrite_handler(handler: ?*const fn (space_id: ulint, page_no: ulint, buf: [*]const byte) ulint) void {
+    fil_doublewrite_handler = handler;
+}
 
 fn fil_make_ibd_name(tablename: []const u8) ?[]u8 {
     const allocator = std.heap.page_allocator;
@@ -679,7 +684,7 @@ pub fn fil_read_page(space_id: ulint, page_no: ulint, buf: [*]byte) ulint {
     return DB_SUCCESS;
 }
 
-pub fn fil_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint {
+pub fn fil_write_page_raw(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint {
     const space = findSpace(space_id) orelse return DB_TABLESPACE_DELETED;
     if (space.deleted) {
         return DB_TABLESPACE_DELETED;
@@ -702,6 +707,13 @@ pub fn fil_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint
         return DB_ERROR;
     }
     return DB_SUCCESS;
+}
+
+pub fn fil_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint {
+    if (fil_doublewrite_handler) |handler| {
+        return handler(space_id, page_no, buf);
+    }
+    return fil_write_page_raw(space_id, page_no, buf);
 }
 
 pub fn fil_aio_wait(segment: ulint) void {

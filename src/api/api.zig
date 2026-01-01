@@ -958,6 +958,14 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     trx_sys.trx_sys_var_init();
     lock_mod.lock_var_init();
     _ = trx_sys.trx_sys_init_at_db_start(std.heap.page_allocator);
+    const doublewrite = if (cfgFind("doublewrite")) |cfg_var| cfg_var.value.IB_CFG_IBOOL else compat.IB_TRUE;
+    trx_sys.trx_doublewrite_set_enabled(doublewrite);
+    if (doublewrite == compat.IB_TRUE) {
+        trx_sys.trx_doublewrite_init_default(std.heap.page_allocator);
+        fil.fil_set_doublewrite_handler(trx_sys.trx_doublewrite_write_page);
+    } else {
+        fil.fil_set_doublewrite_handler(null);
+    }
     trx_sys.trx_sys_file_format_init();
     btr.btr_search_sys_create(128);
     dict.dict_var_init();
@@ -971,6 +979,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
 
 pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
+    fil.fil_set_doublewrite_handler(null);
     if (!cfg_started) {
         lock_mod.lock_sys_close();
         log_mod.log_sys_close();

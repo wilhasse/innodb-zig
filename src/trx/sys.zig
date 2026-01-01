@@ -2,13 +2,14 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const types = @import("types.zig");
 const rseg = @import("rseg.zig");
+const fil = @import("../fil/mod.zig");
 
 pub const module_name = "trx.sys";
 
 pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
 
-pub const TRX_SYS_DOUBLEWRITE_BLOCK_SIZE: ulint = @import("../fsp/mod.zig").FSP_EXTENT_SIZE;
+pub const TRX_SYS_DOUBLEWRITE_BLOCK_SIZE: ulint = @as(ulint, 1) << (20 - compat.UNIV_PAGE_SIZE_SHIFT);
 pub const DICT_TF_FORMAT_51: ulint = 0;
 
 pub const file_format_t = struct {
@@ -33,6 +34,7 @@ pub var trx_doublewrite: ?*trx_doublewrite_t = null;
 pub var trx_doublewrite_must_reset_space_ids: ibool = compat.FALSE;
 pub var trx_doublewrite_buf_is_being_created: ibool = compat.FALSE;
 pub var trx_sys_multiple_tablespace_format: ibool = compat.FALSE;
+pub var trx_doublewrite_enabled: ibool = compat.TRUE;
 
 const file_format_name_map = [_][]const u8{
     "Antelope",
@@ -80,6 +82,7 @@ pub fn trx_sys_var_init() void {
     trx_doublewrite_must_reset_space_ids = compat.FALSE;
     trx_sys_multiple_tablespace_format = compat.FALSE;
     trx_doublewrite_buf_is_being_created = compat.FALSE;
+    trx_doublewrite_enabled = compat.TRUE;
     file_format_max = .{};
 }
 
@@ -87,6 +90,16 @@ pub fn trx_doublewrite_init(block1: ulint, block2: ulint, allocator: std.mem.All
     const dw = allocator.create(trx_doublewrite_t) catch @panic("trx_doublewrite_init");
     dw.* = .{ .first_free = 0, .block1 = block1, .block2 = block2 };
     trx_doublewrite = dw;
+}
+
+pub fn trx_doublewrite_init_default(allocator: std.mem.Allocator) void {
+    const block1 = TRX_SYS_DOUBLEWRITE_BLOCK_SIZE;
+    const block2 = TRX_SYS_DOUBLEWRITE_BLOCK_SIZE * 2;
+    trx_doublewrite_init(block1, block2, allocator);
+}
+
+pub fn trx_doublewrite_set_enabled(enabled: ibool) void {
+    trx_doublewrite_enabled = enabled;
 }
 
 pub fn trx_doublewrite_page_inside(page_no: ulint) bool {
@@ -98,6 +111,30 @@ pub fn trx_doublewrite_page_inside(page_no: ulint) bool {
         return true;
     }
     return false;
+}
+
+pub fn trx_doublewrite_write_page(space_id: ulint, page_no: ulint, buf: [*]const byte) ulint {
+    if (trx_doublewrite_enabled == compat.FALSE) {
+        return fil.fil_write_page_raw(space_id, page_no, buf);
+    }
+    const dw = trx_doublewrite orelse return fil.fil_write_page_raw(space_id, page_no, buf);
+    if (space_id == 0 and trx_doublewrite_page_inside(page_no)) {
+        return fil.fil_write_page_raw(space_id, page_no, buf);
+    }
+    const max_slots = TRX_SYS_DOUBLEWRITE_BLOCK_SIZE * 2;
+    var slot = dw.first_free;
+    if (slot >= max_slots) {
+        slot = 0;
+    }
+    const target_page = if (slot < TRX_SYS_DOUBLEWRITE_BLOCK_SIZE)
+        dw.block1 + slot
+    else
+        dw.block2 + (slot - TRX_SYS_DOUBLEWRITE_BLOCK_SIZE);
+    if (fil.fil_write_page_raw(0, target_page, buf) != fil.DB_SUCCESS) {
+        return fil.DB_ERROR;
+    }
+    dw.first_free = (slot + 1) % max_slots;
+    return fil.fil_write_page_raw(space_id, page_no, buf);
 }
 
 pub fn trx_sys_mark_upgraded_to_multiple_tablespaces() void {
