@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const fil = @import("../fil/mod.zig");
+const log_mod = @import("../log/mod.zig");
 
 pub const module_name = "buf";
 
@@ -703,6 +704,7 @@ pub fn buf_read_page(space: ulint, zip_size: ulint, offset: ulint) ibool {
         return compat.FALSE;
     }
     block.page.dirty = compat.FALSE;
+    _ = log_mod.recv_apply_log_recs(space, offset, block.frame.ptr);
     return compat.TRUE;
 }
 
@@ -814,4 +816,59 @@ test "buf LRU stubs" {
 test "buf read stubs" {
     try std.testing.expectEqual(compat.FALSE, buf_read_page(0, 0, 0));
     try std.testing.expectEqual(@as(ulint, 0), buf_read_ahead_linear(0, 0, 0));
+}
+
+test "buf read applies recv log lsn" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const prev_dir = fil.fil_path_to_client_datadir;
+    fil.fil_path_to_client_datadir = base;
+    defer fil.fil_path_to_client_datadir = prev_dir;
+
+    log_mod.log_var_init();
+    log_mod.recv_sys_var_init();
+    defer log_mod.recv_sys_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_mod.log_sys_init(base, 1, 4096, 0));
+    defer log_mod.log_sys_close();
+
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+
+    var space_id: ulint = 0;
+    const create_err = fil.fil_create_new_single_table_tablespace(&space_id, "redo_apply", compat.FALSE, 0, 4);
+    try std.testing.expectEqual(fil.DB_SUCCESS, create_err);
+
+    var page_buf: [compat.UNIV_PAGE_SIZE]u8 = [_]u8{0} ** compat.UNIV_PAGE_SIZE;
+    try std.testing.expectEqual(fil.DB_SUCCESS, fil.fil_write_page(space_id, 0, page_buf[0..].ptr));
+
+    const lsn: u64 = 0x0102030405060708;
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], lsn, .big);
+    const rec = log_mod.RedoRecord{
+        .type_ = log_mod.LOG_REC_PAGE_LSN,
+        .space = @as(u32, @intCast(space_id)),
+        .page_no = 0,
+        .payload = payload[0..],
+    };
+    var rec_buf: [64]u8 = undefined;
+    const rec_len = try log_mod.redo_record_encode(rec_buf[0..], rec);
+    _ = log_mod.log_append_bytes(rec_buf[0..rec_len]) orelse return error.UnexpectedNull;
+
+    log_mod.recv_sys_create();
+    log_mod.recv_sys_init(1024);
+    defer log_mod.recv_sys_mem_free();
+    try std.testing.expectEqual(compat.TRUE, log_mod.recv_scan_log_recs(1024));
+
+    try std.testing.expectEqual(compat.TRUE, buf_read_page(space_id, 0, 0));
+    var mtr = mtr_t{};
+    const block = buf_page_get_gen(space_id, 0, 0, 0, null, BUF_GET_IF_IN_POOL, "", 0, &mtr) orelse return error.UnexpectedNull;
+    const page_lsn = std.mem.readInt(u64, block.frame[fil.FIL_PAGE_LSN .. fil.FIL_PAGE_LSN + 8], .big);
+    try std.testing.expectEqual(lsn, page_lsn);
+    try std.testing.expectEqual(@as(ulint, 0), log_mod.recv_sys.?.n_addrs);
+
+    buf_mem_free();
 }

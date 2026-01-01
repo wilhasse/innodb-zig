@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const ha = @import("../ha/mod.zig");
 const os_file = @import("../os/file.zig");
+const fil = @import("../fil/mod.zig");
 
 pub const module_name = "log";
 
@@ -31,6 +32,7 @@ const LOG_HDR_FLUSHED_LSN_OFF: usize = 24;
 const LOG_HDR_CLEAN_SHUTDOWN_OFF: usize = 32;
 
 const REDO_RECORD_HEADER_SIZE: usize = 1 + 4 + 4 + 4;
+pub const LOG_REC_PAGE_LSN: u8 = 1;
 
 const LogError = error{
     InvalidHeader,
@@ -770,6 +772,58 @@ pub fn recv_scan_log_recs(available_memory: ulint) ibool {
     sys.apply_log_recs = compat.TRUE;
     recv_recovery_on = compat.TRUE;
     recv_needed_recovery = compat.TRUE;
+    return compat.TRUE;
+}
+
+fn recv_addr_remove(sys: *recv_sys_t, addr: *recv_addr_t) void {
+    const hash = sys.addr_hash orelse return;
+    const fold = recv_calc_fold(addr.space, addr.page_no);
+    _ = ha.ha_search_and_delete_if_found(hash, fold, addr);
+    if (sys.n_addrs > 0) {
+        sys.n_addrs -= 1;
+    }
+    recv_addr_free(addr);
+}
+
+fn page_set_lsn(page: [*]byte, lsn: ib_uint64_t) void {
+    const slice = page[fil.FIL_PAGE_LSN .. fil.FIL_PAGE_LSN + 8];
+    std.mem.writeInt(u64, slice, lsn, .big);
+}
+
+pub fn recv_apply_log_recs(space: ulint, page_no: ulint, page: [*]byte) ibool {
+    const sys = recv_sys orelse return compat.FALSE;
+    if (sys.apply_log_recs == compat.FALSE) {
+        return compat.FALSE;
+    }
+    const hash = sys.addr_hash orelse return compat.FALSE;
+    const fold = recv_calc_fold(space, page_no);
+    const data = ha.ha_search_and_get_data(hash, fold) orelse return compat.FALSE;
+    const addr: *recv_addr_t = @ptrCast(@alignCast(data));
+
+    var rec_opt = addr.rec_list_head;
+    while (rec_opt) |rec| {
+        var lsn_to_apply = rec.end_lsn;
+        if (rec.type_ == LOG_REC_PAGE_LSN) {
+            if (rec.payload) |payload| {
+                if (payload.len >= 8) {
+                    lsn_to_apply = std.mem.readInt(u64, payload[0..8], .big);
+                }
+            }
+        }
+        page_set_lsn(page, lsn_to_apply);
+        if (lsn_to_apply > recv_max_page_lsn) {
+            recv_max_page_lsn = lsn_to_apply;
+        }
+        rec_opt = rec.next;
+    }
+
+    addr.state = .RECV_PROCESSED;
+    recv_addr_remove(sys, addr);
+
+    if (sys.n_addrs == 0) {
+        recv_recovery_on = compat.FALSE;
+        recv_needed_recovery = compat.FALSE;
+    }
     return compat.TRUE;
 }
 
