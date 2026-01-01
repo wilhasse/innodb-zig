@@ -280,12 +280,72 @@ fn log_write_bytes(sys: *log_t, lsn: ib_uint64_t, data: []const u8) !void {
     }
 }
 
+fn log_persist_header(sys: *log_t, clean_shutdown: bool) !void {
+    const header = LogHeader{
+        .start_lsn = sys.first_header_lsn,
+        .checkpoint_lsn = sys.checkpoint_lsn,
+        .flushed_lsn = sys.flushed_lsn,
+        .clean_shutdown = clean_shutdown,
+    };
+    for (sys.files.items) |*file| {
+        try log_write_header(&file.handle, header);
+    }
+}
+
+fn log_flush_sys(sys: *log_t) !void {
+    if (sys.log_buf == null or sys.log_buf_used == 0) {
+        return;
+    }
+    const buf = sys.log_buf.?;
+    try log_write_bytes(sys, sys.log_buf_lsn, buf[0..sys.log_buf_used]);
+    sys.flushed_lsn = sys.log_buf_lsn + @as(ib_uint64_t, @intCast(sys.log_buf_used));
+    sys.log_buf_used = 0;
+    sys.log_buf_lsn = sys.flushed_lsn;
+    try log_persist_header(sys, false);
+}
+
+pub fn log_flush() ibool {
+    const sys = log_sys orelse return compat.FALSE;
+    log_flush_sys(sys) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
 pub fn log_append_bytes(data: []const u8) ?ib_uint64_t {
     const sys = log_sys orelse return null;
     const start_lsn = sys.current_lsn;
-    log_write_bytes(sys, start_lsn, data) catch return null;
-    sys.current_lsn = start_lsn + @as(ib_uint64_t, @intCast(data.len));
-    sys.flushed_lsn = sys.current_lsn;
+    if (sys.log_buf == null or sys.log_buf.?.len == 0) {
+        log_write_bytes(sys, start_lsn, data) catch return null;
+        sys.current_lsn = start_lsn + @as(ib_uint64_t, @intCast(data.len));
+        sys.flushed_lsn = sys.current_lsn;
+        log_persist_header(sys, false) catch return null;
+        return start_lsn;
+    }
+
+    const buf = sys.log_buf.?;
+    if (data.len > buf.len) {
+        log_flush_sys(sys) catch return null;
+        log_write_bytes(sys, start_lsn, data) catch return null;
+        sys.current_lsn = start_lsn + @as(ib_uint64_t, @intCast(data.len));
+        sys.flushed_lsn = sys.current_lsn;
+        log_persist_header(sys, false) catch return null;
+        return start_lsn;
+    }
+
+    if (sys.log_buf_used == 0) {
+        sys.log_buf_lsn = start_lsn;
+    }
+    if (sys.log_buf_used + data.len > buf.len) {
+        log_flush_sys(sys) catch return null;
+        sys.log_buf_lsn = sys.current_lsn;
+    }
+
+    std.mem.copyForwards(u8, buf[sys.log_buf_used .. sys.log_buf_used + data.len], data);
+    sys.log_buf_used += data.len;
+    sys.current_lsn += @as(ib_uint64_t, @intCast(data.len));
+
+    if (sys.log_buf_used >= buf.len / LOG_BUF_FLUSH_RATIO) {
+        log_flush_sys(sys) catch return null;
+    }
     return start_lsn;
 }
 
@@ -636,6 +696,31 @@ test "log append wraps across files" {
     const read1 = try handle1.readAt(buf1[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
     try std.testing.expectEqual(@as(usize, 8), read1);
     try std.testing.expect(std.mem.eql(u8, buf1[0..], payload[16..24]));
+}
+
+test "log buffer flush persists flushed lsn" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 64));
+    try std.testing.expect(log_sys.?.log_buf != null);
+
+    const payload = "buffered";
+    _ = log_append_bytes(payload) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(ib_uint64_t, @intCast(payload.len)), log_sys.?.current_lsn);
+
+    try std.testing.expectEqual(compat.TRUE, log_flush());
+    const flushed = log_sys.?.flushed_lsn;
+    log_sys_close();
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 64));
+    try std.testing.expectEqual(flushed, log_sys.?.flushed_lsn);
+    log_sys_close();
 }
 
 test "log_calc_where_lsn_is positions lsn" {
