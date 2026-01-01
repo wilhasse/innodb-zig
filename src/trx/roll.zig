@@ -189,7 +189,8 @@ pub fn trx_roll_try_truncate(trx: *trx_t) void {
             limit = dulintAdd(biggest, 1);
         }
     }
-    _ = limit;
+    // TODO: limit should be used for actual undo processing
+    _ = &limit;
 }
 
 pub fn trx_undo_rec_reserve(trx: *trx_t, undo_no: undo_no_t) bool {
@@ -348,7 +349,7 @@ pub fn trx_rollback_step(thr: *que.que_thr_t) ?*que.que_thr_t {
 }
 
 pub fn trx_roll_graph_build(trx: *trx_t) *que.que_t {
-    var heap = mem.mem_heap_create_func(512, mem.MEM_HEAP_DYNAMIC) orelse @panic("trx_roll_graph_build");
+    const heap = mem.mem_heap_create_func(512, mem.MEM_HEAP_DYNAMIC) orelse @panic("trx_roll_graph_build");
     const fork = que.que_fork_create(null, null, que.QUE_FORK_ROLLBACK, heap.allocator);
     fork.trx = trx;
     _ = que.que_thr_create(fork, heap.allocator);
@@ -356,8 +357,6 @@ pub fn trx_roll_graph_build(trx: *trx_t) *que.que_t {
 }
 
 pub fn trx_rollback(trx: *trx_t, sig: *trx_sig_t, next_thr: ?*?*que.que_thr_t) void {
-    _ = next_thr;
-
     if (sig.type == types.TRX_SIG_TOTAL_ROLLBACK) {
         trx.roll_limit = types.dulintZero();
     } else if (sig.type == types.TRX_SIG_ROLLBACK_TO_SAVEPT) {

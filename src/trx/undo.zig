@@ -68,7 +68,7 @@ pub const UndoRecHeader = struct {
 
         // Encode type_cmpl byte: type | (cmpl_info * 16) | extern_flag
         var type_cmpl: byte = @intFromEnum(self.rec_type);
-        type_cmpl |= @as(byte, self.cmpl_info) * TRX_UNDO_CMPL_INFO_MULT;
+        type_cmpl |= (@as(byte, self.cmpl_info) << 4); // cmpl_info * 16
         if (self.updated_extern) {
             type_cmpl |= TRX_UNDO_UPD_EXTERN;
         }

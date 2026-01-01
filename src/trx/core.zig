@@ -81,7 +81,7 @@ pub fn trx_free(trx: *types.trx_t) void {
 test "trx create/start/commit lifecycle" {
     trx_var_init();
     var sess = que.sess_t{};
-    var trx = trx_allocate_for_client(&sess, std.testing.allocator);
+    const trx = trx_allocate_for_client(&sess, std.testing.allocator);
     defer trx_free(trx);
 
     try std.testing.expect(trx.conc_state == .not_started);
@@ -96,7 +96,7 @@ test "trx create/start/commit lifecycle" {
 
 test "trx detailed error set" {
     var sess = que.sess_t{};
-    var trx = trx_allocate_for_client(&sess, std.testing.allocator);
+    const trx = trx_allocate_for_client(&sess, std.testing.allocator);
     defer trx_free(trx);
     trx_set_detailed_error(trx, "bad");
     try std.testing.expectEqual(@as(u8, 'b'), trx.detailed_error[0]);
