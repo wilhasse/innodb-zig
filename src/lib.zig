@@ -46,6 +46,7 @@ comptime {
         _ = @import("tests/ib_mt_stress.zig");
         _ = @import("tests/ib_mt_t1.zig");
         _ = @import("tests/ib_mt_t2.zig");
+        _ = @import("tests/ib_mvcc.zig");
         _ = @import("tests/ib_perf1.zig");
         _ = @import("tests/ib_recover.zig");
         _ = @import("tests/ib_restart_persist.zig");
@@ -54,6 +55,7 @@ comptime {
         _ = @import("tests/ib_simple_bulk.zig");
         _ = @import("tests/ib_shared_storage.zig");
         _ = @import("tests/ib_status.zig");
+        _ = @import("tests/ib_storage_foundation.zig");
         _ = @import("tests/ib_sys_boot.zig");
         _ = @import("tests/ib_dict_restart.zig");
         _ = @import("tests/ib_sys_metadata.zig");
