@@ -42,17 +42,63 @@ pub var ibuf_use: ibuf_use_t = .IBUF_USE_INSERT;
 pub var ibuf: ?*ibuf_t = null;
 pub var ibuf_flush_count: ulint = 0;
 
-pub fn ibuf_init_at_db_start() void {}
+const FreeBitsKey = struct {
+    space: ulint,
+    page_no: ulint,
+};
+
+var ibuf_free_bits: std.AutoHashMap(FreeBitsKey, u8) = undefined;
+var ibuf_free_bits_inited = false;
+
+fn ibuf_free_bits_map() *std.AutoHashMap(FreeBitsKey, u8) {
+    if (!ibuf_free_bits_inited) {
+        ibuf_free_bits = std.AutoHashMap(FreeBitsKey, u8).init(std.heap.page_allocator);
+        ibuf_free_bits_inited = true;
+    }
+    return &ibuf_free_bits;
+}
+
+fn ibuf_free_bits_get(space: ulint, page_no: ulint) u8 {
+    if (!ibuf_free_bits_inited) {
+        return 0;
+    }
+    return ibuf_free_bits.get(.{ .space = space, .page_no = page_no }) orelse 0;
+}
+
+fn ibuf_free_bits_set(space: ulint, page_no: ulint, bits: u8) void {
+    const map = ibuf_free_bits_map();
+    _ = map.put(.{ .space = space, .page_no = page_no }, bits) catch {};
+}
+
+fn ibuf_free_bits_clear() void {
+    if (ibuf_free_bits_inited) {
+        ibuf_free_bits.clearAndFree();
+    }
+}
+
+fn ibuf_ensure() *ibuf_t {
+    if (ibuf == null) {
+        const ptr = std.heap.page_allocator.create(ibuf_t) catch @panic("ibuf_ensure");
+        ptr.* = .{};
+        ibuf = ptr;
+    }
+    return ibuf.?;
+}
+
+pub fn ibuf_init_at_db_start() void {
+    _ = ibuf_free_bits_map();
+    _ = ibuf_ensure();
+}
 
 pub fn ibuf_update_max_tablespace_id() void {}
 
 pub fn ibuf_bitmap_page_init(block: *buf_block_t, mtr: *mtr_t) void {
-    _ = block;
+    ibuf_free_bits_set(block.page.space, block.page.page_no, 0);
     _ = mtr;
 }
 
 pub fn ibuf_reset_free_bits(block: *buf_block_t) void {
-    _ = block;
+    ibuf_free_bits_set(block.page.space, block.page.page_no, 0);
 }
 
 pub fn ibuf_update_free_bits_if_full(
@@ -60,20 +106,21 @@ pub fn ibuf_update_free_bits_if_full(
     max_ins_size: ulint,
     increase: ulint,
 ) void {
-    _ = block;
-    _ = max_ins_size;
-    _ = increase;
+    const current = ibuf_free_bits_get(block.page.space, block.page.page_no);
+    if (current == 0 and increase > 0) {
+        const bits = ibuf_index_page_calc_free_bits(block.zip_size, max_ins_size + increase);
+        ibuf_free_bits_set(block.page.space, block.page.page_no, @intCast(bits));
+    }
 }
 
 pub fn ibuf_update_free_bits_low(block: *const buf_block_t, max_ins_size: ulint, mtr: *mtr_t) void {
-    _ = block;
-    _ = max_ins_size;
+    const bits = ibuf_index_page_calc_free_bits(block.zip_size, max_ins_size);
+    ibuf_free_bits_set(block.page.space, block.page.page_no, @intCast(bits));
     _ = mtr;
 }
 
 pub fn ibuf_update_free_bits_zip(block: *buf_block_t, mtr: *mtr_t) void {
-    _ = block;
-    _ = mtr;
+    ibuf_update_free_bits_low(block, compat.UNIV_PAGE_SIZE, mtr);
 }
 
 pub fn ibuf_update_free_bits_for_two_pages_low(
@@ -83,9 +130,8 @@ pub fn ibuf_update_free_bits_for_two_pages_low(
     mtr: *mtr_t,
 ) void {
     _ = zip_size;
-    _ = block1;
-    _ = block2;
-    _ = mtr;
+    ibuf_update_free_bits_low(block1, compat.UNIV_PAGE_SIZE, mtr);
+    ibuf_update_free_bits_low(block2, compat.UNIV_PAGE_SIZE, mtr);
 }
 
 pub fn ibuf_should_try(index: *dict.dict_index_t, ignore_sec_unique: ulint) ibool {
@@ -103,6 +149,14 @@ pub fn ibuf_should_try(index: *dict.dict_index_t, ignore_sec_unique: ulint) iboo
 
 pub fn ibuf_inside() ibool {
     return compat.FALSE;
+}
+
+pub fn ibuf_merge_or_delete_for_page(space: ulint, page_no: ulint, merged_recs: ulint) ibool {
+    const state = ibuf_ensure();
+    state.n_merges += 1;
+    state.n_merged_recs += merged_recs;
+    ibuf_free_bits_set(space, page_no, 0);
+    return compat.TRUE;
 }
 
 pub fn ibuf_bitmap_page(zip_size: ulint, page_no: ulint) ibool {
@@ -195,4 +249,41 @@ test "ibuf bitmap and free space helpers" {
     try std.testing.expect(ibuf_index_page_calc_free_bits(0, denom * 4) == 3);
     try std.testing.expect(ibuf_index_page_calc_free_from_bits(0, 2) == 2 * denom);
     try std.testing.expect(ibuf_index_page_calc_free_from_bits(0, 3) == 4 * denom);
+}
+
+test "ibuf free bits tracking and merge" {
+    ibuf_free_bits_clear();
+    ibuf_free_bits_inited = false;
+    ibuf = null;
+
+    const allocator = std.testing.allocator;
+    const frame = try allocator.alloc(byte, compat.UNIV_PAGE_SIZE);
+    defer allocator.free(frame);
+
+    var block = buf_block_t{
+        .frame = frame,
+        .page = .{ .space = 1, .page_no = 5 },
+        .zip_size = 0,
+    };
+    var mtr = mtr_t{};
+
+    ibuf_bitmap_page_init(&block, &mtr);
+    try std.testing.expectEqual(@as(u8, 0), ibuf_free_bits_get(1, 5));
+
+    const expected = ibuf_index_page_calc_free_bits(0, compat.UNIV_PAGE_SIZE / 2);
+    ibuf_update_free_bits_low(&block, compat.UNIV_PAGE_SIZE / 2, &mtr);
+    try std.testing.expectEqual(@as(u8, @intCast(expected)), ibuf_free_bits_get(1, 5));
+
+    ibuf_reset_free_bits(&block);
+    try std.testing.expectEqual(@as(u8, 0), ibuf_free_bits_get(1, 5));
+    ibuf_update_free_bits_if_full(&block, 0, compat.UNIV_PAGE_SIZE);
+    try std.testing.expect(ibuf_free_bits_get(1, 5) > 0);
+
+    const state = ibuf_ensure();
+    state.n_merges = 0;
+    state.n_merged_recs = 0;
+    try std.testing.expectEqual(compat.TRUE, ibuf_merge_or_delete_for_page(1, 5, 7));
+    try std.testing.expectEqual(@as(ulint, 1), state.n_merges);
+    try std.testing.expectEqual(@as(ulint, 7), state.n_merged_recs);
+    try std.testing.expectEqual(@as(u8, 0), ibuf_free_bits_get(1, 5));
 }
