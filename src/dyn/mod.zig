@@ -319,7 +319,7 @@ test "dyn push string spans blocks" {
     defer dyn_array_free(&arr);
 
     var payload: [DYN_ARRAY_DATA_SIZE * 2 + 10]byte = undefined;
-    for (payload, 0..) |*b, idx| {
+    for (payload[0..], 0..) |*b, idx| {
         b.* = @as(byte, @intCast(idx % 251));
     }
 

@@ -8,6 +8,7 @@ pub const module_name = "trx.sys";
 
 pub const ulint = compat.ulint;
 pub const ibool = compat.ibool;
+pub const byte = compat.byte;
 
 pub const TRX_SYS_DOUBLEWRITE_BLOCK_SIZE: ulint = @as(ulint, 1) << (20 - compat.UNIV_PAGE_SIZE_SHIFT);
 pub const DICT_TF_FORMAT_51: ulint = 0;

@@ -1270,7 +1270,7 @@ test "log writer thread flushes buffer" {
     try std.testing.expectEqual(compat.TRUE, log_writer_start(10_000));
     defer log_writer_stop();
 
-    std.time.sleep(30 * std.time.ns_per_ms);
+    std.Thread.sleep(30 * std.time.ns_per_ms);
     try std.testing.expect(log_sys.?.log_buf_used == 0);
 }
 

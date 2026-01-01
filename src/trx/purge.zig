@@ -15,18 +15,19 @@ pub const undo_no_t = types.undo_no_t;
 // ============================================================================
 
 pub const TrxPurge = struct {
-    pending: std.ArrayList(*page.rec_t),
+    pending: std.ArrayListUnmanaged(*page.rec_t) = .{},
+    allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TrxPurge {
-        return .{ .pending = std.ArrayList(*page.rec_t).init(allocator) };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *TrxPurge) void {
-        self.pending.deinit();
+        self.pending.deinit(self.allocator);
     }
 
     pub fn add(self: *TrxPurge, rec: *page.rec_t) void {
-        self.pending.append(rec) catch @panic("TrxPurge.add");
+        self.pending.append(self.allocator, rec) catch @panic("TrxPurge.add");
     }
 
     pub fn apply(self: *TrxPurge) usize {

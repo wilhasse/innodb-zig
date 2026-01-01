@@ -537,7 +537,11 @@ test "mtr commit writes log bytes to buffer" {
     defer log.log_sys_close();
 
     const allocator = std.testing.allocator;
-    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    const page_mem = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(compat.UNIV_PAGE_SIZE),
+        compat.UNIV_PAGE_SIZE,
+    );
     defer allocator.free(page_mem);
     @memset(page_mem, 0);
 
@@ -581,7 +585,11 @@ fn mlog_collect_bytes(allocator: std.mem.Allocator, arr: *dyn.dyn_array_t) ![]u8
 
 test "mlog_write_ulint logs page update" {
     const allocator = std.testing.allocator;
-    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    const page_mem = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(compat.UNIV_PAGE_SIZE),
+        compat.UNIV_PAGE_SIZE,
+    );
     defer allocator.free(page_mem);
     @memset(page_mem, 0);
 
@@ -616,7 +624,11 @@ test "mlog_write_ulint logs page update" {
 
 test "mlog_write_dulint logs 8-byte update" {
     const allocator = std.testing.allocator;
-    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    const page_mem = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(compat.UNIV_PAGE_SIZE),
+        compat.UNIV_PAGE_SIZE,
+    );
     defer allocator.free(page_mem);
     @memset(page_mem, 0);
 
@@ -656,7 +668,11 @@ test "mlog_write_dulint logs 8-byte update" {
 
 test "mlog_write_string logs payload" {
     const allocator = std.testing.allocator;
-    const page_mem = try allocator.alignedAlloc(u8, compat.UNIV_PAGE_SIZE, compat.UNIV_PAGE_SIZE);
+    const page_mem = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(compat.UNIV_PAGE_SIZE),
+        compat.UNIV_PAGE_SIZE,
+    );
     defer allocator.free(page_mem);
     @memset(page_mem, 0);
 
