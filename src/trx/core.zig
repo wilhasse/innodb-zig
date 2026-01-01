@@ -9,8 +9,6 @@ pub const module_name = "trx.core";
 
 pub const ulint = compat.ulint;
 
-pub const TRX_ISO_REPEATABLE_READ: ulint = 2;
-
 pub var trx_dummy_sess: ?*que.sess_t = null;
 pub var trx_n_transactions: ulint = 0;
 
@@ -37,7 +35,7 @@ pub fn trx_create(sess: *que.sess_t, allocator: std.mem.Allocator) *types.trx_t 
     trx.allocator = allocator;
     trx.sess = sess;
     trx.conc_state = .not_started;
-    trx.isolation_level = TRX_ISO_REPEATABLE_READ;
+    trx.isolation_level = types.TRX_ISO_REPEATABLE_READ;
     trx.start_time = std.time.timestamp();
     trx_n_transactions += 1;
     return trx;

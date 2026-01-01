@@ -6,6 +6,11 @@ const que = @import("../que/mod.zig");
 pub const ulint = compat.ulint;
 pub const dulint = compat.Dulint;
 
+pub const TRX_ISO_READ_UNCOMMITTED: ulint = 0;
+pub const TRX_ISO_READ_COMMITTED: ulint = 1;
+pub const TRX_ISO_REPEATABLE_READ: ulint = 2;
+pub const TRX_ISO_SERIALIZABLE: ulint = 3;
+
 pub const trx_id_t = compat.ib_uint64_t;
 pub const undo_no_t = dulint;
 pub const roll_ptr_t = dulint;
