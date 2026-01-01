@@ -72,6 +72,9 @@ pub const trx_undo_record_t = struct {
     data: []const u8 = &[_]u8{},
 };
 
+// Forward declaration for trx_undo_t (defined in undo.zig)
+pub const trx_undo_t = opaque {};
+
 pub const trx_t = struct {
     id: trx_id_t = 0,
     sess: ?*que.sess_t = null,
@@ -93,4 +96,42 @@ pub const trx_t = struct {
     error_state: errors.DbErr = .DB_SUCCESS,
     error_key_num: ulint = 0,
     detailed_error: [128]u8 = [_]u8{0} ** 128,
+
+    // Undo log pointers - separate logs for inserts vs updates/deletes
+    insert_undo: ?*anyopaque = null, // trx_undo_t for insert operations
+    update_undo: ?*anyopaque = null, // trx_undo_t for update/delete operations
+
+    /// Get the next undo number and increment
+    pub fn nextUndoNo(self: *trx_t) undo_no_t {
+        const result = self.undo_no;
+        // Increment undo_no (handle overflow from low to high)
+        if (self.undo_no.low == 0xFFFFFFFF) {
+            self.undo_no.high += 1;
+            self.undo_no.low = 0;
+        } else {
+            self.undo_no.low += 1;
+        }
+        return result;
+    }
+
+    /// Create a roll pointer from page/offset (simplified)
+    pub fn makeRollPtr(self: *const trx_t, is_insert: bool, page_no: ulint, offset: ulint) roll_ptr_t {
+        _ = self;
+        // Roll pointer format: [is_insert:1][rseg_id:7][page_no:24][offset:16]
+        // Simplified version using dulint
+        const high: ulint = if (is_insert) 0x80000000 else 0;
+        const low: ulint = (page_no << 16) | (offset & 0xFFFF);
+        return .{ .high = high, .low = low };
+    }
+
+    /// Check if transaction has any undo logs
+    pub fn hasUndoLogs(self: *const trx_t) bool {
+        return self.insert_undo != null or self.update_undo != null or
+            self.undo_stack.items.len > 0;
+    }
+
+    /// Get current savepoint
+    pub fn getSavepoint(self: *const trx_t) trx_savept_t {
+        return .{ .least_undo_no = self.undo_no };
+    }
 };

@@ -223,6 +223,19 @@ pub const trx_undo_t = struct {
     empty: bool = true,
     records: std.ArrayListUnmanaged(types.trx_undo_record_t) = .{},
     allocator: std.mem.Allocator = std.heap.page_allocator,
+
+    /// Get the undo log as a typed pointer from trx_t's insert_undo/update_undo
+    pub fn fromOpaquePtr(ptr: ?*anyopaque) ?*trx_undo_t {
+        if (ptr) |p| {
+            return @ptrCast(@alignCast(p));
+        }
+        return null;
+    }
+
+    /// Convert to opaque pointer for storage in trx_t
+    pub fn toOpaquePtr(self: *trx_undo_t) *anyopaque {
+        return @ptrCast(self);
+    }
 };
 
 pub fn trx_undo_mem_create(
@@ -453,4 +466,221 @@ test "UndoRecHeader encodedSize matches encode" {
         const actual_size = hdr.encode(&buf);
         try std.testing.expectEqual(hdr.encodedSize(), actual_size);
     }
+}
+
+// ============================================================================
+// Transaction Undo Log Management (IBD-209)
+// ============================================================================
+
+/// Get or create the insert undo log for a transaction
+pub fn trx_undo_assign_insert(trx: *types.trx_t) *trx_undo_t {
+    if (trx_undo_t.fromOpaquePtr(trx.insert_undo)) |undo| {
+        return undo;
+    }
+    // Create new insert undo log
+    const undo = trx_undo_mem_create(0, TRX_UNDO_INSERT, trx.id, trx.allocator);
+    trx.insert_undo = undo.toOpaquePtr();
+    return undo;
+}
+
+/// Get or create the update undo log for a transaction
+pub fn trx_undo_assign_update(trx: *types.trx_t) *trx_undo_t {
+    if (trx_undo_t.fromOpaquePtr(trx.update_undo)) |undo| {
+        return undo;
+    }
+    // Create new update undo log
+    const undo = trx_undo_mem_create(0, TRX_UNDO_UPDATE, trx.id, trx.allocator);
+    trx.update_undo = undo.toOpaquePtr();
+    return undo;
+}
+
+/// Report a row operation - creates undo record and appends to appropriate log
+/// Returns the undo_no assigned to this operation
+/// table_id is for future use in full UndoRec serialization
+pub fn trx_undo_report_row_operation(
+    trx: *types.trx_t,
+    rec_type: UndoRecType,
+    _: dulint, // table_id - reserved for full undo record encoding
+    pk_data: []const u8,
+) undo_no_t {
+    const undo_no = trx.nextUndoNo();
+    const is_insert = (rec_type == .insert);
+
+    // Get appropriate undo log
+    const undo = if (is_insert)
+        trx_undo_assign_insert(trx)
+    else
+        trx_undo_assign_update(trx);
+
+    // Create and append the undo record
+    const rec = types.trx_undo_record_t{
+        .undo_no = undo_no,
+        .roll_ptr = trx.makeRollPtr(is_insert, 0, 0), // simplified: page/offset from caller in real impl
+        .is_insert = is_insert,
+        .data = pk_data,
+    };
+
+    trx_undo_append_record(undo, rec);
+
+    return undo_no;
+}
+
+/// Free all undo logs for a transaction (called during trx cleanup)
+pub fn trx_undo_free_logs(trx: *types.trx_t) void {
+    if (trx_undo_t.fromOpaquePtr(trx.insert_undo)) |undo| {
+        trx_undo_mem_free(undo);
+        trx.insert_undo = null;
+    }
+    if (trx_undo_t.fromOpaquePtr(trx.update_undo)) |undo| {
+        trx_undo_mem_free(undo);
+        trx.update_undo = null;
+    }
+}
+
+/// Check if transaction has any undo logs with records
+pub fn trx_undo_has_records(trx: *const types.trx_t) bool {
+    if (trx_undo_t.fromOpaquePtr(trx.insert_undo)) |undo| {
+        if (!undo.empty) return true;
+    }
+    if (trx_undo_t.fromOpaquePtr(trx.update_undo)) |undo| {
+        if (!undo.empty) return true;
+    }
+    return false;
+}
+
+/// Get total number of undo records across all logs
+pub fn trx_undo_record_count(trx: *const types.trx_t) usize {
+    var count: usize = 0;
+    if (trx_undo_t.fromOpaquePtr(trx.insert_undo)) |undo| {
+        count += undo.records.items.len;
+    }
+    if (trx_undo_t.fromOpaquePtr(trx.update_undo)) |undo| {
+        count += undo.records.items.len;
+    }
+    return count;
+}
+
+test "trx_undo_assign_insert creates undo log" {
+    var trx = types.trx_t{
+        .id = 100,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    try std.testing.expect(trx.insert_undo == null);
+
+    const undo = trx_undo_assign_insert(&trx);
+    try std.testing.expect(trx.insert_undo != null);
+    try std.testing.expectEqual(@as(ulint, TRX_UNDO_INSERT), undo.type);
+    try std.testing.expectEqual(@as(trx_id_t, 100), undo.trx_id);
+
+    // Second call returns same undo log
+    const undo2 = trx_undo_assign_insert(&trx);
+    try std.testing.expectEqual(undo, undo2);
+}
+
+test "trx_undo_assign_update creates separate undo log" {
+    var trx = types.trx_t{
+        .id = 200,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    const insert_undo = trx_undo_assign_insert(&trx);
+    const update_undo = trx_undo_assign_update(&trx);
+
+    try std.testing.expect(trx.insert_undo != null);
+    try std.testing.expect(trx.update_undo != null);
+    try std.testing.expect(insert_undo != update_undo);
+    try std.testing.expectEqual(@as(ulint, TRX_UNDO_INSERT), insert_undo.type);
+    try std.testing.expectEqual(@as(ulint, TRX_UNDO_UPDATE), update_undo.type);
+}
+
+test "trx_undo_report_row_operation insert" {
+    var trx = types.trx_t{
+        .id = 300,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    const pk = "pk_value";
+    const undo_no = trx_undo_report_row_operation(&trx, .insert, .{ .high = 0, .low = 1 }, pk);
+
+    try std.testing.expectEqual(@as(ulint, 0), undo_no.low);
+
+    const insert_undo = trx_undo_t.fromOpaquePtr(trx.insert_undo).?;
+    try std.testing.expectEqual(@as(usize, 1), insert_undo.records.items.len);
+    try std.testing.expectEqual(true, insert_undo.records.items[0].is_insert);
+
+    // update_undo should still be null
+    try std.testing.expect(trx.update_undo == null);
+}
+
+test "trx_undo_report_row_operation update goes to update log" {
+    var trx = types.trx_t{
+        .id = 400,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    const pk = "updated_pk";
+    _ = trx_undo_report_row_operation(&trx, .update_exist, .{ .high = 0, .low = 2 }, pk);
+
+    try std.testing.expect(trx.insert_undo == null); // no insert log created
+    const update_undo = trx_undo_t.fromOpaquePtr(trx.update_undo).?;
+    try std.testing.expectEqual(@as(usize, 1), update_undo.records.items.len);
+    try std.testing.expectEqual(false, update_undo.records.items[0].is_insert);
+}
+
+test "trx_undo_report_row_operation increments undo_no" {
+    var trx = types.trx_t{
+        .id = 500,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    const undo1 = trx_undo_report_row_operation(&trx, .insert, .{ .high = 0, .low = 1 }, "a");
+    const undo2 = trx_undo_report_row_operation(&trx, .update_exist, .{ .high = 0, .low = 1 }, "b");
+    const undo3 = trx_undo_report_row_operation(&trx, .del_mark, .{ .high = 0, .low = 1 }, "c");
+
+    try std.testing.expectEqual(@as(ulint, 0), undo1.low);
+    try std.testing.expectEqual(@as(ulint, 1), undo2.low);
+    try std.testing.expectEqual(@as(ulint, 2), undo3.low);
+}
+
+test "trx_undo_has_records and record_count" {
+    var trx = types.trx_t{
+        .id = 600,
+        .allocator = std.testing.allocator,
+    };
+    defer trx_undo_free_logs(&trx);
+
+    try std.testing.expect(!trx_undo_has_records(&trx));
+    try std.testing.expectEqual(@as(usize, 0), trx_undo_record_count(&trx));
+
+    _ = trx_undo_report_row_operation(&trx, .insert, .{ .high = 0, .low = 1 }, "x");
+    try std.testing.expect(trx_undo_has_records(&trx));
+    try std.testing.expectEqual(@as(usize, 1), trx_undo_record_count(&trx));
+
+    _ = trx_undo_report_row_operation(&trx, .update_exist, .{ .high = 0, .low = 1 }, "y");
+    _ = trx_undo_report_row_operation(&trx, .del_mark, .{ .high = 0, .low = 1 }, "z");
+    try std.testing.expectEqual(@as(usize, 3), trx_undo_record_count(&trx));
+}
+
+test "trx_undo_free_logs cleans up" {
+    var trx = types.trx_t{
+        .id = 700,
+        .allocator = std.testing.allocator,
+    };
+
+    _ = trx_undo_report_row_operation(&trx, .insert, .{ .high = 0, .low = 1 }, "data1");
+    _ = trx_undo_report_row_operation(&trx, .update_exist, .{ .high = 0, .low = 1 }, "data2");
+
+    try std.testing.expect(trx.insert_undo != null);
+    try std.testing.expect(trx.update_undo != null);
+
+    trx_undo_free_logs(&trx);
+
+    try std.testing.expect(trx.insert_undo == null);
+    try std.testing.expect(trx.update_undo == null);
 }
