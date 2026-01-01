@@ -3981,6 +3981,7 @@ test "btr load parses leaf records from bytes" {
 
     const index2 = dict.dict_mem_index_create("db/t1", "PRIMARY", space_id, dict.DICT_CLUSTERED | dict.DICT_UNIQUE, 1) orelse return error.OutOfMemory;
     defer dict.dict_mem_index_free(index2);
+    defer index_state_remove(index2);
     index2.table = table2;
     index2.n_uniq = 1;
     index2.n_uniq_in_tree = 1;

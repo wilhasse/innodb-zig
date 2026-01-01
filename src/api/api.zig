@@ -5,6 +5,7 @@ const btr = @import("../btr/mod.zig");
 const compat = @import("../ut/compat.zig");
 const data_mod = @import("../data/mod.zig");
 const dict = @import("../dict/mod.zig");
+const dict_sys_btr = @import("../dict/sys_btr.zig");
 const errors = @import("../ut/errors.zig");
 const fil = @import("../fil/mod.zig");
 const fil_sys = @import("../fil/sys.zig");
@@ -972,6 +973,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     dict.dict_init();
     dict.dict_create();
     _ = dict.dict_sys_metadata_load();
+    dict_sys_btr.dict_sys_btr_init(std.heap.page_allocator);
 
     cfg_started = true;
     return .DB_SUCCESS;

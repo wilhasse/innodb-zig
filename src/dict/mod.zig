@@ -130,6 +130,19 @@ pub var dict_sys: dict_sys_t = .{};
 pub var dict_ind_redundant: ?*dict_index_t = null;
 pub var dict_ind_compact: ?*dict_index_t = null;
 
+pub const dict_sys_btr_hooks_t = struct {
+    insert_table: ?*const fn (row: dict_sys_table_row_t) void = null,
+    insert_column: ?*const fn (row: dict_sys_column_row_t) void = null,
+    insert_index: ?*const fn (row: dict_sys_index_row_t) void = null,
+    clear: ?*const fn () void = null,
+};
+
+pub var dict_sys_btr_hooks: dict_sys_btr_hooks_t = .{};
+
+pub fn dict_sys_btr_set_hooks(hooks: dict_sys_btr_hooks_t) void {
+    dict_sys_btr_hooks = hooks;
+}
+
 pub const rw_lock_t = struct {};
 pub const mutex_t = struct {};
 pub var dict_operation_lock: rw_lock_t = .{};
@@ -224,6 +237,7 @@ pub fn dict_var_init() void {
     dict_ind_compact = null;
     dict_operation_lock = .{};
     dict_foreign_err_mutex = .{};
+    dict_sys_btr_hooks = .{};
 }
 
 pub fn dict_init() void {
@@ -311,6 +325,9 @@ fn freeSysName(name: []const u8) void {
 }
 
 fn dict_sys_metadata_clear() void {
+    if (dict_sys_btr_hooks.clear) |hook| {
+        hook();
+    }
     for (dict_sys.sys_tables.items) |row| {
         freeSysName(row.name);
     }
@@ -340,6 +357,9 @@ pub fn dict_sys_table_insert(name: []const u8, table_id: dulint, space: ulint, n
             dict_sys.sys_tables.items[idx].space = space;
             dict_sys.sys_tables.items[idx].n_cols = n_cols;
             dict_sys.sys_tables.items[idx].flags = flags;
+            if (dict_sys_btr_hooks.insert_table) |hook| {
+                hook(dict_sys.sys_tables.items[idx]);
+            }
             return compat.TRUE;
         }
     }
@@ -352,6 +372,9 @@ pub fn dict_sys_table_insert(name: []const u8, table_id: dulint, space: ulint, n
         .n_cols = n_cols,
         .flags = flags,
     }) catch return compat.FALSE;
+    if (dict_sys_btr_hooks.insert_table) |hook| {
+        hook(dict_sys.sys_tables.items[dict_sys.sys_tables.items.len - 1]);
+    }
     return compat.TRUE;
 }
 
@@ -366,6 +389,9 @@ pub fn dict_sys_column_insert(table_id: dulint, name: []const u8, pos: ulint, mt
             dict_sys.sys_columns.items[idx].mtype = mtype;
             dict_sys.sys_columns.items[idx].prtype = prtype;
             dict_sys.sys_columns.items[idx].len = len;
+            if (dict_sys_btr_hooks.insert_column) |hook| {
+                hook(dict_sys.sys_columns.items[idx]);
+            }
             return compat.TRUE;
         }
     }
@@ -379,6 +405,9 @@ pub fn dict_sys_column_insert(table_id: dulint, name: []const u8, pos: ulint, mt
         .prtype = prtype,
         .len = len,
     }) catch return compat.FALSE;
+    if (dict_sys_btr_hooks.insert_column) |hook| {
+        hook(dict_sys.sys_columns.items[dict_sys.sys_columns.items.len - 1]);
+    }
     return compat.TRUE;
 }
 
@@ -394,6 +423,9 @@ pub fn dict_sys_index_insert(table_id: dulint, index_id: dulint, name: []const u
             dict_sys.sys_indexes.items[idx].table_id = table_id;
             dict_sys.sys_indexes.items[idx].type = type_;
             dict_sys.sys_indexes.items[idx].space = space;
+            if (dict_sys_btr_hooks.insert_index) |hook| {
+                hook(dict_sys.sys_indexes.items[idx]);
+            }
             return compat.TRUE;
         }
     }
@@ -406,6 +438,9 @@ pub fn dict_sys_index_insert(table_id: dulint, index_id: dulint, name: []const u
         .type = type_,
         .space = space,
     }) catch return compat.FALSE;
+    if (dict_sys_btr_hooks.insert_index) |hook| {
+        hook(dict_sys.sys_indexes.items[dict_sys.sys_indexes.items.len - 1]);
+    }
     return compat.TRUE;
 }
 
