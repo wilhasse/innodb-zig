@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const dict = @import("../dict/mod.zig");
 const trx_types = @import("../trx/types.zig");
+const errors = @import("../ut/errors.zig");
 
 pub const module_name = "lock";
 
@@ -102,7 +103,7 @@ const LockRecKey = struct {
 pub const lock_sys_t = struct {
     rec_hash: std.AutoHashMap(LockRecKey, lock_queue_t),
     table_hash: std.AutoHashMap(u64, lock_queue_t),
-    trx_hash: std.AutoHashMap(*trx_types.trx_t, lock_queue_t),
+    trx_hash: std.AutoHashMap(*trx_types.trx_t, std.ArrayListUnmanaged(*lock_t)),
     allocator: std.mem.Allocator,
 };
 
@@ -191,6 +192,10 @@ pub fn lock_var_init() void {
 
 pub fn lock_sys_close() void {
     if (lock_sys) |sys| {
+        var it = sys.trx_hash.valueIterator();
+        while (it.next()) |list| {
+            list.deinit(sys.allocator);
+        }
         sys.rec_hash.deinit();
         sys.table_hash.deinit();
         sys.trx_hash.deinit();
@@ -209,10 +214,138 @@ pub fn lock_sys_create(n_cells: ulint) void {
     sys.* = .{
         .rec_hash = std.AutoHashMap(LockRecKey, lock_queue_t).init(allocator),
         .table_hash = std.AutoHashMap(u64, lock_queue_t).init(allocator),
-        .trx_hash = std.AutoHashMap(*trx_types.trx_t, lock_queue_t).init(allocator),
+        .trx_hash = std.AutoHashMap(*trx_types.trx_t, std.ArrayListUnmanaged(*lock_t)).init(allocator),
         .allocator = allocator,
     };
     lock_sys = sys;
+}
+
+fn lock_trx_list_add(sys: *lock_sys_t, trx: *trx_types.trx_t, lock: *lock_t) void {
+    const entry = sys.trx_hash.getOrPut(trx) catch return;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{};
+    }
+    entry.value_ptr.append(sys.allocator, lock) catch {};
+}
+
+fn lock_trx_list_remove(sys: *lock_sys_t, trx: *trx_types.trx_t, lock: *lock_t) void {
+    if (sys.trx_hash.getPtr(trx)) |list| {
+        var idx: usize = 0;
+        while (idx < list.items.len) {
+            if (list.items[idx] == lock) {
+                _ = list.orderedRemove(sys.allocator, idx);
+                break;
+            }
+            idx += 1;
+        }
+        if (list.items.len == 0) {
+            list.deinit(sys.allocator);
+            _ = sys.trx_hash.remove(trx);
+        }
+    }
+}
+
+fn lock_table_queue_add(sys: *lock_sys_t, lock: *lock_t) void {
+    const entry = sys.table_hash.getOrPut(lock.table_id) catch return;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{};
+    }
+    lock_queue_append(entry.value_ptr, lock);
+}
+
+fn lock_table_queue_remove(sys: *lock_sys_t, lock: *lock_t) void {
+    if (sys.table_hash.getPtr(lock.table_id)) |queue| {
+        lock_queue_remove(queue, lock);
+        if (queue.head == null) {
+            _ = sys.table_hash.remove(lock.table_id);
+        }
+    }
+}
+
+fn lock_table_create(sys: *lock_sys_t, trx: *trx_types.trx_t, table_id: u64, type_mode: ulint) ?*lock_t {
+    const lock = sys.allocator.create(lock_t) catch return null;
+    lock.* = .{
+        .trx = trx,
+        .type_mode = type_mode | LOCK_TABLE,
+        .table_id = table_id,
+    };
+    lock_table_queue_add(sys, lock);
+    lock_trx_list_add(sys, trx, lock);
+    return lock;
+}
+
+fn lock_table_remove(sys: *lock_sys_t, lock: *lock_t) void {
+    lock_table_queue_remove(sys, lock);
+    if (lock.trx) |trx| {
+        lock_trx_list_remove(sys, trx, lock);
+    }
+    sys.allocator.destroy(lock);
+}
+
+fn lock_table_has(sys: *lock_sys_t, trx: *trx_types.trx_t, table_id: u64, mode: ulint) bool {
+    const queue = sys.table_hash.getPtr(table_id) orelse return false;
+    var current = queue.tail;
+    while (current) |lock| {
+        if (lock.trx == trx and lock_mode_stronger_or_eq(lock_get_mode(lock), mode) == compat.TRUE) {
+            return true;
+        }
+        current = lock.prev;
+    }
+    return false;
+}
+
+fn lock_table_other_has_incompatible(
+    sys: *lock_sys_t,
+    trx: *trx_types.trx_t,
+    table_id: u64,
+    mode: ulint,
+    include_wait: bool,
+) ?*lock_t {
+    const queue = sys.table_hash.getPtr(table_id) orelse return null;
+    var current = queue.tail;
+    while (current) |lock| {
+        if (lock.trx != trx and lock_mode_compatible(lock_get_mode(lock), mode) == compat.FALSE) {
+            if (include_wait or lock_is_wait(lock) == compat.FALSE) {
+                return lock;
+            }
+        }
+        current = lock.prev;
+    }
+    return null;
+}
+
+pub fn lock_table(trx: *trx_types.trx_t, table_id: u64, mode: ulint) errors.DbErr {
+    if (mode >= LOCK_NUM) {
+        return .DB_ERROR;
+    }
+    lock_sys_create(0);
+    const sys = lock_sys orelse return .DB_ERROR;
+
+    if (lock_table_has(sys, trx, table_id, mode)) {
+        return .DB_SUCCESS;
+    }
+
+    if (lock_table_other_has_incompatible(sys, trx, table_id, mode, true)) |conflict| {
+        const lock = lock_table_create(sys, trx, table_id, mode | LOCK_WAIT) orelse return .DB_OUT_OF_MEMORY;
+        lock.wait_for = conflict;
+        return .DB_LOCK_WAIT;
+    }
+
+    _ = lock_table_create(sys, trx, table_id, mode) orelse return .DB_OUT_OF_MEMORY;
+    return .DB_SUCCESS;
+}
+
+pub fn lock_table_release(trx: *trx_types.trx_t, table_id: u64) void {
+    const sys = lock_sys orelse return;
+    const queue = sys.table_hash.getPtr(table_id) orelse return;
+    var current = queue.head;
+    while (current) |lock| {
+        const next = lock.next;
+        if (lock.trx == trx) {
+            lock_table_remove(sys, lock);
+        }
+        current = next;
+    }
 }
 
 pub fn lock_queue_iterator_reset(iter: *lock_queue_iterator_t, lock: *const lock_t, bit_no: ulint) void {
@@ -348,5 +481,23 @@ test "record lock queue append/remove" {
 
     lock_rec_queue_remove(sys, &lock2);
     try std.testing.expect(sys.rec_hash.count() == 0);
+    lock_sys_close();
+}
+
+test "table lock request and release" {
+    lock_sys_close();
+    lock_sys_create(0);
+
+    var trx1 = trx_types.trx_t{};
+    var trx2 = trx_types.trx_t{};
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, lock_table(&trx1, 11, LOCK_IX));
+    try std.testing.expectEqual(errors.DbErr.DB_LOCK_WAIT, lock_table(&trx2, 11, LOCK_S));
+
+    lock_table_release(&trx1, 11);
+    lock_table_release(&trx2, 11);
+
+    const sys = lock_sys orelse return error.OutOfMemory;
+    try std.testing.expect(sys.table_hash.count() == 0);
     lock_sys_close();
 }
