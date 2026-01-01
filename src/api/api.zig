@@ -915,13 +915,21 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     os_file.os_file_var_init();
     fil.fil_var_init();
     fil.fil_init(0, open_files);
+    log_mod.log_var_init();
+    log_mod.recv_sys_var_init();
+
+    const log_buffer_size = if (cfgFind("log_buffer_size")) |cfg_var| cfg_var.value.IB_CFG_ULINT else 0;
+    const log_file_size = if (cfgFind("log_file_size")) |cfg_var| cfg_var.value.IB_CFG_ULINT else 0;
+    const log_files_in_group = if (cfgFind("log_files_in_group")) |cfg_var| cfg_var.value.IB_CFG_ULINT else 0;
+    const log_dir = if (cfgFind("log_group_home_dir")) |cfg_var| cfg_var.value.IB_CFG_TEXT else ".";
+    if (log_mod.log_sys_init(log_dir, log_files_in_group, @as(compat.ib_int64_t, @intCast(log_file_size)), log_buffer_size) == compat.FALSE) {
+        return .DB_ERROR;
+    }
     buf_mod.buf_buddy_var_init();
     buf_mod.buf_LRU_var_init();
     buf_mod.buf_var_init();
     _ = buf_mod.buf_pool_init();
     fsp.fsp_init();
-    log_mod.log_var_init();
-    log_mod.recv_sys_var_init();
     trx_sys.trx_sys_var_init();
     _ = trx_sys.trx_sys_init_at_db_start(std.heap.page_allocator);
     trx_sys.trx_sys_file_format_init();
@@ -938,6 +946,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
 pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     _ = flag;
     if (!cfg_started) {
+        log_mod.log_sys_close();
         buf_mod.buf_close();
         buf_mod.buf_mem_free();
         fil.fil_close();
@@ -951,6 +960,7 @@ pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     }
     btr.btr_search_sys_close();
     trx_sys.trx_sys_close();
+    log_mod.log_shutdown();
     fil.fil_close();
     _ = dict.dict_sys_metadata_save();
     dict.dict_close();

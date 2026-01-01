@@ -404,6 +404,22 @@ pub fn log_flush() ibool {
     return compat.TRUE;
 }
 
+pub fn log_checkpoint(lsn: ib_uint64_t) ibool {
+    const sys = log_sys orelse return compat.FALSE;
+    const checkpoint = if (lsn <= sys.flushed_lsn) lsn else sys.flushed_lsn;
+    sys.checkpoint_lsn = checkpoint;
+    log_persist_header(sys, false) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn log_shutdown() void {
+    const sys = log_sys orelse return;
+    _ = log_flush();
+    _ = log_checkpoint(sys.flushed_lsn);
+    log_persist_header(sys, true) catch {};
+    log_sys_close();
+}
+
 pub fn log_append_bytes(data: []const u8) ?ib_uint64_t {
     const sys = log_sys orelse return null;
     const start_lsn = sys.current_lsn;
@@ -1075,6 +1091,28 @@ test "log buffer flush persists flushed lsn" {
     log_var_init();
     try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 64));
     try std.testing.expectEqual(flushed, log_sys.?.flushed_lsn);
+    log_sys_close();
+}
+
+test "log checkpoint persists on shutdown" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 0));
+    _ = log_append_bytes("checkpoint") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(compat.TRUE, log_flush());
+    const flushed = log_sys.?.flushed_lsn;
+
+    log_shutdown();
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 0));
+    try std.testing.expectEqual(flushed, log_sys.?.checkpoint_lsn);
+    try std.testing.expect(log_sys.?.was_clean_shutdown);
     log_sys_close();
 }
 
