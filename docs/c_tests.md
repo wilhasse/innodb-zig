@@ -33,3 +33,29 @@ to run those tests using the existing Makefile targets.
   `zig build test` to exercise the log persistence path and startup recovery.
 - Log files are created under `log_group_home_dir` (default `.`); remove
   `ib_logfile*` if you want a clean run.
+
+## MVCC Test Coverage
+
+The Zig port includes comprehensive MVCC and rollback tests in
+`src/tests/ib_mvcc.zig`. Run with:
+
+```bash
+zig build test -Dtest-filter="ib_mvcc"
+```
+
+### Test Categories
+1. **Insert Rollback**: Single and multiple inserts with LIFO undo order
+2. **Update Rollback**: Value restoration from undo records
+3. **Delete Rollback**: Unmark delete-marked rows
+4. **Read View Visibility**: Snapshot isolation with version chains
+5. **Savepoint Rollback**: Partial and nested savepoint handling
+6. **Concurrent Scenarios**: Multiple readers with writer interleaving
+7. **Purge Eligibility**: View-based undo record protection
+
+### Related Module Tests
+Additional unit tests exist in the source modules:
+- `src/trx/undo.zig` - Undo log operations
+- `src/trx/purge.zig` - Purge system behavior
+- `src/read/mod.zig` - Read view visibility rules
+- `src/row/vers.zig` - Version chain management
+- `src/row/undo.zig` - Rollback application

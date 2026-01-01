@@ -72,3 +72,47 @@ interfaces to avoid hard cycles where possible.
 - Step 7: transaction state and lock compatibility matrix
 - Step 8: row selection and expression evaluation on in-memory data
 - Step 9: server start/stop and API smoke tests
+- Step 10: MVCC read view visibility and rollback coverage
+
+## MVCC and Undo Log Implementation (IBD-208 to IBD-216)
+
+The transaction system now includes multi-version concurrency control (MVCC)
+support with undo logging for rollback and consistent reads.
+
+### Undo Log Subsystem (`src/trx/undo.zig`)
+- Undo record format with dulint-based undo_no
+- Per-transaction insert and update undo logs
+- Record append/pop operations with LIFO ordering
+- Memory-efficient undo storage with configurable limits
+
+### Read View (`src/read/mod.zig`)
+- Snapshot isolation via `read_view_t` structure
+- Visibility rules: up_limit_id, low_limit_id, active transaction list
+- Creator transaction sees own changes
+- Clone and lifecycle management for cursor views
+
+### Row Version Chain (`src/row/vers.zig`)
+- Linked list of row versions with transaction IDs
+- Version traversal for consistent reads
+- Delete-marked version handling
+- Chain length and visibility counting
+
+### Rollback (`src/row/undo.zig`)
+- Apply undo records in reverse order (LIFO)
+- Support for insert, update, and delete-mark undo
+- Savepoint rollback to partial transaction state
+- Callback-based undo application for storage integration
+
+### Purge System (`src/trx/purge.zig`)
+- Track active read views for purge eligibility
+- Oldest view limit determines purgeable undo records
+- Per-transaction and per-log purge operations
+- Statistics tracking for monitoring
+
+### Test Coverage (`src/tests/ib_mvcc.zig`)
+- Insert/update/delete rollback tests
+- Read view visibility with version chains
+- Savepoint rollback (single and nested)
+- Concurrent read/write scenarios
+- Purge eligibility after view closure
+- Edge cases: empty transactions, failed undo, long chains
