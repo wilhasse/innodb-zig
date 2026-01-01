@@ -939,6 +939,9 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
         return .DB_ERROR;
     }
     _ = log_mod.log_mark_dirty();
+    if (log_mod.log_writer_start(log_mod.LOG_WRITER_SLEEP_US) == compat.FALSE) {
+        return .DB_ERROR;
+    }
     buf_mod.buf_buddy_var_init();
     buf_mod.buf_LRU_var_init();
     buf_mod.buf_var_init();

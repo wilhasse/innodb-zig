@@ -25,6 +25,7 @@ pub const LOG_CHECKPOINT_EXTRA_FREE: ulint = 8 * compat.UNIV_PAGE_SIZE;
 pub const LOG_FILE_MAGIC: u32 = 0x49424C47; // "IBLG"
 pub const LOG_FILE_VERSION: u32 = 1;
 pub const LOG_FILE_HDR_BYTES: usize = @as(usize, @intCast(LOG_FILE_HDR_SIZE));
+pub const LOG_WRITER_SLEEP_US: u64 = 100_000;
 
 const LOG_HDR_MAGIC_OFF: usize = 0;
 const LOG_HDR_VERSION_OFF: usize = 4;
@@ -98,6 +99,8 @@ pub var log_do_write: ibool = compat.TRUE;
 pub var log_debug_writes: ibool = compat.FALSE;
 pub var log_has_printed_chkp_warning: ibool = compat.FALSE;
 pub var log_last_warning_time: i64 = 0;
+var log_writer_stop_flag = std.atomic.Value(bool).init(false);
+var log_writer_thread: ?std.Thread = null;
 
 pub fn log_var_init() void {
     log_fsp_current_free_limit = 0;
@@ -415,11 +418,39 @@ pub fn log_checkpoint(lsn: ib_uint64_t) ibool {
 }
 
 pub fn log_shutdown() void {
+    log_writer_stop();
     const sys = log_sys orelse return;
     _ = log_flush();
     _ = log_checkpoint(sys.flushed_lsn);
     log_persist_header(sys, true) catch {};
     log_sys_close();
+}
+
+fn log_writer_loop(sleep_us: u64) void {
+    while (!log_writer_stop_flag.load(.seq_cst)) {
+        _ = log_flush();
+        std.Thread.sleep(sleep_us * std.time.ns_per_us);
+    }
+}
+
+pub fn log_writer_start(sleep_us: u64) ibool {
+    if (log_writer_thread != null) {
+        return compat.TRUE;
+    }
+    if (log_sys == null) {
+        return compat.FALSE;
+    }
+    log_writer_stop_flag.store(false, .seq_cst);
+    log_writer_thread = std.Thread.spawn(.{}, log_writer_loop, .{sleep_us}) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn log_writer_stop() void {
+    if (log_writer_thread) |thread| {
+        log_writer_stop_flag.store(true, .seq_cst);
+        thread.join();
+        log_writer_thread = null;
+    }
 }
 
 pub fn log_mark_dirty() ibool {
@@ -1108,6 +1139,28 @@ test "log buffer flush persists flushed lsn" {
     try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 64));
     try std.testing.expectEqual(flushed, log_sys.?.flushed_lsn);
     log_sys_close();
+}
+
+test "log writer thread flushes buffer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 1, 4096, 128));
+    defer log_sys_close();
+
+    const payload = "writer";
+    _ = log_append_bytes(payload) orelse return error.UnexpectedNull;
+    try std.testing.expect(log_sys.?.log_buf_used > 0);
+
+    try std.testing.expectEqual(compat.TRUE, log_writer_start(10_000));
+    defer log_writer_stop();
+
+    std.time.sleep(30 * std.time.ns_per_ms);
+    try std.testing.expect(log_sys.?.log_buf_used == 0);
 }
 
 test "log checkpoint persists on shutdown" {
