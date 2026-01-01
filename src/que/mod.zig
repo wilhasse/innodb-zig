@@ -161,8 +161,23 @@ pub fn que_fork_start_command(fork: *que_fork_t) ?*que_thr_t {
     return null;
 }
 
+pub fn que_thr_step(thr: *que_thr_t) bool {
+    const node = thr.run_node orelse return false;
+    thr.prev_node = node;
+    if (node.type == QUE_NODE_EXIT) {
+        thr.run_node = null;
+        return false;
+    }
+    if (node.brother) |next| {
+        thr.run_node = next;
+        return true;
+    }
+    thr.run_node = null;
+    return false;
+}
+
 pub fn que_run_threads(thr: *que_thr_t) void {
-    _ = thr;
+    while (que_thr_step(thr)) {}
 }
 
 pub fn que_graph_free_recursive(node: *que_node_t) void {
@@ -203,4 +218,28 @@ test "que node set parent" {
     var child_node = que_node_t{};
     que_node_set_parent(&child_node, &parent_node);
     try std.testing.expect(child_node.parent == &parent_node);
+}
+
+test "que run threads walks siblings" {
+    var n1 = que_node_t{ .type = QUE_NODE_SYMBOL };
+    var n2 = que_node_t{ .type = QUE_NODE_FUNC };
+    var n3 = que_node_t{ .type = QUE_NODE_RETURN };
+    n1.brother = &n2;
+    n2.brother = &n3;
+
+    var thr = que_thr_t{ .run_node = &n1 };
+    que_run_threads(&thr);
+    try std.testing.expect(thr.run_node == null);
+    try std.testing.expect(thr.prev_node == &n3);
+}
+
+test "que run threads stops at exit" {
+    var n1 = que_node_t{ .type = QUE_NODE_FUNC };
+    var n2 = que_node_t{ .type = QUE_NODE_EXIT };
+    n1.brother = &n2;
+
+    var thr = que_thr_t{ .run_node = &n1 };
+    que_run_threads(&thr);
+    try std.testing.expect(thr.run_node == null);
+    try std.testing.expect(thr.prev_node == &n2);
 }
