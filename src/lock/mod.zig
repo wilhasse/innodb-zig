@@ -498,6 +498,26 @@ pub fn lock_rec_release(trx: *trx_types.trx_t, index: *dict.dict_index_t, rec: *
     }
 }
 
+pub fn lock_trx_release(trx: *trx_types.trx_t) void {
+    const sys = lock_sys orelse return;
+    while (sys.trx_hash.getPtr(trx)) |list| {
+        if (list.items.len == 0) {
+            list.deinit(sys.allocator);
+            _ = sys.trx_hash.remove(trx);
+            break;
+        }
+        const lock = list.items[0];
+        switch (lock_get_type_low(lock)) {
+            LOCK_TABLE => lock_table_remove(sys, lock),
+            LOCK_REC => lock_rec_remove(sys, lock),
+            else => {
+                lock_trx_list_remove(sys, trx, lock);
+                sys.allocator.destroy(lock);
+            },
+        }
+    }
+}
+
 pub fn lock_queue_iterator_reset(iter: *lock_queue_iterator_t, lock: *const lock_t, bit_no: ulint) void {
     iter.current_lock = lock;
 

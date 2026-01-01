@@ -2651,6 +2651,7 @@ pub fn ib_trx_release(ib_trx: ib_trx_t) ib_err_t {
 
     // Free internal transaction and undo logs (IBD-213)
     if (trx.inner_trx) |inner| {
+        lock_mod.lock_trx_release(inner);
         trx_undo.trx_undo_free_logs(inner);
         std.heap.page_allocator.destroy(inner);
         trx.inner_trx = null;

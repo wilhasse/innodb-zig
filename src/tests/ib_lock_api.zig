@@ -91,3 +91,29 @@ test "record lock conflict via api" {
     defer api.ib_tuple_delete(read_tpl);
     try std.testing.expectEqual(api.ib_err_t.DB_LOCK_WAIT, api.ib_cursor_read_row(crsr2, read_tpl));
 }
+
+test "table lock released on commit" {
+    try expectOk(api.ib_init());
+    defer _ = api.ib_shutdown(.IB_SHUTDOWN_NORMAL);
+    try expectOk(api.ib_startup("barracuda"));
+
+    try createDatabase();
+    defer dropDatabase() catch {};
+    try createTable();
+    defer dropTable() catch {};
+
+    var table_id: api.ib_id_t = 0;
+    try expectOk(api.ib_table_get_id(TABLE_NAME, &table_id));
+
+    const trx1 = api.ib_trx_begin(.IB_TRX_REPEATABLE_READ) orelse return error.OutOfMemory;
+    const trx2 = api.ib_trx_begin(.IB_TRX_REPEATABLE_READ) orelse return error.OutOfMemory;
+
+    try std.testing.expectEqual(api.ib_err_t.DB_SUCCESS, api.ib_table_lock(trx1, table_id, .IB_LOCK_X));
+    try std.testing.expectEqual(api.ib_err_t.DB_LOCK_WAIT, api.ib_table_lock(trx2, table_id, .IB_LOCK_S));
+    try std.testing.expectEqual(api.ib_err_t.DB_SUCCESS, api.ib_trx_commit(trx1));
+    _ = api.ib_trx_rollback(trx2);
+
+    const trx3 = api.ib_trx_begin(.IB_TRX_REPEATABLE_READ) orelse return error.OutOfMemory;
+    defer _ = api.ib_trx_rollback(trx3);
+    try std.testing.expectEqual(api.ib_err_t.DB_SUCCESS, api.ib_table_lock(trx3, table_id, .IB_LOCK_S));
+}
