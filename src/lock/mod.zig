@@ -129,6 +129,59 @@ pub fn lock_rec_get_prev(lock: *const lock_t, heap_no: ulint) ?*const lock_t {
     return lock.prev;
 }
 
+fn lock_queue_append(queue: *lock_queue_t, lock: *lock_t) void {
+    lock.prev = queue.tail;
+    lock.next = null;
+    if (queue.tail) |tail| {
+        tail.next = lock;
+    } else {
+        queue.head = lock;
+    }
+    queue.tail = lock;
+}
+
+fn lock_queue_remove(queue: *lock_queue_t, lock: *lock_t) void {
+    if (lock.prev) |prev| {
+        prev.next = lock.next;
+    } else {
+        queue.head = lock.next;
+    }
+    if (lock.next) |next| {
+        next.prev = lock.prev;
+    } else {
+        queue.tail = lock.prev;
+    }
+    lock.prev = null;
+    lock.next = null;
+}
+
+fn lock_rec_queue_add(sys: *lock_sys_t, lock: *lock_t) void {
+    const key = LockRecKey{
+        .space = lock.space,
+        .page_no = lock.page_no,
+        .rec_offset = lock.rec_bit,
+    };
+    const entry = sys.rec_hash.getOrPut(key) catch return;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{};
+    }
+    lock_queue_append(entry.value_ptr, lock);
+}
+
+fn lock_rec_queue_remove(sys: *lock_sys_t, lock: *lock_t) void {
+    const key = LockRecKey{
+        .space = lock.space,
+        .page_no = lock.page_no,
+        .rec_offset = lock.rec_bit,
+    };
+    if (sys.rec_hash.getPtr(key)) |queue| {
+        lock_queue_remove(queue, lock);
+        if (queue.head == null) {
+            _ = sys.rec_hash.remove(key);
+        }
+    }
+}
+
 pub fn lock_var_init() void {
     if (lock_sys != null) {
         return;
@@ -270,5 +323,30 @@ test "lock sys hash tables init" {
 
     _ = sys.rec_hash.remove(key);
     _ = sys.table_hash.remove(42);
+    lock_sys_close();
+}
+
+test "record lock queue append/remove" {
+    lock_sys_close();
+    lock_sys_create(0);
+    const sys = lock_sys orelse return error.OutOfMemory;
+
+    var lock1 = lock_t{ .type_mode = LOCK_REC, .space = 1, .page_no = 2, .rec_bit = 7 };
+    var lock2 = lock_t{ .type_mode = LOCK_REC, .space = 1, .page_no = 2, .rec_bit = 7 };
+    lock_rec_queue_add(sys, &lock1);
+    lock_rec_queue_add(sys, &lock2);
+
+    const key = LockRecKey{ .space = 1, .page_no = 2, .rec_offset = 7 };
+    const queue = sys.rec_hash.getPtr(key) orelse return error.OutOfMemory;
+    try std.testing.expect(queue.head == &lock1);
+    try std.testing.expect(queue.tail == &lock2);
+    try std.testing.expect(lock_rec_get_prev(&lock2, 0) == &lock1);
+
+    lock_rec_queue_remove(sys, &lock1);
+    try std.testing.expect(queue.head == &lock2);
+    try std.testing.expect(queue.tail == &lock2);
+
+    lock_rec_queue_remove(sys, &lock2);
+    try std.testing.expect(sys.rec_hash.count() == 0);
     lock_sys_close();
 }
