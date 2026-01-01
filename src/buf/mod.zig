@@ -146,13 +146,32 @@ pub fn buf_var_init() void {
 }
 
 pub fn buf_calc_page_new_checksum(page: [*]const byte) ulint {
-    _ = page;
-    return 0;
+    const page_slice = page[0..compat.UNIV_PAGE_SIZE];
+    var crc = std.hash.Crc32.init();
+    const end_off = compat.UNIV_PAGE_SIZE - fil.FIL_PAGE_END_LSN_OLD_CHKSUM;
+    const head = page_slice[0..fil.FIL_PAGE_SPACE_OR_CHKSUM];
+    const mid = page_slice[fil.FIL_PAGE_SPACE_OR_CHKSUM + 4 .. end_off];
+    const tail = page_slice[end_off + 4 ..];
+    crc.update(head);
+    crc.update(mid);
+    crc.update(tail);
+    return @as(ulint, @intCast(crc.final()));
 }
 
 pub fn buf_calc_page_old_checksum(page: [*]const byte) ulint {
-    _ = page;
-    return 0;
+    const page_slice = page[0..compat.UNIV_PAGE_SIZE];
+    var sum: u32 = 0;
+    const end_off = compat.UNIV_PAGE_SIZE - fil.FIL_PAGE_END_LSN_OLD_CHKSUM;
+    for (page_slice, 0..) |b, idx| {
+        if (idx >= fil.FIL_PAGE_SPACE_OR_CHKSUM and idx < fil.FIL_PAGE_SPACE_OR_CHKSUM + 4) {
+            continue;
+        }
+        if (idx >= end_off and idx < end_off + 4) {
+            continue;
+        }
+        sum +%= b;
+    }
+    return @as(ulint, sum);
 }
 
 pub fn buf_page_is_corrupted(read_buf: [*]const byte, zip_size: ulint) ibool {
@@ -586,9 +605,14 @@ pub fn buf_flush_free_margin() void {
 }
 
 pub fn buf_flush_init_for_writing(page: [*]byte, page_zip_: ?*anyopaque, newest_lsn: ib_uint64_t) void {
-    _ = page;
     _ = page_zip_;
-    _ = newest_lsn;
+    const page_slice = page[0..compat.UNIV_PAGE_SIZE];
+    std.mem.writeInt(u64, page_slice[fil.FIL_PAGE_LSN .. fil.FIL_PAGE_LSN + 8], newest_lsn, .big);
+    const new_checksum = buf_calc_page_new_checksum(page);
+    std.mem.writeInt(u32, page_slice[fil.FIL_PAGE_SPACE_OR_CHKSUM .. fil.FIL_PAGE_SPACE_OR_CHKSUM + 4], @as(u32, @intCast(new_checksum)), .big);
+    const old_checksum = buf_calc_page_old_checksum(page);
+    const end_off = compat.UNIV_PAGE_SIZE - fil.FIL_PAGE_END_LSN_OLD_CHKSUM;
+    std.mem.writeInt(u32, page_slice[end_off .. end_off + 4], @as(u32, @intCast(old_checksum)), .big);
 }
 
 pub fn buf_flush_batch(flush_type: buf_flush, min_n: ulint, lsn_limit: ib_uint64_t) ulint {
@@ -1041,4 +1065,23 @@ test "buf read applies recv log lsn" {
     try std.testing.expectEqual(@as(ulint, 0), log_mod.recv_sys.?.n_addrs);
 
     buf_mem_free();
+}
+
+test "buf flush init writes lsn and checksums" {
+    var page: [compat.UNIV_PAGE_SIZE]byte = undefined;
+    @memset(page[0..], 0x5A);
+    const lsn: u64 = 0x1122334455667788;
+    buf_flush_init_for_writing(page[0..].ptr, null, lsn);
+
+    const got_lsn = std.mem.readInt(u64, page[fil.FIL_PAGE_LSN .. fil.FIL_PAGE_LSN + 8], .big);
+    try std.testing.expectEqual(lsn, got_lsn);
+
+    const stored = std.mem.readInt(u32, page[fil.FIL_PAGE_SPACE_OR_CHKSUM .. fil.FIL_PAGE_SPACE_OR_CHKSUM + 4], .big);
+    const computed = @as(u32, @intCast(buf_calc_page_new_checksum(page[0..].ptr)));
+    try std.testing.expectEqual(computed, stored);
+
+    const end_off = compat.UNIV_PAGE_SIZE - fil.FIL_PAGE_END_LSN_OLD_CHKSUM;
+    const stored_old = std.mem.readInt(u32, page[end_off .. end_off + 4], .big);
+    const computed_old = @as(u32, @intCast(buf_calc_page_old_checksum(page[0..].ptr)));
+    try std.testing.expectEqual(computed_old, stored_old);
 }
