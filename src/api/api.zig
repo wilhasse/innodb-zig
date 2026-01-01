@@ -13,6 +13,7 @@ const fsp = @import("../fsp/mod.zig");
 const rec_mod = @import("../rec/mod.zig");
 const log = @import("../ut/log.zig");
 const log_mod = @import("../log/mod.zig");
+const log_ddl = @import("../log/ddl.zig");
 const lock_mod = @import("../lock/mod.zig");
 const os_file = @import("../os/file.zig");
 const os_thread = @import("../os/thread.zig");
@@ -975,6 +976,10 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     _ = dict.dict_sys_metadata_load();
     dict_sys_btr.dict_sys_btr_init(std.heap.page_allocator);
     _ = dict_sys_btr.dict_sys_btr_load_cache();
+    if (log_ddl.ddl_log_init() == compat.FALSE) {
+        return .DB_ERROR;
+    }
+    _ = log_ddl.ddl_log_recover();
 
     cfg_started = true;
     return .DB_SUCCESS;
@@ -1004,6 +1009,7 @@ pub fn ib_shutdown(flag: ib_shutdown_t) ib_err_t {
     fil.fil_close();
     _ = dict.dict_sys_metadata_save();
     dict.dict_close();
+    log_ddl.ddl_log_shutdown();
     buf_mod.buf_close();
     buf_mod.buf_mem_free();
     _ = ib_cfg_shutdown();
@@ -4644,6 +4650,11 @@ pub fn ib_table_create(ib_trx: ib_trx_t, ib_tbl_sch: ib_tbl_sch_t, id: *ib_id_t)
         }
     }
 
+    if (log_ddl.ddl_log_begin(.create, schema.name, null) == compat.FALSE) {
+        return .DB_ERROR;
+    }
+    errdefer _ = log_ddl.ddl_log_end(.create, schema.name, null);
+
     const new_id = next_table_id;
     var space_id: ib_ulint_t = 0;
     if (cfgFind("file_per_table")) |cfg_var| {
@@ -4686,6 +4697,7 @@ pub fn ib_table_create(ib_trx: ib_trx_t, ib_tbl_sch: ib_tbl_sch_t, id: *ib_id_t)
     next_table_id += 1;
     schema.table_id = new_id;
     id.* = new_id;
+    _ = log_ddl.ddl_log_end(.create, schema.name, null);
     return .DB_SUCCESS;
 }
 
@@ -4703,6 +4715,11 @@ pub fn ib_table_rename(ib_trx: ib_trx_t, old_name: []const u8, new_name: []const
         return .DB_DUPLICATE_KEY;
     }
 
+    if (log_ddl.ddl_log_begin(.rename, old_name, new_name) == compat.FALSE) {
+        return .DB_ERROR;
+    }
+    errdefer _ = log_ddl.ddl_log_end(.rename, old_name, new_name);
+
     if (catalogFindByName(old_name)) |table| {
         const name_copy = dupName(table.allocator, new_name) catch return .DB_OUT_OF_MEMORY;
         table.allocator.free(table.name);
@@ -4713,6 +4730,7 @@ pub fn ib_table_rename(ib_trx: ib_trx_t, old_name: []const u8, new_name: []const
         if (table.space_id != 0) {
             _ = fil.fil_rename_tablespace(old_name, table.space_id, new_name);
         }
+        _ = log_ddl.ddl_log_end(.rename, old_name, new_name);
         return .DB_SUCCESS;
     }
 
@@ -4774,6 +4792,12 @@ pub fn ib_table_drop(ib_trx: ib_trx_t, name: []const u8) ib_err_t {
         return .DB_INVALID_INPUT;
     }
     const table = catalogFindByName(name) orelse return .DB_TABLE_NOT_FOUND;
+
+    if (log_ddl.ddl_log_begin(.drop, name, null) == compat.FALSE) {
+        return .DB_ERROR;
+    }
+    errdefer _ = log_ddl.ddl_log_end(.drop, name, null);
+
     const space_id = table.space_id;
     dict.dict_sys_table_remove(dulintFromId(table.id));
     if (!catalogRemoveByName(name)) {
@@ -4782,6 +4806,7 @@ pub fn ib_table_drop(ib_trx: ib_trx_t, name: []const u8) ib_err_t {
     if (space_id != 0) {
         _ = fil.fil_delete_tablespace(space_id);
     }
+    _ = log_ddl.ddl_log_end(.drop, name, null);
     return .DB_SUCCESS;
 }
 
