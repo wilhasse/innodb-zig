@@ -420,6 +420,20 @@ pub fn log_shutdown() void {
     log_sys_close();
 }
 
+pub fn log_mark_dirty() ibool {
+    const sys = log_sys orelse return compat.FALSE;
+    log_persist_header(sys, false) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn log_recover_if_needed(available_memory: ulint) ibool {
+    const sys = log_sys orelse return compat.FALSE;
+    if (sys.was_clean_shutdown) {
+        return compat.TRUE;
+    }
+    return recv_scan_log_recs(available_memory);
+}
+
 pub fn log_append_bytes(data: []const u8) ?ib_uint64_t {
     const sys = log_sys orelse return null;
     const start_lsn = sys.current_lsn;

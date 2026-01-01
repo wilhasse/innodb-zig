@@ -925,6 +925,11 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     if (log_mod.log_sys_init(log_dir, log_files_in_group, @as(compat.ib_int64_t, @intCast(log_file_size)), log_buffer_size) == compat.FALSE) {
         return .DB_ERROR;
     }
+    const buffer_pool_size = if (cfgFind("buffer_pool_size")) |cfg_var| cfg_var.value.IB_CFG_ULINT else 0;
+    if (log_mod.log_recover_if_needed(@as(compat.ulint, @intCast(buffer_pool_size))) == compat.FALSE) {
+        return .DB_ERROR;
+    }
+    _ = log_mod.log_mark_dirty();
     buf_mod.buf_buddy_var_init();
     buf_mod.buf_LRU_var_init();
     buf_mod.buf_var_init();
