@@ -65,7 +65,7 @@ interfaces to avoid hard cycles where possible.
 ## Test Milestones
 - Step 1: unit tests for byte order, lists, and allocators
 - Step 2: deterministic tests for mutex/rw-lock wrappers and thread helpers
-- Step 3: redo log record encode/decode and file IO round-trip
+- Step 3: redo log header/create + buffer flush, record codec, recovery scan/apply
 - Step 4: page header parse/write and file-based list operations
 - Step 5: buffer pool LRU and page fetch/evict behavior
 - Step 6: B-tree insert/search on synthetic pages

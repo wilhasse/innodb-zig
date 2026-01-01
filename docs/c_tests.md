@@ -29,3 +29,7 @@ to run those tests using the existing Makefile targets.
 - These steps invoke `make test` and `make test-stress` in the C repo.
 - Failures usually mean the C tree is not configured or the libraries are
   missing (zlib/pthread).
+- Zig tests now cover redo log header/flush and recovery scan/apply; run
+  `zig build test` to exercise the log persistence path and startup recovery.
+- Log files are created under `log_group_home_dir` (default `.`); remove
+  `ib_logfile*` if you want a clean run.
