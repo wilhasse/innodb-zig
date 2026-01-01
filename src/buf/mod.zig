@@ -880,6 +880,27 @@ pub fn buf_flush_get_desired_flush_rate() ulint {
     return 0;
 }
 
+pub const BUF_ADAPTIVE_FLUSH_MAX: ulint = 32;
+
+pub fn buf_adaptive_flush() void {
+    const total = buf_pool_get_curr_size();
+    if (total == 0) {
+        return;
+    }
+    const rate = buf_flush_get_desired_flush_rate();
+    if (rate == 0) {
+        return;
+    }
+    var target = @as(ulint, @intCast((rate * total) / 100));
+    if (target == 0) {
+        target = 1;
+    }
+    if (target > BUF_ADAPTIVE_FLUSH_MAX) {
+        target = BUF_ADAPTIVE_FLUSH_MAX;
+    }
+    _ = buf_flush_batch(.BUF_FLUSH_LIST, target, 0);
+}
+
 pub fn buf_flush_validate() ibool {
     return compat.TRUE;
 }

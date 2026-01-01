@@ -99,6 +99,8 @@ pub var log_do_write: ibool = compat.TRUE;
 pub var log_debug_writes: ibool = compat.FALSE;
 pub var log_has_printed_chkp_warning: ibool = compat.FALSE;
 pub var log_last_warning_time: i64 = 0;
+pub var log_adaptive_flushing: ibool = compat.TRUE;
+pub var log_adaptive_flush_cb: ?*const fn () void = null;
 var log_writer_stop_flag = std.atomic.Value(bool).init(false);
 var log_writer_thread: ?std.Thread = null;
 
@@ -109,6 +111,8 @@ pub fn log_var_init() void {
     log_debug_writes = compat.FALSE;
     log_has_printed_chkp_warning = compat.FALSE;
     log_last_warning_time = 0;
+    log_adaptive_flushing = compat.TRUE;
+    log_adaptive_flush_cb = null;
 }
 
 fn log_write_header(file: *os_file.FileHandle, header: LogHeader) !void {
@@ -428,8 +432,20 @@ pub fn log_shutdown() void {
 
 fn log_writer_loop(sleep_us: u64) void {
     while (!log_writer_stop_flag.load(.seq_cst)) {
-        _ = log_flush();
+        log_writer_tick();
         std.Thread.sleep(sleep_us * std.time.ns_per_us);
+    }
+}
+
+pub fn log_writer_tick() void {
+    _ = log_flush();
+    if (log_adaptive_flushing == compat.TRUE) {
+        if (log_adaptive_flush_cb) |cb| {
+            cb();
+        }
+    }
+    if (log_sys) |sys| {
+        _ = log_checkpoint(sys.flushed_lsn);
     }
 }
 
@@ -1198,4 +1214,11 @@ test "log_calc_where_lsn_is positions lsn" {
     const file_no2 = log_calc_where_lsn_is(&offset, 1000, 500, 2, 8192);
     try std.testing.expect(file_no2 == 1);
     try std.testing.expect(offset == 7692);
+}
+pub fn log_set_adaptive_flushing(enabled: ibool) void {
+    log_adaptive_flushing = enabled;
+}
+
+pub fn log_set_adaptive_flush_callback(cb: ?*const fn () void) void {
+    log_adaptive_flush_cb = cb;
 }

@@ -939,13 +939,16 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
         return .DB_ERROR;
     }
     _ = log_mod.log_mark_dirty();
-    if (log_mod.log_writer_start(log_mod.LOG_WRITER_SLEEP_US) == compat.FALSE) {
-        return .DB_ERROR;
-    }
+    const adaptive_flushing = if (cfgFind("adaptive_flushing")) |cfg_var| cfg_var.value.IB_CFG_IBOOL else compat.IB_TRUE;
+    log_mod.log_set_adaptive_flushing(adaptive_flushing);
     buf_mod.buf_buddy_var_init();
     buf_mod.buf_LRU_var_init();
     buf_mod.buf_var_init();
     _ = buf_mod.buf_pool_init();
+    log_mod.log_set_adaptive_flush_callback(buf_mod.buf_adaptive_flush);
+    if (log_mod.log_writer_start(log_mod.LOG_WRITER_SLEEP_US) == compat.FALSE) {
+        return .DB_ERROR;
+    }
     fsp.fsp_init();
     const data_home_dir = if (cfgFind("data_home_dir")) |cfg_var| cfg_var.value.IB_CFG_TEXT else "./";
     const data_file_path = if (cfgFind("data_file_path")) |cfg_var| cfg_var.value.IB_CFG_TEXT else "ibdata1:32M:autoextend";
