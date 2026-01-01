@@ -345,6 +345,13 @@ fn dict_sys_metadata_clear() void {
     dict_sys.sys_indexes = .empty;
 }
 
+pub fn dict_sys_clear_in_memory() void {
+    const prev_hooks = dict_sys_btr_hooks;
+    dict_sys_btr_hooks = .{};
+    dict_sys_metadata_clear();
+    dict_sys_btr_hooks = prev_hooks;
+}
+
 pub fn dict_sys_table_insert(name: []const u8, table_id: dulint, space: ulint, n_cols: ulint, flags: ulint) ibool {
     for (dict_sys.sys_tables.items, 0..) |row, idx| {
         if (dulintEqual(row.id, table_id) or std.mem.eql(u8, row.name, name)) {
@@ -606,7 +613,7 @@ pub fn dict_sys_metadata_save() ibool {
     return compat.TRUE;
 }
 
-fn dict_sys_load_cache() void {
+pub fn dict_sys_load_cache() void {
     var heap = mem_heap_t{};
     for (dict_sys.sys_tables.items) |row| {
         if (dict_table_get_low(row.name) != null) {
@@ -730,7 +737,6 @@ pub fn dict_sys_metadata_load() ibool {
         }
     }
 
-    dict_sys_load_cache();
     return compat.TRUE;
 }
 

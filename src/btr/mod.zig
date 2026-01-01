@@ -422,6 +422,19 @@ fn index_state_remove(index: *dict_index_t) void {
     }
 }
 
+pub fn btr_index_states_clear() void {
+    var it = index_states.iterator();
+    while (it.next()) |entry| {
+        var block_it = entry.value_ptr.*.pages.valueIterator();
+        while (block_it.next()) |block_ptr| {
+            btr_block_destroy(block_ptr.*);
+        }
+        entry.value_ptr.*.pages.deinit();
+        std.heap.page_allocator.destroy(entry.value_ptr.*);
+    }
+    index_states.clearAndFree();
+}
+
 fn btr_node_ptr_set_child_page_no(rec: *rec_t, page_no: ulint) void {
     rec.child_page_no = page_no;
 }
@@ -4012,6 +4025,7 @@ test "btr load parses leaf records from bytes" {
 }
 
 test "btr create root and free" {
+    btr_index_states_clear();
     const allocator = std.heap.page_allocator;
     const index = allocator.create(dict_index_t) catch return error.OutOfMemory;
     index.* = .{};

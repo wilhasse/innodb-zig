@@ -974,6 +974,7 @@ pub fn ib_startup(format: ?[]const u8) ib_err_t {
     dict.dict_create();
     _ = dict.dict_sys_metadata_load();
     dict_sys_btr.dict_sys_btr_init(std.heap.page_allocator);
+    _ = dict_sys_btr.dict_sys_btr_load_cache();
 
     cfg_started = true;
     return .DB_SUCCESS;

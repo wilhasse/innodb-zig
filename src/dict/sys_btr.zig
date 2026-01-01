@@ -26,8 +26,35 @@ const SysBtrState = struct {
 
 var sys_btr: ?*SysBtrState = null;
 
+const SYS_TABLES_FIXED_LEN: usize = 8 + 4 + 4 + 4;
+const SYS_COLUMNS_FIXED_LEN: usize = 8 + 8 + 4 + 4 + 4 + 4;
+const SYS_INDEXES_FIXED_LEN: usize = 8 + 8 + 4 + 4;
+
 fn dulintToU64(id: dict.dulint) u64 {
     return (@as(u64, id.high) << 32) | id.low;
+}
+
+fn dulintFromU64(val: u64) dict.dulint {
+    return .{
+        .high = @as(dict.ulint, @intCast(val >> 32)),
+        .low = @as(dict.ulint, @intCast(val & 0xFFFF_FFFF)),
+    };
+}
+
+fn recDataSlice(rec: *btr.rec_t) ?[]const u8 {
+    const rec_bytes = rec.rec_bytes orelse return null;
+    if (rec.rec_offset == 0 or rec.rec_offset > rec_bytes.len) {
+        return null;
+    }
+    return rec_bytes[@as(usize, @intCast(rec.rec_offset))..];
+}
+
+fn readU64Slice(bytes: []const u8) u64 {
+    return std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(bytes.ptr)), .little);
+}
+
+fn readU32Slice(bytes: []const u8) u32 {
+    return std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(bytes.ptr)), .little);
 }
 
 fn dtupleKey(tuple: *const data.dtuple_t) i64 {
@@ -216,6 +243,127 @@ fn dictSysBtrInsertIndex(row: dict.dict_sys_index_row_t) void {
     btrInsert(state.indexes_index, &tuple);
 }
 
+fn loadSysTables(state: *SysBtrState) bool {
+    var cursor = btr.btr_cur_t{};
+    var mtr = btr.mtr_t{};
+    btr.btr_cur_open_at_index_side_func(compat.TRUE, state.tables_index, 0, &cursor, module_name, 0, &mtr);
+    var rec_opt = btr.btr_get_next_user_rec(cursor.rec, null);
+    while (rec_opt) |rec| {
+        const data_bytes = recDataSlice(rec) orelse return false;
+        if (data_bytes.len < SYS_TABLES_FIXED_LEN) {
+            return false;
+        }
+        const name_len = data_bytes.len - SYS_TABLES_FIXED_LEN;
+        const id_val = readU64Slice(data_bytes[0..8]);
+        const name_bytes = data_bytes[8 .. 8 + name_len];
+        const space_val = readU32Slice(data_bytes[8 + name_len .. 12 + name_len]);
+        const n_cols_val = readU32Slice(data_bytes[12 + name_len .. 16 + name_len]);
+        const flags_val = readU32Slice(data_bytes[16 + name_len .. 20 + name_len]);
+        if (dict.dict_sys_table_insert(
+            name_bytes,
+            dulintFromU64(id_val),
+            @as(dict.ulint, @intCast(space_val)),
+            @as(dict.ulint, @intCast(n_cols_val)),
+            @as(dict.ulint, @intCast(flags_val)),
+        ) == compat.FALSE) {
+            return false;
+        }
+        rec_opt = btr.btr_get_next_user_rec(rec, null);
+    }
+    return true;
+}
+
+fn loadSysColumns(state: *SysBtrState, max_row_id: *u64) bool {
+    var cursor = btr.btr_cur_t{};
+    var mtr = btr.mtr_t{};
+    btr.btr_cur_open_at_index_side_func(compat.TRUE, state.columns_index, 0, &cursor, module_name, 0, &mtr);
+    var rec_opt = btr.btr_get_next_user_rec(cursor.rec, null);
+    while (rec_opt) |rec| {
+        const data_bytes = recDataSlice(rec) orelse return false;
+        if (data_bytes.len < SYS_COLUMNS_FIXED_LEN) {
+            return false;
+        }
+        const name_len = data_bytes.len - SYS_COLUMNS_FIXED_LEN;
+        const row_id_val = readU64Slice(data_bytes[0..8]);
+        if (row_id_val > max_row_id.*) {
+            max_row_id.* = row_id_val;
+        }
+        const table_id_val = readU64Slice(data_bytes[8..16]);
+        const name_bytes = data_bytes[16 .. 16 + name_len];
+        const pos_val = readU32Slice(data_bytes[16 + name_len .. 20 + name_len]);
+        const mtype_val = readU32Slice(data_bytes[20 + name_len .. 24 + name_len]);
+        const prtype_val = readU32Slice(data_bytes[24 + name_len .. 28 + name_len]);
+        const len_val = readU32Slice(data_bytes[28 + name_len .. 32 + name_len]);
+        if (dict.dict_sys_column_insert(
+            dulintFromU64(table_id_val),
+            name_bytes,
+            @as(dict.ulint, @intCast(pos_val)),
+            @as(dict.ulint, @intCast(mtype_val)),
+            @as(dict.ulint, @intCast(prtype_val)),
+            @as(dict.ulint, @intCast(len_val)),
+        ) == compat.FALSE) {
+            return false;
+        }
+        rec_opt = btr.btr_get_next_user_rec(rec, null);
+    }
+    return true;
+}
+
+fn loadSysIndexes(state: *SysBtrState) bool {
+    var cursor = btr.btr_cur_t{};
+    var mtr = btr.mtr_t{};
+    btr.btr_cur_open_at_index_side_func(compat.TRUE, state.indexes_index, 0, &cursor, module_name, 0, &mtr);
+    var rec_opt = btr.btr_get_next_user_rec(cursor.rec, null);
+    while (rec_opt) |rec| {
+        const data_bytes = recDataSlice(rec) orelse return false;
+        if (data_bytes.len < SYS_INDEXES_FIXED_LEN) {
+            return false;
+        }
+        const name_len = data_bytes.len - SYS_INDEXES_FIXED_LEN;
+        const id_val = readU64Slice(data_bytes[0..8]);
+        const table_id_val = readU64Slice(data_bytes[8..16]);
+        const name_bytes = data_bytes[16 .. 16 + name_len];
+        const type_val = readU32Slice(data_bytes[16 + name_len .. 20 + name_len]);
+        const space_val = readU32Slice(data_bytes[20 + name_len .. 24 + name_len]);
+        if (dict.dict_sys_index_insert(
+            dulintFromU64(table_id_val),
+            dulintFromU64(id_val),
+            name_bytes,
+            @as(dict.ulint, @intCast(type_val)),
+            @as(dict.ulint, @intCast(space_val)),
+        ) == compat.FALSE) {
+            return false;
+        }
+        rec_opt = btr.btr_get_next_user_rec(rec, null);
+    }
+    return true;
+}
+
+pub fn dict_sys_btr_load_cache() compat.ibool {
+    const state = ensureSysBtr(std.heap.page_allocator);
+    const prev_hooks = dict.dict_sys_btr_hooks;
+    dict.dict_sys_btr_set_hooks(.{});
+    defer dict.dict_sys_btr_set_hooks(prev_hooks);
+
+    dict.dict_sys_clear_in_memory();
+
+    var max_row_id: u64 = 0;
+    if (!loadSysTables(state)) {
+        return compat.FALSE;
+    }
+    if (!loadSysColumns(state, &max_row_id)) {
+        return compat.FALSE;
+    }
+    if (!loadSysIndexes(state)) {
+        return compat.FALSE;
+    }
+    if (max_row_id != 0) {
+        dict.dict_sys.row_id = dulintFromU64(max_row_id + 1);
+    }
+    dict.dict_sys_load_cache();
+    return compat.TRUE;
+}
+
 pub fn dict_sys_btr_init(allocator: std.mem.Allocator) void {
     dictSysBtrClear();
     _ = ensureSysBtr(allocator);
@@ -262,4 +410,22 @@ test "dict sys tables stored in BTR index" {
 
     const found = dict_sys_btr_find_table(.{ .high = 0, .low = 42 });
     try std.testing.expect(found != null);
+}
+
+test "dict sys btr load cache rebuilds dict tables" {
+    dict.dict_var_init();
+    dict.dict_init();
+    dict.dict_create();
+    dict_sys_btr_init(std.testing.allocator);
+    defer dict_sys_btr_clear();
+
+    const table_id: dict.dulint = .{ .high = 0, .low = 42 };
+    const index_id: dict.dulint = .{ .high = 0, .low = 43 };
+    _ = dict.dict_sys_table_insert("db/sys_test", table_id, 0, 1, 0);
+    _ = dict.dict_sys_column_insert(table_id, "id", 0, data.DATA_INT, data.DATA_UNSIGNED, 4);
+    _ = dict.dict_sys_index_insert(table_id, index_id, "PRIMARY", dict.DICT_CLUSTERED | dict.DICT_UNIQUE, 0);
+
+    try std.testing.expectEqual(compat.TRUE, dict_sys_btr_load_cache());
+    try std.testing.expect(dict.dict_table_get_low("db/sys_test") != null);
+    try std.testing.expect(dict.dict_index_find_on_id_low(index_id) != null);
 }
