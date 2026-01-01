@@ -50,6 +50,7 @@ comptime {
         _ = @import("tests/ib_mvcc.zig");
         _ = @import("tests/ib_perf1.zig");
         _ = @import("tests/ib_recover.zig");
+        _ = @import("tests/ib_redo_apply.zig");
         _ = @import("tests/ib_restart_persist.zig");
         _ = @import("tests/ib_search.zig");
         _ = @import("tests/ib_shutdown.zig");

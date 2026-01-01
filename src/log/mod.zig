@@ -2,6 +2,7 @@ const std = @import("std");
 const ArrayList = std.array_list.Managed;
 const compat = @import("../ut/compat.zig");
 const ha = @import("../ha/mod.zig");
+const mach = @import("../mach/mod.zig");
 const os_file = @import("../os/file.zig");
 const fil = @import("../fil/mod.zig");
 
@@ -35,7 +36,12 @@ const LOG_HDR_FLUSHED_LSN_OFF: usize = 24;
 const LOG_HDR_CLEAN_SHUTDOWN_OFF: usize = 32;
 
 const REDO_RECORD_HEADER_SIZE: usize = 1 + 4 + 4 + 4;
-pub const LOG_REC_PAGE_LSN: u8 = 1;
+pub const LOG_REC_PAGE_LSN: u8 = 200;
+const MLOG_1BYTE: u8 = 1;
+const MLOG_2BYTES: u8 = 2;
+const MLOG_4BYTES: u8 = 4;
+const MLOG_8BYTES: u8 = 8;
+const MLOG_WRITE_STRING: u8 = 30;
 
 const LogError = error{
     InvalidHeader,
@@ -869,6 +875,87 @@ fn page_set_lsn(page: [*]byte, lsn: ib_uint64_t) void {
     std.mem.writeInt(u64, slice, lsn, .big);
 }
 
+fn recv_parse_nbytes(type_: u8, ptr: [*]byte, end_ptr: [*]byte, page: [*]byte) ?[*]byte {
+    std.debug.assert(type_ <= MLOG_8BYTES);
+
+    if (@intFromPtr(end_ptr) < @intFromPtr(ptr + 2)) {
+        return null;
+    }
+
+    const offset = mach.mach_read_from_2(ptr);
+    var next = ptr + 2;
+
+    if (offset >= compat.UNIV_PAGE_SIZE) {
+        if (recv_sys) |sys| {
+            sys.found_corrupt_log = compat.TRUE;
+        }
+        return null;
+    }
+
+    if (type_ == MLOG_8BYTES) {
+        var dval: compat.Dulint = .{ .high = 0, .low = 0 };
+        next = mach.mach_dulint_parse_compressed(next, end_ptr, &dval) orelse return null;
+        mach.mach_write_to_8(page + offset, dval);
+        return next;
+    }
+
+    var val: ulint = 0;
+    next = mach.mach_parse_compressed(next, end_ptr, &val) orelse return null;
+
+    switch (type_) {
+        MLOG_1BYTE => {
+            if (val > 0xFF) {
+                if (recv_sys) |sys| {
+                    sys.found_corrupt_log = compat.TRUE;
+                }
+                return null;
+            }
+            mach.mach_write_to_1(page + offset, val);
+        },
+        MLOG_2BYTES => {
+            if (val > 0xFFFF) {
+                if (recv_sys) |sys| {
+                    sys.found_corrupt_log = compat.TRUE;
+                }
+                return null;
+            }
+            mach.mach_write_to_2(page + offset, val);
+        },
+        MLOG_4BYTES => {
+            mach.mach_write_to_4(page + offset, val);
+        },
+        else => return null,
+    }
+
+    return next;
+}
+
+fn recv_parse_string(ptr: [*]byte, end_ptr: [*]byte, page: [*]byte) ?[*]byte {
+    if (@intFromPtr(end_ptr) < @intFromPtr(ptr + 4)) {
+        return null;
+    }
+
+    const offset = mach.mach_read_from_2(ptr);
+    const len = mach.mach_read_from_2(ptr + 2);
+    const next = ptr + 4;
+
+    if (offset >= compat.UNIV_PAGE_SIZE or len + offset > compat.UNIV_PAGE_SIZE) {
+        if (recv_sys) |sys| {
+            sys.found_corrupt_log = compat.TRUE;
+        }
+        return null;
+    }
+
+    if (@intFromPtr(end_ptr) < @intFromPtr(next + len)) {
+        return null;
+    }
+
+    const dst = page[offset .. offset + len];
+    const src = next[0..len];
+    std.mem.copyForwards(u8, dst, src);
+    return next + len;
+}
+
 pub fn recv_apply_log_recs(space: ulint, page_no: ulint, page: [*]byte) ibool {
     const sys = recv_sys orelse return compat.FALSE;
     if (sys.apply_log_recs == compat.FALSE) {
@@ -887,6 +974,14 @@ pub fn recv_apply_log_recs(space: ulint, page_no: ulint, page: [*]byte) ibool {
                 if (payload.len >= 8) {
                     lsn_to_apply = std.mem.readInt(u64, payload[0..8], .big);
                 }
+            }
+        } else if (rec.payload) |payload| {
+            const payload_ptr = @constCast(payload.ptr);
+            const payload_end = payload_ptr + payload.len;
+            if (rec.type_ <= MLOG_8BYTES) {
+                _ = recv_parse_nbytes(rec.type_, payload_ptr, payload_end, page);
+            } else if (rec.type_ == MLOG_WRITE_STRING) {
+                _ = recv_parse_string(payload_ptr, payload_end, page);
             }
         }
         page_set_lsn(page, lsn_to_apply);

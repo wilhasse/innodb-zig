@@ -69,28 +69,67 @@ pub fn mtr_start(mtr: *mtr_t) *mtr_t {
 
 fn mtr_log_reserve_and_write(mtr: *mtr_t) void {
     const mlog = &mtr.log;
-    if (mtr.n_log_recs > 1) {
-        mlog_catenate_ulint(mtr, MLOG_MULTI_REC_END, MLOG_1BYTE);
-    } else {
-        const first = dyn.dyn_block_get_data(mlog);
-        first[0] = @as(byte, @intCast(@as(ulint, first[0]) | MLOG_SINGLE_REC_FLAG));
+    const data_size = dyn.dyn_array_get_data_size(mlog);
+    if (data_size == 0) {
+        return;
     }
 
-    var total: u64 = 0;
-    var start_lsn: ?u64 = null;
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, @as(usize, @intCast(data_size))) catch return;
+    defer allocator.free(buf);
+
+    var offset: usize = 0;
     var block: ?*dyn.dyn_block_t = dyn.dyn_array_get_first_block(mlog);
     while (block) |cur| {
         const used = dyn.dyn_block_get_used(cur);
         if (used > 0) {
             const data = dyn.dyn_block_get_data(cur)[0..@as(usize, @intCast(used))];
-            const lsn = log.log_append_bytes(data) orelse return;
-            if (start_lsn == null) {
-                start_lsn = lsn;
-            }
-            total += used;
+            std.mem.copyForwards(u8, buf[offset .. offset + data.len], data);
+            offset += data.len;
         }
         block = dyn.dyn_array_get_next_block(mlog, cur);
     }
+
+    var ptr: [*]byte = buf.ptr;
+    const end_ptr: [*]byte = buf.ptr + buf.len;
+    var total: u64 = 0;
+    var start_lsn: ?u64 = null;
+
+    while (@intFromPtr(ptr) < @intFromPtr(end_ptr)) {
+        var type_out: byte = 0;
+        var space: ulint = 0;
+        var page_no: ulint = 0;
+        const after_hdr = mlog_parse_initial_log_record(ptr, end_ptr, &type_out, &space, &page_no) orelse break;
+        var next_ptr: ?[*]byte = null;
+        if (type_out <= MLOG_8BYTES) {
+            next_ptr = mlog_parse_nbytes(type_out, after_hdr, end_ptr, null, null);
+        } else if (type_out == MLOG_WRITE_STRING) {
+            next_ptr = mlog_parse_string(after_hdr, end_ptr, null, null);
+        } else {
+            break;
+        }
+        const record_end = next_ptr orelse break;
+        const payload_len = @as(usize, @intCast(@intFromPtr(record_end) - @intFromPtr(after_hdr)));
+        const payload = @as([]const u8, after_hdr[0..payload_len]);
+
+        const rec = log.RedoRecord{
+            .type_ = type_out,
+            .space = @as(u32, @intCast(space)),
+            .page_no = @as(u32, @intCast(page_no)),
+            .payload = payload,
+        };
+        const rec_len = log.redo_record_size(rec);
+        const rec_buf = allocator.alloc(u8, rec_len) catch return;
+        defer allocator.free(rec_buf);
+        _ = log.redo_record_encode(rec_buf, rec) catch return;
+        const lsn = log.log_append_bytes(rec_buf) orelse return;
+        if (start_lsn == null) {
+            start_lsn = lsn;
+        }
+        total += rec_len;
+        ptr = record_end;
+    }
+
     if (start_lsn) |lsn| {
         mtr.start_lsn = lsn;
         mtr.end_lsn = lsn + total;
@@ -517,17 +556,17 @@ test "mtr commit writes log bytes to buffer" {
     try std.testing.expect(mtr.end_lsn >= mtr.start_lsn);
 
     const buf = sys.log_buf.?[0..@as(usize, @intCast(sys.log_buf_used))];
-    var expected: [32]u8 = undefined;
-    var pos: usize = 0;
-    expected[pos] = @as(byte, @intCast(MLOG_SINGLE_REC_FLAG | MLOG_1BYTE));
-    pos += 1;
-    pos += @as(usize, @intCast(mach.mach_write_compressed(expected[pos..].ptr, 5)));
-    pos += @as(usize, @intCast(mach.mach_write_compressed(expected[pos..].ptr, 17)));
-    mach.mach_write_to_2(expected[pos..].ptr, 128);
-    pos += 2;
-    pos += @as(usize, @intCast(mach.mach_write_compressed(expected[pos..].ptr, 0xCC)));
+    const rec = try log.redo_record_decode(buf);
+    try std.testing.expectEqual(@as(byte, MLOG_1BYTE), rec.type_);
+    try std.testing.expectEqual(@as(u32, 5), rec.space);
+    try std.testing.expectEqual(@as(u32, 17), rec.page_no);
 
-    try std.testing.expectEqualSlices(u8, expected[0..pos], buf[0..pos]);
+    var applied = [_]byte{0} ** compat.UNIV_PAGE_SIZE;
+    const payload_ptr = @constCast(rec.payload.ptr);
+    const end_ptr = payload_ptr + rec.payload.len;
+    const res = mlog_parse_nbytes(MLOG_1BYTE, payload_ptr, end_ptr, applied[0..].ptr, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(res == end_ptr);
+    try std.testing.expectEqual(@as(byte, 0xCC), applied[128]);
 }
 
 fn mlog_collect_bytes(allocator: std.mem.Allocator, arr: *dyn.dyn_array_t) ![]u8 {
