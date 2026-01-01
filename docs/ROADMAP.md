@@ -74,6 +74,14 @@ interfaces to avoid hard cycles where possible.
 - Step 9: server start/stop and API smoke tests
 - Step 10: MVCC read view visibility and rollback coverage
 
+## Locking System (IBD-217 to IBD-224)
+- Lock mode compatibility + stronger-or-equal checks (lock0lock.c)
+- lock_sys hash tables for table/record queues + trx lock lists
+- Table and record lock request/release with wait flag
+- Wait-for graph with basic deadlock cycle detection
+- API integration for table/record locks in cursor DML paths
+- Tests: lock conflicts, deadlock detection, commit releases locks
+
 ## MVCC and Undo Log Implementation (IBD-208 to IBD-216)
 
 The transaction system now includes multi-version concurrency control (MVCC)

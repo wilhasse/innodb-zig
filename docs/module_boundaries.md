@@ -16,7 +16,7 @@ subsystem layout.
 - fut: File-based list utilities on pages.
 - ha: Handler glue for MySQL integration.
 - ibuf: Insert buffer and change buffer operations.
-- lock: Locking system and lock compatibility.
+- lock: Locking system (table/record queues, wait graph, compatibility).
 - log: Redo log records and logging subsystem.
 - mach: Byte order, encoding, and integer packing.
 - mem: Memory heaps and allocation helpers.
