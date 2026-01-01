@@ -144,6 +144,10 @@ pub fn page_set_index_id_bytes(page: [*]byte, id: compat.Dulint) void {
     mach.mach_write_to_8(page + PAGE_HEADER + PAGE_INDEX_ID, id);
 }
 
+pub fn page_set_level_bytes(page: [*]byte, level: ulint) void {
+    mach.mach_write_to_2(page + PAGE_HEADER + PAGE_LEVEL, level);
+}
+
 pub fn page_dir_get_nth_slot(page: [*]const byte, n: ulint) [*]const byte {
     const offs = compat.UNIV_PAGE_SIZE - PAGE_DIR - (n + 1) * PAGE_DIR_SLOT_SIZE;
     return page + @as(usize, @intCast(offs));

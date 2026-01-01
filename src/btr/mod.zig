@@ -161,6 +161,152 @@ pub fn btr_root_block_get(index: *dict_index_t, mtr: *mtr_t) ?*buf_block_t {
     return btr_page_load_from_disk(index, index.page);
 }
 
+fn btr_page_parse_from_bytes(index: *dict_index_t, block: *buf_block_t) bool {
+    if (block.bytes.len != compat.UNIV_PAGE_SIZE) {
+        return false;
+    }
+    const bytes = block.bytes;
+    const max_slots = (compat.UNIV_PAGE_SIZE - page.PAGE_DIR) / page.PAGE_DIR_SLOT_SIZE;
+    const n_slots = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_N_DIR_SLOTS);
+    if (n_slots > max_slots) {
+        return false;
+    }
+    const heap_top = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_HEAP_TOP);
+    if (heap_top == 0 or heap_top > compat.UNIV_PAGE_SIZE - page.PAGE_DIR) {
+        return false;
+    }
+
+    block.frame.header.n_dir_slots = n_slots;
+    block.frame.header.heap_top = heap_top;
+    block.frame.header.n_heap = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_N_HEAP);
+    block.frame.header.free = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_FREE);
+    block.frame.header.garbage = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_GARBAGE);
+    block.frame.header.last_insert = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_LAST_INSERT);
+    block.frame.header.direction = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_DIRECTION);
+    block.frame.header.n_direction = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_N_DIRECTION);
+    block.frame.header.max_trx_id = page.page_get_max_trx_id_bytes(bytes.ptr);
+    block.frame.header.level = page.page_header_get_field_bytes(bytes.ptr, page.PAGE_LEVEL);
+    block.frame.header.index_id = page.page_get_index_id_bytes(bytes.ptr);
+
+    block.frame.infimum.prev = null;
+    block.frame.infimum.next = &block.frame.supremum;
+    block.frame.supremum.prev = &block.frame.infimum;
+    block.frame.supremum.next = null;
+
+    if (n_slots == 0) {
+        block.frame.header.n_recs = 0;
+        return true;
+    }
+
+    const allocator = std.heap.page_allocator;
+    const leaf_meta = build_index_meta(index, allocator) orelse return false;
+    defer allocator.free(leaf_meta);
+
+    const node_meta = [_]rec_mod.FieldMeta{
+        .{ .fixed_len = @sizeOf(i64), .nullable = false },
+        .{ .fixed_len = @sizeOf(u32), .nullable = false },
+    };
+
+    var prev: *rec_t = &block.frame.infimum;
+    var count: ulint = 0;
+    var i: ulint = 0;
+    while (i < n_slots) : (i += 1) {
+        const rec_offs = page.page_dir_get_nth_slot_val(bytes.ptr, i);
+        if (rec_offs == 0 or rec_offs >= compat.UNIV_PAGE_SIZE - page.PAGE_DIR) {
+            continue;
+        }
+        const rec_ptr = bytes.ptr + @as(usize, @intCast(rec_offs));
+        const is_node_ptr = rec_mod.rec_get_status(rec_ptr) == rec_mod.REC_STATUS_NODE_PTR;
+        const meta = if (is_node_ptr) node_meta[0..] else leaf_meta;
+        if (meta.len == 0) {
+            continue;
+        }
+
+        const needed = @as(usize, @intCast(rec_mod.REC_OFFS_HEADER_SIZE + 1 + @as(ulint, @intCast(meta.len))));
+        var offsets_buf = [_]ulint{0} ** rec_mod.REC_OFFS_NORMAL_SIZE;
+        var offsets: []ulint = offsets_buf[0..];
+        var heap_offsets: ?[]ulint = null;
+        if (needed > offsets_buf.len) {
+            heap_offsets = allocator.alloc(ulint, needed) catch continue;
+            offsets = heap_offsets.?;
+        } else {
+            offsets = offsets_buf[0..needed];
+        }
+        defer if (heap_offsets) |offs| allocator.free(offs);
+
+        rec_mod.rec_init_offsets_compact(rec_ptr, rec_mod.REC_N_NEW_EXTRA_BYTES, meta, offsets);
+        const base0 = offsets[rec_mod.REC_OFFS_HEADER_SIZE] & rec_mod.REC_OFFS_MASK;
+        const header_len = base0 + 1;
+        if (rec_offs < header_len) {
+            continue;
+        }
+        const n_fields = rec_mod.rec_offs_n_fields(offsets);
+        var data_len: ulint = 0;
+        if (n_fields > 0) {
+            data_len = offsets[rec_mod.REC_OFFS_HEADER_SIZE + @as(usize, @intCast(n_fields))] & rec_mod.REC_OFFS_MASK;
+        }
+        const total_len = header_len + data_len;
+        const rec_start = rec_offs - header_len;
+        if (@as(usize, @intCast(rec_start + total_len)) > bytes.len) {
+            continue;
+        }
+
+        const rec_bytes = allocator.alloc(u8, @as(usize, @intCast(total_len))) catch continue;
+        const start_idx = @as(usize, @intCast(rec_start));
+        const end_idx = @as(usize, @intCast(rec_start + total_len));
+        std.mem.copyForwards(u8, rec_bytes, bytes[start_idx..end_idx]);
+
+        const rec = allocator.create(rec_t) catch {
+            allocator.free(rec_bytes);
+            continue;
+        };
+        rec.* = .{
+            .rec_bytes = rec_bytes,
+            .rec_offset = header_len,
+            .rec_page_offset = rec_offs,
+            .deleted = rec_mod.rec_get_deleted_flag(rec_ptr, true) != 0,
+            .min_rec_mark = rec_mod.rec_get_min_rec_flag(rec_ptr, true) != 0,
+        };
+        rec.page = block.frame;
+
+        if (n_fields > 0) {
+            var len: ulint = 0;
+            const field_ptr = rec_mod.rec_get_nth_field(rec_ptr, offsets, 0, &len);
+            if (len != compat.UNIV_SQL_NULL) {
+                rec.key = rec_field_to_i64(field_ptr, len);
+            }
+        }
+
+        if (is_node_ptr and n_fields >= 2) {
+            var len: ulint = 0;
+            const field_ptr = rec_mod.rec_get_nth_field(rec_ptr, offsets, 1, &len);
+            if (len == @sizeOf(u32)) {
+                const buf = @as([*]const u8, @ptrCast(field_ptr))[0..4];
+                rec.child_page_no = @as(ulint, @intCast(std.mem.readInt(u32, buf, .little)));
+            }
+        }
+
+        if (rec.child_page_no != 0) {
+            if (index_states.get(index)) |state| {
+                if (state.pages.get(rec.child_page_no)) |child| {
+                    rec.child_block = child;
+                    child.frame.parent_block = block;
+                }
+            }
+        }
+
+        rec.prev = prev;
+        rec.next = &block.frame.supremum;
+        prev.next = rec;
+        block.frame.supremum.prev = rec;
+        prev = rec;
+        count += 1;
+    }
+
+    block.frame.header.n_recs = count;
+    return true;
+}
+
 fn btr_page_load_from_disk(index: *dict_index_t, page_no: ulint) ?*buf_block_t {
     if (fil.fil_tablespace_exists_in_mem(index.space) == compat.FALSE) {
         return null;
@@ -198,6 +344,10 @@ fn btr_page_load_from_disk(index: *dict_index_t, page_no: ulint) ?*buf_block_t {
         return null;
     };
     std.mem.copyForwards(u8, bytes, buf_block.frame);
+    _ = btr_page_parse_from_bytes(index, block);
+    if (page_no == index.page) {
+        index.root_level = block.frame.header.level;
+    }
 
     const state = index_state_get(index) orelse {
         btr_block_destroy(block);
@@ -232,6 +382,14 @@ fn btr_page_set_level(page_obj: *page_t, page_zip: ?*page_zip_des_t, level: ulin
 fn btr_page_get_level(page_obj: *const page_t, mtr: *mtr_t) ulint {
     _ = mtr;
     return page_obj.header.level;
+}
+
+fn btr_page_bytes_set_header(block: *buf_block_t, index: *dict_index_t, level: ulint) void {
+    if (block.bytes.len == 0) {
+        return;
+    }
+    page.page_set_level_bytes(block.bytes.ptr, level);
+    page.page_set_index_id_bytes(block.bytes.ptr, index.id);
 }
 
 fn index_state_get(index: *dict_index_t) ?*IndexState {
@@ -282,6 +440,7 @@ fn btr_page_create(block: *buf_block_t, page_zip: ?*page_zip_des_t, index: *dict
     btr_page_set_index_id(block.frame, page_zip, index.id, mtr);
     if (btr_block_bytes_ensure(block)) |bytes| {
         page.page_bytes_reset(bytes);
+        btr_page_bytes_set_header(block, index, level);
     }
 }
 
@@ -296,6 +455,7 @@ fn btr_page_empty(block: *buf_block_t, page_zip: ?*page_zip_des_t, index: *dict_
     btr_page_set_index_id(block.frame, page_zip, index.id, mtr);
     if (btr_block_bytes_ensure(block)) |bytes| {
         page.page_bytes_reset(bytes);
+        btr_page_bytes_set_header(block, index, level);
     }
 }
 
@@ -404,6 +564,53 @@ fn build_tuple_meta(entry: *const dtuple_t, allocator: std.mem.Allocator) ?[]rec
         }
     }
     return metas;
+}
+
+fn build_index_meta(index: *const dict_index_t, allocator: std.mem.Allocator) ?[]rec_mod.FieldMeta {
+    const n_fields = @as(usize, @intCast(index.n_fields));
+    if (n_fields == 0) {
+        return null;
+    }
+    const metas = allocator.alloc(rec_mod.FieldMeta, n_fields) catch return null;
+    var i: usize = 0;
+    while (i < n_fields) : (i += 1) {
+        const field = dict.dict_index_get_nth_field(index, @intCast(i)) orelse {
+            metas[i] = .{};
+            continue;
+        };
+        const col = dict.dict_field_get_col(field) orelse {
+            metas[i] = .{};
+            continue;
+        };
+        var fixed_len = dict.dict_col_get_fixed_size(col, 1);
+        var max_len: ulint = 0;
+        if (fixed_len == 0) {
+            max_len = dict.dict_col_get_max_size(col);
+        }
+        if (field.prefix_len != 0) {
+            if (fixed_len != 0) {
+                fixed_len = @min(fixed_len, field.prefix_len);
+            } else if (max_len != 0) {
+                max_len = @min(max_len, field.prefix_len);
+            }
+        }
+        const nullable = (col.prtype & data.DATA_NOT_NULL) == 0;
+        metas[i] = .{
+            .fixed_len = fixed_len,
+            .max_len = max_len,
+            .nullable = nullable,
+            .is_blob = col.mtype == data.DATA_BLOB,
+        };
+    }
+    return metas;
+}
+
+fn rec_field_to_i64(ptr: [*]const byte, len: ulint) i64 {
+    return switch (len) {
+        4 => @as(i64, @intCast(std.mem.readInt(i32, @as([*]const u8, @ptrCast(ptr))[0..4], .little))),
+        8 => std.mem.readInt(i64, @as([*]const u8, @ptrCast(ptr))[0..8], .little),
+        else => 0,
+    };
 }
 
 fn rec_ptr_for_compare(index: *dict_index_t, rec: *const rec_t) ?[*]const byte {
@@ -847,8 +1054,16 @@ fn descend_to_level(index: *dict_index_t, target_level: ulint, from_left: bool) 
     while (level > target_level) {
         const node_ptr = if (from_left) page_first_user_rec(block.frame) else page_last_user_rec(block.frame);
         const rec = node_ptr orelse return block;
-        const child = rec.child_block orelse return block;
-        block = child;
+        var child = rec.child_block;
+        if (child == null and rec.child_page_no != 0) {
+            child = btr_page_load_from_disk(index, rec.child_page_no);
+            if (child) |blk| {
+                rec.child_block = blk;
+                blk.frame.parent_block = block;
+            }
+        }
+        const next_block = child orelse return block;
+        block = next_block;
         level = block.frame.header.level;
     }
     if (target_level == 0) {
@@ -866,10 +1081,21 @@ fn descend_to_level(index: *dict_index_t, target_level: ulint, from_left: bool) 
 }
 
 pub fn btr_node_ptr_get_child(node_ptr: *const rec_t, index: *dict_index_t, offsets: *const ulint, mtr: *mtr_t) ?*buf_block_t {
-    _ = index;
     _ = offsets;
     _ = mtr;
-    return node_ptr.child_block;
+    if (node_ptr.child_block) |blk| {
+        return blk;
+    }
+    if (node_ptr.child_page_no == 0) {
+        return null;
+    }
+    const loaded = btr_page_load_from_disk(index, node_ptr.child_page_no) orelse return null;
+    const mut = @constCast(node_ptr);
+    mut.child_block = loaded;
+    if (btr_block_for_rec(index, mut)) |parent_block| {
+        loaded.frame.parent_block = parent_block;
+    }
+    return loaded;
 }
 
 pub fn btr_page_get_father_node_ptr_func(
@@ -1016,6 +1242,7 @@ pub fn btr_page_alloc(index: *dict_index_t, hint_page_no: ulint, file_direction:
         btr_block_destroy(block);
         return null;
     };
+    btr_page_bytes_set_header(block, index, level);
 
     if (fil.fil_tablespace_exists_in_mem(index.space) == compat.TRUE) {
         buf_mod.buf_flush_init_for_writing(bytes.ptr, null, 0);
@@ -3684,6 +3911,95 @@ test "btr page fetch reads from disk via buf" {
         try std.testing.expectEqual(@as(u8, 0x5A), loaded.bytes[0]);
         try std.testing.expectEqual(@as(u8, 0xA5), loaded.bytes[1]);
     }
+}
+
+test "btr load parses leaf records from bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const prev_path = fil.fil_path_to_client_datadir;
+    fil.fil_path_to_client_datadir = base;
+    defer fil.fil_path_to_client_datadir = prev_path;
+
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+
+    var space_id: ulint = 0;
+    const create_err = fil.fil_create_new_single_table_tablespace(&space_id, "btrparse", compat.FALSE, 0, 4);
+    try std.testing.expectEqual(fil.DB_SUCCESS, create_err);
+
+    const table = dict.dict_mem_table_create("db/t1", space_id, 1, 0) orelse return error.OutOfMemory;
+    defer dict.dict_mem_table_free(table);
+    dict.dict_mem_table_add_col(table, null, "id", data.DATA_INT, data.DATA_NOT_NULL, @sizeOf(i64));
+
+    const index = dict.dict_mem_index_create("db/t1", "PRIMARY", space_id, dict.DICT_CLUSTERED | dict.DICT_UNIQUE, 1) orelse return error.OutOfMemory;
+    defer dict.dict_mem_index_free(index);
+    index.table = table;
+    index.n_uniq = 1;
+    index.n_uniq_in_tree = 1;
+    dict.dict_index_add_col(index, table, &table.cols.items[0], 0);
+
+    var mtr = mtr_t{};
+    _ = btr_create(0, space_id, 0, .{ .high = 0, .low = 111 }, index, &mtr);
+    const root_block = btr_root_block_get(index, &mtr) orelse return error.OutOfMemory;
+
+    var cursor = btr_cur_t{
+        .index = index,
+        .block = root_block,
+        .rec = page.page_get_infimum_rec(root_block.frame),
+        .opened = true,
+    };
+    var rec_out: ?*rec_t = null;
+    var big_rec: ?*big_rec_t = null;
+    const keys = [_]i64{ 10, 20, 30 };
+    for (keys) |key| {
+        var k = key;
+        var fields = [_]data.dfield_t{.{ .data = &k, .len = @intCast(@sizeOf(i64)) }};
+        var tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = fields[0..] };
+        try std.testing.expectEqual(@as(ulint, 0), btr_cur_optimistic_insert(0, &cursor, &tuple, &rec_out, &big_rec, 0, null, &mtr));
+    }
+
+    try std.testing.expectEqual(fil.DB_SUCCESS, fil.fil_write_page(space_id, root_block.frame.page_no, root_block.bytes.ptr));
+    const root_page_no = root_block.frame.page_no;
+
+    index_state_remove(index);
+    buf_mod.buf_mem_free();
+
+    const table2 = dict.dict_mem_table_create("db/t1", space_id, 1, 0) orelse return error.OutOfMemory;
+    defer dict.dict_mem_table_free(table2);
+    dict.dict_mem_table_add_col(table2, null, "id", data.DATA_INT, data.DATA_NOT_NULL, @sizeOf(i64));
+
+    const index2 = dict.dict_mem_index_create("db/t1", "PRIMARY", space_id, dict.DICT_CLUSTERED | dict.DICT_UNIQUE, 1) orelse return error.OutOfMemory;
+    defer dict.dict_mem_index_free(index2);
+    index2.table = table2;
+    index2.n_uniq = 1;
+    index2.n_uniq_in_tree = 1;
+    index2.page = root_page_no;
+    index2.id = .{ .high = 0, .low = 111 };
+    dict.dict_index_add_col(index2, table2, &table2.cols.items[0], 0);
+
+    var mtr2 = mtr_t{};
+    const loaded = btr_root_block_get(index2, &mtr2) orelse return error.OutOfMemory;
+    defer btr_page_free(index2, loaded, &mtr2);
+
+    const first = page_first_user_rec(loaded.frame) orelse return error.OutOfMemory;
+    const second = btr_get_next_user_rec(first, null) orelse return error.OutOfMemory;
+    const third = btr_get_next_user_rec(second, null) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@as(i64, 10), first.key);
+    try std.testing.expectEqual(@as(i64, 20), second.key);
+    try std.testing.expectEqual(@as(i64, 30), third.key);
+
+    var lookup_key: i64 = 20;
+    var lookup_fields = [_]data.dfield_t{.{ .data = &lookup_key, .len = @intCast(@sizeOf(i64)) }};
+    var lookup_tuple = data.dtuple_t{ .n_fields = 1, .n_fields_cmp = 1, .fields = lookup_fields[0..] };
+    var search_cursor = page.page_cur_t{};
+    _ = page.page_cur_search(loaded, index2, &lookup_tuple, page.PAGE_CUR_GE, &search_cursor);
+    try std.testing.expect(search_cursor.rec != null);
+    try std.testing.expectEqual(@as(i64, 20), search_cursor.rec.?.key);
+
+    index_state_remove(index2);
 }
 
 test "btr create root and free" {
