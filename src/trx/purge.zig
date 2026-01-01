@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../ut/compat.zig");
 const page = @import("../page/mod.zig");
 const types = @import("types.zig");
 const undo = @import("undo.zig");
@@ -9,6 +10,7 @@ pub const module_name = "trx.purge";
 pub const ulint = types.ulint;
 pub const trx_id_t = types.trx_id_t;
 pub const undo_no_t = types.undo_no_t;
+pub const ibool = compat.ibool;
 
 // ============================================================================
 // Legacy TrxPurge for delete-marked records
@@ -59,12 +61,16 @@ pub const PurgeStats = struct {
 pub const purge_sys_t = struct {
     /// List of active read views (for determining oldest)
     active_views: std.ArrayListUnmanaged(*read.read_view_t) = .{},
+    /// Undo logs waiting for purge
+    pending_undo_logs: std.ArrayListUnmanaged(*undo.trx_undo_t) = .{},
     /// Oldest view's low_limit_no - undo records with undo_no < this can be purged
     oldest_view_low_limit: trx_id_t = 0,
     /// Statistics
     stats: PurgeStats = .{},
     /// Memory allocator
     allocator: std.mem.Allocator = std.heap.page_allocator,
+    /// Mutex for purge system state
+    mutex: std.Thread.Mutex = .{},
 
     /// Check if there are any active views
     pub fn hasActiveViews(self: *const purge_sys_t) bool {
@@ -79,6 +85,8 @@ pub const purge_sys_t = struct {
 
 /// Global purge system instance
 pub var purge_sys: ?*purge_sys_t = null;
+var purge_thread_stop_flag = std.atomic.Value(bool).init(false);
+var purge_thread: ?std.Thread = null;
 
 /// Initialize the global purge system
 pub fn trx_purge_sys_init(allocator: std.mem.Allocator) *purge_sys_t {
@@ -93,8 +101,12 @@ pub fn trx_purge_sys_init(allocator: std.mem.Allocator) *purge_sys_t {
 
 /// Free the global purge system
 pub fn trx_purge_sys_free() void {
+    trx_purge_thread_stop();
     if (purge_sys) |sys| {
+        sys.mutex.lock();
         sys.active_views.deinit(sys.allocator);
+        sys.pending_undo_logs.deinit(sys.allocator);
+        sys.mutex.unlock();
         sys.allocator.destroy(sys);
         purge_sys = null;
     }
@@ -104,6 +116,8 @@ pub fn trx_purge_sys_free() void {
 /// Called when a new consistent read view is opened
 pub fn trx_purge_register_view(view: *read.read_view_t) void {
     const sys = purge_sys orelse return;
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
     sys.active_views.append(sys.allocator, view) catch @panic("trx_purge_register_view");
     updateOldestViewLimit(sys);
 }
@@ -112,6 +126,9 @@ pub fn trx_purge_register_view(view: *read.read_view_t) void {
 /// Called when a read view is closed - may trigger purge
 pub fn trx_purge_unregister_view(view: *read.read_view_t) void {
     const sys = purge_sys orelse return;
+
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
 
     // Find and remove the view
     var idx: usize = 0;
@@ -147,12 +164,17 @@ fn updateOldestViewLimit(sys: *purge_sys_t) void {
 /// Get the current purge limit - undo records older than this can be purged
 pub fn trx_purge_get_limit() trx_id_t {
     const sys = purge_sys orelse return 0;
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
     return sys.oldest_view_low_limit;
 }
 
 /// Check if an undo record can be purged based on its trx_id
 pub fn trx_purge_can_purge(trx_id: trx_id_t) bool {
     const sys = purge_sys orelse return false;
+
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
 
     // If no active views, can purge all committed transactions
     if (!sys.hasActiveViews()) {
@@ -163,11 +185,21 @@ pub fn trx_purge_can_purge(trx_id: trx_id_t) bool {
     return trx_id < sys.oldest_view_low_limit;
 }
 
-/// Purge undo records from a single undo log that are no longer needed
-/// Returns number of records purged
-pub fn trx_purge_undo_log(undo_log: *undo.trx_undo_t) usize {
-    const sys = purge_sys orelse return 0;
+/// Add an undo log to the pending purge list
+pub fn trx_purge_add_undo_log(undo_log: *undo.trx_undo_t) void {
+    const sys = purge_sys orelse return;
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
 
+    for (sys.pending_undo_logs.items) |item| {
+        if (item == undo_log) {
+            return;
+        }
+    }
+    sys.pending_undo_logs.append(sys.allocator, undo_log) catch @panic("trx_purge_add_undo_log");
+}
+
+fn trx_purge_undo_log_locked(sys: *purge_sys_t, undo_log: *undo.trx_undo_t) usize {
     // If views exist and this log's trx is still visible, can't purge
     if (sys.hasActiveViews() and undo_log.trx_id >= sys.oldest_view_low_limit) {
         return 0;
@@ -189,6 +221,15 @@ pub fn trx_purge_undo_log(undo_log: *undo.trx_undo_t) usize {
     sys.stats.records_purged += count;
 
     return count;
+}
+
+/// Purge undo records from a single undo log that are no longer needed
+/// Returns number of records purged
+pub fn trx_purge_undo_log(undo_log: *undo.trx_undo_t) usize {
+    const sys = purge_sys orelse return 0;
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
+    return trx_purge_undo_log_locked(sys, undo_log);
 }
 
 /// Purge all undo records from a transaction that are no longer needed
@@ -213,28 +254,70 @@ pub fn trx_purge_trx_undo_logs(trx: *types.trx_t) usize {
 pub fn trx_purge_run() usize {
     const sys = purge_sys orelse return 0;
 
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
+
     sys.stats.cycles_run += 1;
 
-    // In a full implementation, we would:
-    // 1. Get the oldest view's limit
-    // 2. Iterate through committed transaction undo logs
-    // 3. Purge records where trx_id < limit
+    var purged: usize = 0;
+    var idx: usize = 0;
+    while (idx < sys.pending_undo_logs.items.len) {
+        const undo_log = sys.pending_undo_logs.items[idx];
+        purged += trx_purge_undo_log_locked(sys, undo_log);
+        if (undo_log.empty) {
+            _ = sys.pending_undo_logs.orderedRemove(idx);
+            sys.stats.logs_freed += 1;
+        } else {
+            idx += 1;
+        }
+    }
 
-    // For now, return 0 as we don't have a global undo history list
-    return 0;
+    return purged;
 }
 
 /// Get current purge statistics
 pub fn trx_purge_get_stats() PurgeStats {
     const sys = purge_sys orelse return .{};
+    sys.mutex.lock();
+    defer sys.mutex.unlock();
     return sys.stats;
 }
 
 /// Reset purge statistics
 pub fn trx_purge_reset_stats() void {
     if (purge_sys) |sys| {
+        sys.mutex.lock();
+        defer sys.mutex.unlock();
         sys.stats = .{};
     }
+}
+
+fn purge_thread_loop(sleep_us: u64) void {
+    while (!purge_thread_stop_flag.load(.seq_cst)) {
+        _ = trx_purge_run();
+        std.Thread.sleep(sleep_us * std.time.ns_per_us);
+    }
+}
+
+pub fn trx_purge_thread_start(sleep_us: u64) ibool {
+    if (purge_thread != null) {
+        return compat.FALSE;
+    }
+    purge_thread_stop_flag.store(false, .seq_cst);
+    purge_thread = std.Thread.spawn(.{}, purge_thread_loop, .{sleep_us}) catch return compat.FALSE;
+    return compat.TRUE;
+}
+
+pub fn trx_purge_thread_stop() void {
+    if (purge_thread) |thread| {
+        purge_thread_stop_flag.store(true, .seq_cst);
+        thread.join();
+        purge_thread = null;
+    }
+}
+
+pub fn trx_purge_thread_is_running() bool {
+    return purge_thread != null;
 }
 
 // ============================================================================
@@ -442,4 +525,31 @@ test "purge statistics tracking" {
     _ = trx_purge_run();
     stats = trx_purge_get_stats();
     try std.testing.expectEqual(@as(usize, 1), stats.cycles_run);
+}
+
+test "purge thread cleans pending undo logs" {
+    const sys = trx_purge_sys_init(std.testing.allocator);
+    defer trx_purge_sys_free();
+
+    const undo_log = undo.trx_undo_mem_create(0, undo.TRX_UNDO_INSERT, 10, std.testing.allocator);
+    defer undo.trx_undo_mem_free(undo_log);
+
+    undo.trx_undo_append_record(undo_log, .{ .undo_no = .{ .high = 0, .low = 1 }, .data = "t1" });
+    undo.trx_undo_append_record(undo_log, .{ .undo_no = .{ .high = 0, .low = 2 }, .data = "t2" });
+
+    trx_purge_add_undo_log(undo_log);
+    try std.testing.expectEqual(compat.TRUE, trx_purge_thread_start(5_000));
+    defer trx_purge_thread_stop();
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+
+    try std.testing.expect(undo_log.empty);
+
+    sys.mutex.lock();
+    const pending_len = sys.pending_undo_logs.items.len;
+    sys.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), pending_len);
+
+    const stats = trx_purge_get_stats();
+    try std.testing.expect(stats.logs_freed >= 1);
 }
