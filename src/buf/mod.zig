@@ -448,7 +448,7 @@ pub fn buf_page_peek_if_search_hashed(space: ulint, offset: ulint) ibool {
 }
 
 pub fn buf_page_set_file_page_was_freed(space: ulint, offset: ulint) ?*buf_page_t {
-    if (buf_pool) |pool| {
+    if (buf_pool_get_for_page(space, offset)) |pool| {
         const key = BufPageKey{ .space = space, .page_no = offset };
         if (pool.pages.get(key)) |block| {
             return &block.page;
@@ -458,7 +458,7 @@ pub fn buf_page_set_file_page_was_freed(space: ulint, offset: ulint) ?*buf_page_
 }
 
 pub fn buf_page_reset_file_page_was_freed(space: ulint, offset: ulint) ?*buf_page_t {
-    if (buf_pool) |pool| {
+    if (buf_pool_get_for_page(space, offset)) |pool| {
         const key = BufPageKey{ .space = space, .page_no = offset };
         if (pool.pages.get(key)) |block| {
             return &block.page;
@@ -581,7 +581,7 @@ pub fn buf_page_try_get_func(
     _ = file;
     _ = line;
     _ = mtr;
-    if (buf_pool) |pool| {
+    if (buf_pool_get_for_page(space_id, page_no)) |pool| {
         const key = BufPageKey{ .space = space_id, .page_no = page_no };
         if (pool.pages.get(key)) |block| {
             return block;
@@ -859,6 +859,18 @@ pub fn buf_flush_stat_update() void {
 }
 
 pub fn buf_flush_get_desired_flush_rate() ulint {
+    if (buf_pool_array.len != 0) {
+        var total_pages: ulint = 0;
+        var dirty: ulint = 0;
+        for (buf_pool_array) |pool| {
+            total_pages += pool.curr_size;
+            dirty += pool.dirty_pages;
+        }
+        if (total_pages == 0) {
+            return 0;
+        }
+        return @as(ulint, @intCast((dirty * 100) / total_pages));
+    }
     if (buf_pool) |pool| {
         if (pool.curr_size == 0) {
             return 0;
