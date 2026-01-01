@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const ha = @import("../ha/mod.zig");
+const os_file = @import("../os/file.zig");
 
 pub const module_name = "log";
 
@@ -18,8 +19,54 @@ pub const LOG_BUF_FLUSH_MARGIN: ulint = LOG_BUF_WRITE_MARGIN + 4 * compat.UNIV_P
 pub const LOG_CHECKPOINT_FREE_PER_THREAD: ulint = 4 * compat.UNIV_PAGE_SIZE;
 pub const LOG_CHECKPOINT_EXTRA_FREE: ulint = 8 * compat.UNIV_PAGE_SIZE;
 
+pub const LOG_FILE_MAGIC: u32 = 0x49424C47; // "IBLG"
+pub const LOG_FILE_VERSION: u32 = 1;
+pub const LOG_FILE_HDR_BYTES: usize = @as(usize, @intCast(LOG_FILE_HDR_SIZE));
+
+const LOG_HDR_MAGIC_OFF: usize = 0;
+const LOG_HDR_VERSION_OFF: usize = 4;
+const LOG_HDR_START_LSN_OFF: usize = 8;
+const LOG_HDR_CHECKPOINT_LSN_OFF: usize = 16;
+const LOG_HDR_FLUSHED_LSN_OFF: usize = 24;
+const LOG_HDR_CLEAN_SHUTDOWN_OFF: usize = 32;
+
+const LogError = error{
+    InvalidHeader,
+    InvalidLogFileSize,
+    ShortRead,
+    ShortWrite,
+};
+
+const LogHeader = struct {
+    magic: u32 = LOG_FILE_MAGIC,
+    version: u32 = LOG_FILE_VERSION,
+    start_lsn: ib_uint64_t = 0,
+    checkpoint_lsn: ib_uint64_t = 0,
+    flushed_lsn: ib_uint64_t = 0,
+    clean_shutdown: bool = true,
+};
+
+const LogFile = struct {
+    path: []u8,
+    handle: os_file.FileHandle,
+};
+
 pub const log_t = struct {
-    dummy: u8 = 0,
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    mutex: std.Thread.Mutex = .{},
+    log_dir: []u8 = &[_]u8{},
+    log_dir_owned: bool = false,
+    n_files: ulint = 0,
+    file_size: ib_int64_t = 0,
+    files: std.ArrayList(LogFile) = std.ArrayList(LogFile).init(std.heap.page_allocator),
+    log_buf: ?[]u8 = null,
+    log_buf_used: ulint = 0,
+    log_buf_lsn: ib_uint64_t = 0,
+    current_lsn: ib_uint64_t = 0,
+    flushed_lsn: ib_uint64_t = 0,
+    checkpoint_lsn: ib_uint64_t = 0,
+    first_header_lsn: ib_uint64_t = 0,
+    was_clean_shutdown: bool = true,
 };
 
 pub var log_fsp_current_free_limit: ulint = 0;
@@ -36,6 +83,166 @@ pub fn log_var_init() void {
     log_debug_writes = compat.FALSE;
     log_has_printed_chkp_warning = compat.FALSE;
     log_last_warning_time = 0;
+}
+
+fn log_write_header(file: *os_file.FileHandle, header: LogHeader) !void {
+    var buf: [LOG_FILE_HDR_BYTES]u8 = [_]u8{0} ** LOG_FILE_HDR_BYTES;
+    std.mem.writeInt(u32, buf[LOG_HDR_MAGIC_OFF .. LOG_HDR_MAGIC_OFF + 4], header.magic, .big);
+    std.mem.writeInt(u32, buf[LOG_HDR_VERSION_OFF .. LOG_HDR_VERSION_OFF + 4], header.version, .big);
+    std.mem.writeInt(u64, buf[LOG_HDR_START_LSN_OFF .. LOG_HDR_START_LSN_OFF + 8], header.start_lsn, .big);
+    std.mem.writeInt(u64, buf[LOG_HDR_CHECKPOINT_LSN_OFF .. LOG_HDR_CHECKPOINT_LSN_OFF + 8], header.checkpoint_lsn, .big);
+    std.mem.writeInt(u64, buf[LOG_HDR_FLUSHED_LSN_OFF .. LOG_HDR_FLUSHED_LSN_OFF + 8], header.flushed_lsn, .big);
+    const clean: u32 = if (header.clean_shutdown) 1 else 0;
+    std.mem.writeInt(u32, buf[LOG_HDR_CLEAN_SHUTDOWN_OFF .. LOG_HDR_CLEAN_SHUTDOWN_OFF + 4], clean, .big);
+
+    const written = try file.writeAt(buf[0..], 0);
+    if (written != buf.len) {
+        return LogError.ShortWrite;
+    }
+}
+
+fn log_read_header(file: *os_file.FileHandle) !LogHeader {
+    var buf: [LOG_FILE_HDR_BYTES]u8 = undefined;
+    const read = try file.readAt(buf[0..], 0);
+    if (read != buf.len) {
+        return LogError.ShortRead;
+    }
+    const magic = std.mem.readInt(u32, buf[LOG_HDR_MAGIC_OFF .. LOG_HDR_MAGIC_OFF + 4], .big);
+    const version = std.mem.readInt(u32, buf[LOG_HDR_VERSION_OFF .. LOG_HDR_VERSION_OFF + 4], .big);
+    if (magic != LOG_FILE_MAGIC or version != LOG_FILE_VERSION) {
+        return LogError.InvalidHeader;
+    }
+    const start_lsn = std.mem.readInt(u64, buf[LOG_HDR_START_LSN_OFF .. LOG_HDR_START_LSN_OFF + 8], .big);
+    const checkpoint_lsn = std.mem.readInt(u64, buf[LOG_HDR_CHECKPOINT_LSN_OFF .. LOG_HDR_CHECKPOINT_LSN_OFF + 8], .big);
+    const flushed_lsn = std.mem.readInt(u64, buf[LOG_HDR_FLUSHED_LSN_OFF .. LOG_HDR_FLUSHED_LSN_OFF + 8], .big);
+    const clean_val = std.mem.readInt(u32, buf[LOG_HDR_CLEAN_SHUTDOWN_OFF .. LOG_HDR_CLEAN_SHUTDOWN_OFF + 4], .big);
+    return .{
+        .magic = magic,
+        .version = version,
+        .start_lsn = start_lsn,
+        .checkpoint_lsn = checkpoint_lsn,
+        .flushed_lsn = flushed_lsn,
+        .clean_shutdown = clean_val != 0,
+    };
+}
+
+fn log_make_file_name(allocator: std.mem.Allocator, log_dir: []const u8, file_no: ulint) ![]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "ib_logfile{d}", .{file_no});
+    defer allocator.free(filename);
+    if (log_dir.len == 0 or std.mem.eql(u8, log_dir, ".")) {
+        return try allocator.dupe(u8, filename);
+    }
+    return std.fs.path.join(allocator, &.{ log_dir, filename });
+}
+
+pub fn log_sys_init(log_dir: []const u8, n_files: ulint, log_file_size: ib_int64_t, log_buffer_size: ulint) ibool {
+    if (log_sys != null) {
+        return compat.TRUE;
+    }
+    if (log_file_size <= LOG_FILE_HDR_SIZE) {
+        return compat.FALSE;
+    }
+
+    const allocator = std.heap.page_allocator;
+    const sys = allocator.create(log_t) catch return compat.FALSE;
+    sys.* = .{
+        .allocator = allocator,
+        .log_dir = &[_]u8{},
+        .log_dir_owned = false,
+        .n_files = n_files,
+        .file_size = log_file_size,
+        .files = std.ArrayList(LogFile).init(allocator),
+        .log_buf = null,
+        .log_buf_used = 0,
+        .log_buf_lsn = 0,
+        .current_lsn = 0,
+        .flushed_lsn = 0,
+        .checkpoint_lsn = 0,
+        .first_header_lsn = 0,
+        .was_clean_shutdown = true,
+    };
+    errdefer {
+        log_sys = sys;
+        log_sys_close();
+    }
+
+    if (!(log_dir.len == 0 or std.mem.eql(u8, log_dir, "."))) {
+        std.fs.cwd().makePath(log_dir) catch return compat.FALSE;
+    }
+
+    sys.log_dir = allocator.dupe(u8, log_dir) catch return compat.FALSE;
+    sys.log_dir_owned = true;
+
+    var header0: LogHeader = .{};
+    var header0_valid = false;
+
+    var i: ulint = 0;
+    while (i < n_files) : (i += 1) {
+        const path = log_make_file_name(allocator, log_dir, i) catch return compat.FALSE;
+        var keep_path = false;
+        defer if (!keep_path) allocator.free(path);
+        const exists = os_file.exists(path);
+        const handle = os_file.open(path, if (exists) .open else .create, .read_write) catch return compat.FALSE;
+        var keep_handle = false;
+        defer if (!keep_handle) handle.close();
+
+        if (!exists) {
+            handle.file.setEndPos(@as(u64, @intCast(log_file_size))) catch return compat.FALSE;
+            const header = LogHeader{};
+            log_write_header(&handle, header) catch return compat.FALSE;
+            if (!header0_valid) {
+                header0 = header;
+                header0_valid = true;
+            }
+        } else {
+            const header = log_read_header(&handle) catch return compat.FALSE;
+            if (!header0_valid) {
+                header0 = header;
+                header0_valid = true;
+            }
+        }
+
+        sys.files.append(.{ .path = path, .handle = handle }) catch return compat.FALSE;
+        keep_handle = true;
+        keep_path = true;
+    }
+
+    if (!header0_valid) {
+        return compat.FALSE;
+    }
+
+    sys.first_header_lsn = header0.start_lsn;
+    sys.checkpoint_lsn = header0.checkpoint_lsn;
+    sys.flushed_lsn = header0.flushed_lsn;
+    sys.current_lsn = header0.flushed_lsn;
+    sys.was_clean_shutdown = header0.clean_shutdown;
+
+    if (log_buffer_size > 0) {
+        sys.log_buf = allocator.alloc(u8, @as(usize, @intCast(log_buffer_size))) catch return compat.FALSE;
+    }
+
+    log_sys = sys;
+    return compat.TRUE;
+}
+
+pub fn log_sys_close() void {
+    if (log_sys) |sys| {
+        for (sys.files.items) |*file| {
+            file.handle.close();
+            if (file.path.len > 0) {
+                sys.allocator.free(file.path);
+            }
+        }
+        sys.files.deinit();
+        if (sys.log_buf) |buf| {
+            sys.allocator.free(buf);
+        }
+        if (sys.log_dir_owned and sys.log_dir.len > 0) {
+            sys.allocator.free(sys.log_dir);
+        }
+        sys.allocator.destroy(sys);
+        log_sys = null;
+    }
 }
 
 pub fn log_fsp_current_free_limit_set_and_checkpoint(limit: ulint) void {
@@ -296,6 +503,34 @@ test "log_var_init resets globals" {
     try std.testing.expect(log_debug_writes == compat.FALSE);
     try std.testing.expect(log_has_printed_chkp_warning == compat.FALSE);
     try std.testing.expect(log_last_warning_time == 0);
+}
+
+test "log sys init creates and reopens log headers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 2, 1024 * 1024, 0));
+    try std.testing.expect(log_sys != null);
+
+    const path = try log_make_file_name(std.testing.allocator, base, 0);
+    defer std.testing.allocator.free(path);
+    const handle = try os_file.open(path, .open, .read_write);
+    defer handle.close();
+    const header = try log_read_header(&handle);
+    try std.testing.expectEqual(LOG_FILE_MAGIC, header.magic);
+    try std.testing.expectEqual(LOG_FILE_VERSION, header.version);
+
+    const prev_flushed = log_sys.?.flushed_lsn;
+    log_sys_close();
+
+    log_var_init();
+    try std.testing.expectEqual(compat.TRUE, log_sys_init(base, 2, 1024 * 1024, 0));
+    try std.testing.expectEqual(prev_flushed, log_sys.?.flushed_lsn);
+    log_sys_close();
 }
 
 test "log_calc_where_lsn_is positions lsn" {
