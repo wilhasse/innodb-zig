@@ -30,10 +30,14 @@ const LOG_HDR_CHECKPOINT_LSN_OFF: usize = 16;
 const LOG_HDR_FLUSHED_LSN_OFF: usize = 24;
 const LOG_HDR_CLEAN_SHUTDOWN_OFF: usize = 32;
 
+const REDO_RECORD_HEADER_SIZE: usize = 1 + 4 + 4 + 4;
+
 const LogError = error{
     InvalidHeader,
     InvalidLogFileSize,
+    InvalidRecord,
     ShortRead,
+    ShortBuffer,
     ShortWrite,
 };
 
@@ -44,6 +48,21 @@ const LogHeader = struct {
     checkpoint_lsn: ib_uint64_t = 0,
     flushed_lsn: ib_uint64_t = 0,
     clean_shutdown: bool = true,
+};
+
+pub const RedoRecord = struct {
+    type_: u8,
+    space: u32,
+    page_no: u32,
+    payload: []const u8,
+};
+
+pub const RedoRecordView = struct {
+    type_: u8,
+    space: u32,
+    page_no: u32,
+    payload: []const u8,
+    len: usize,
 };
 
 const LogFile = struct {
@@ -123,6 +142,44 @@ fn log_read_header(file: *os_file.FileHandle) !LogHeader {
         .checkpoint_lsn = checkpoint_lsn,
         .flushed_lsn = flushed_lsn,
         .clean_shutdown = clean_val != 0,
+    };
+}
+
+pub fn redo_record_size(rec: RedoRecord) usize {
+    return REDO_RECORD_HEADER_SIZE + rec.payload.len;
+}
+
+pub fn redo_record_encode(buf: []u8, rec: RedoRecord) !usize {
+    const needed = redo_record_size(rec);
+    if (buf.len < needed) {
+        return LogError.ShortBuffer;
+    }
+    buf[0] = rec.type_;
+    std.mem.writeInt(u32, buf[1..5], rec.space, .big);
+    std.mem.writeInt(u32, buf[5..9], rec.page_no, .big);
+    std.mem.writeInt(u32, buf[9..13], @as(u32, @intCast(rec.payload.len)), .big);
+    std.mem.copyForwards(u8, buf[13..needed], rec.payload);
+    return needed;
+}
+
+pub fn redo_record_decode(buf: []const u8) !RedoRecordView {
+    if (buf.len < REDO_RECORD_HEADER_SIZE) {
+        return LogError.ShortBuffer;
+    }
+    const type_ = buf[0];
+    const space = std.mem.readInt(u32, buf[1..5], .big);
+    const page_no = std.mem.readInt(u32, buf[5..9], .big);
+    const payload_len = std.mem.readInt(u32, buf[9..13], .big);
+    const total = REDO_RECORD_HEADER_SIZE + @as(usize, @intCast(payload_len));
+    if (buf.len < total) {
+        return LogError.ShortBuffer;
+    }
+    return .{
+        .type_ = type_,
+        .space = space,
+        .page_no = page_no,
+        .payload = buf[13..total],
+        .len = total,
     };
 }
 
@@ -696,6 +753,24 @@ test "log append wraps across files" {
     const read1 = try handle1.readAt(buf1[0..], @as(u64, @intCast(LOG_FILE_HDR_SIZE)));
     try std.testing.expectEqual(@as(usize, 8), read1);
     try std.testing.expect(std.mem.eql(u8, buf1[0..], payload[16..24]));
+}
+
+test "redo record encode/decode roundtrip" {
+    const payload = [_]u8{ 1, 2, 3, 4, 5 };
+    const rec = RedoRecord{
+        .type_ = 3,
+        .space = 42,
+        .page_no = 99,
+        .payload = payload[0..],
+    };
+    var buf: [64]u8 = undefined;
+    const written = try redo_record_encode(buf[0..], rec);
+    const decoded = try redo_record_decode(buf[0..written]);
+    try std.testing.expectEqual(rec.type_, decoded.type_);
+    try std.testing.expectEqual(rec.space, decoded.space);
+    try std.testing.expectEqual(rec.page_no, decoded.page_no);
+    try std.testing.expect(std.mem.eql(u8, decoded.payload, payload[0..]));
+    try std.testing.expectEqual(written, decoded.len);
 }
 
 test "log buffer flush persists flushed lsn" {
