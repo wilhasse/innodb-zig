@@ -250,6 +250,11 @@ pub fn eval_node_get_ibool_val(node: *que_node_t) ibool {
     return mach.mach_read_from_1(@as([*]const byte, @ptrCast(data_ptr.?)));
 }
 
+pub fn eval_node_get_bool_val(node: *que_node_t) ibool {
+    eval_exp(node);
+    return eval_node_get_ibool_val(node);
+}
+
 pub fn eval_node_set_ibool_val(func_node: *func_node_t, val: ibool) void {
     const dfield = que.que_node_get_val(&func_node.common);
     var data_ptr = data.dfield_get_data(dfield);
@@ -1033,4 +1038,25 @@ test "eval procedure steps" {
     thr = .{ .run_node = &ret.common, .prev_node = &outer.common };
     _ = return_step(&thr);
     try std.testing.expect(thr.run_node == null);
+}
+
+test "eval predicate from parsed graph" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const graph = try pars.core.pars_sql("a = 1 AND b <> 2", arena.allocator());
+    const root = graph.thrs_head.?.child.?;
+    const root_func: *func_node_t = @ptrCast(root);
+    const left_func: *func_node_t = @ptrCast(root_func.args.?);
+    const right_func: *func_node_t = @ptrCast(root_func.args.?.brother.?);
+
+    const a_node: *sym_node_t = @ptrCast(left_func.args.?);
+    const b_node: *sym_node_t = @ptrCast(right_func.args.?);
+
+    eval_node_set_int_val(&a_node.common, 1);
+    eval_node_set_int_val(&b_node.common, 3);
+    try std.testing.expectEqual(@as(ibool, compat.TRUE), eval_node_get_bool_val(root));
+
+    eval_node_set_int_val(&b_node.common, 2);
+    try std.testing.expectEqual(@as(ibool, compat.FALSE), eval_node_get_bool_val(root));
 }
