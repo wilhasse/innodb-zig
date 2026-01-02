@@ -774,7 +774,7 @@ const cfg_vars_defaults = [_]CfgVar{
         .flag = .IB_CFG_FLAG_READONLY_AFTER_STARTUP,
         .min_val = 1024 * 1024,
         .max_val = @as(ib_u64_t, @intCast(compat.ULINT_MAX)),
-        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 16 * 1024 * 1024) },
+        .value = .{ .IB_CFG_ULINT = @as(ib_ulint_t, 32 * 1024 * 1024) },
     },
     .{
         .name = "log_files_in_group",
