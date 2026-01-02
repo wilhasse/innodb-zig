@@ -5,6 +5,7 @@ const ha = @import("../ha/mod.zig");
 const mach = @import("../mach/mod.zig");
 const os_file = @import("../os/file.zig");
 const fil = @import("../fil/mod.zig");
+const log = @import("../ut/log.zig");
 
 pub const module_name = "log";
 
@@ -264,6 +265,7 @@ pub fn log_sys_init(log_dir: []const u8, n_files: ulint, log_file_size: ib_int64
             handle.file.setEndPos(@as(u64, @intCast(log_file_size))) catch return compat.FALSE;
             const header = LogHeader{};
             log_write_header(&handle, header) catch return compat.FALSE;
+            log.logf("InnoDB: created redo log file {s}\n", .{path});
             if (!header0_valid) {
                 header0 = header;
                 header0_valid = true;
