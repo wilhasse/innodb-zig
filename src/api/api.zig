@@ -17,6 +17,7 @@ const log_ddl = @import("../log/ddl.zig");
 const lock_mod = @import("../lock/mod.zig");
 const os_file = @import("../os/file.zig");
 const os_thread = @import("../os/thread.zig");
+const pars = @import("../pars/mod.zig");
 const page = @import("../page/mod.zig");
 const buf_mod = @import("../buf/mod.zig");
 const trx_sys = @import("../trx/sys.zig");
@@ -1678,6 +1679,203 @@ fn sqlArgNameValid(name: []const u8) bool {
     return name[0] == ':' or name[0] == '$';
 }
 
+fn sqlTrim(input: []const u8) []const u8 {
+    var start: usize = 0;
+    var end: usize = input.len;
+    while (start < end and std.ascii.isWhitespace(input[start])) {
+        start += 1;
+    }
+    while (end > start and std.ascii.isWhitespace(input[end - 1])) {
+        end -= 1;
+    }
+    if (end > start and input[end - 1] == ';') {
+        end -= 1;
+        while (end > start and std.ascii.isWhitespace(input[end - 1])) {
+            end -= 1;
+        }
+    }
+    return input[start..end];
+}
+
+fn sqlIsIdentChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '/' or ch == '.';
+}
+
+fn sqlConsumeKeyword(input: []const u8, pos: *usize, kw: []const u8) bool {
+    if (pos.* + kw.len > input.len) {
+        return false;
+    }
+    if (!std.ascii.eqlIgnoreCase(input[pos.* .. pos.* + kw.len], kw)) {
+        return false;
+    }
+    const end = pos.* + kw.len;
+    if (end < input.len and sqlIsIdentChar(input[end])) {
+        return false;
+    }
+    pos.* = end;
+    return true;
+}
+
+fn sqlSkipSpaces(input: []const u8, pos: *usize) void {
+    while (pos.* < input.len and std.ascii.isWhitespace(input[pos.*])) {
+        pos.* += 1;
+    }
+}
+
+fn sqlNextToken(input: []const u8, pos: *usize) ?[]const u8 {
+    sqlSkipSpaces(input, pos);
+    if (pos.* >= input.len) {
+        return null;
+    }
+    const ch = input[pos.*];
+    if (ch == '(' or ch == ')' or ch == ',') {
+        pos.* += 1;
+        return input[pos.* - 1 .. pos.*];
+    }
+    const start = pos.*;
+    while (pos.* < input.len and !std.ascii.isWhitespace(input[pos.*]) and input[pos.*] != '(' and
+        input[pos.*] != ')' and input[pos.*] != ',')
+    {
+        pos.* += 1;
+    }
+    return input[start..pos.*];
+}
+
+const SqlColumnDef = struct {
+    name: []const u8,
+    col_type: ib_col_type_t,
+    attr: ib_col_attr_t,
+    len: ib_ulint_t,
+};
+
+fn sqlParseLen(token: []const u8) ?ib_ulint_t {
+    if (token.len == 0) {
+        return null;
+    }
+    var value: usize = 0;
+    for (token) |ch| {
+        if (!std.ascii.isDigit(ch)) {
+            return null;
+        }
+        value = value * 10 + @as(usize, @intCast(ch - '0'));
+    }
+    return @intCast(value);
+}
+
+fn sqlParseColumnDef(def: []const u8, allocator: std.mem.Allocator, cols: *ArrayList(SqlColumnDef), pk_cols: *ArrayList([]const u8)) ib_err_t {
+    var pos: usize = 0;
+    const first = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+    if (std.ascii.eqlIgnoreCase(first, "primary")) {
+        const second = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+        if (!std.ascii.eqlIgnoreCase(second, "key")) {
+            return .DB_INVALID_INPUT;
+        }
+        const open = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+        if (!std.mem.eql(u8, open, "(")) {
+            return .DB_INVALID_INPUT;
+        }
+        while (true) {
+            const col = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+            if (std.mem.eql(u8, col, ")")) {
+                break;
+            }
+            if (std.mem.eql(u8, col, ",")) {
+                continue;
+            }
+            pk_cols.append(col) catch return .DB_OUT_OF_MEMORY;
+        }
+        return .DB_SUCCESS;
+    }
+    if (std.ascii.eqlIgnoreCase(first, "unique") or std.ascii.eqlIgnoreCase(first, "key")) {
+        return .DB_SUCCESS;
+    }
+
+    const type_tok = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+    var col_type: ib_col_type_t = undefined;
+    var len: ib_ulint_t = 0;
+    if (std.ascii.eqlIgnoreCase(type_tok, "int") or std.ascii.eqlIgnoreCase(type_tok, "integer")) {
+        col_type = .IB_INT;
+        len = @intCast(@sizeOf(ib_i32_t));
+    } else if (std.ascii.eqlIgnoreCase(type_tok, "varchar")) {
+        col_type = .IB_VARCHAR;
+        len = 255;
+    } else if (std.ascii.eqlIgnoreCase(type_tok, "char")) {
+        col_type = .IB_CHAR;
+        len = 1;
+    } else if (std.ascii.eqlIgnoreCase(type_tok, "binary")) {
+        col_type = .IB_BINARY;
+        len = 1;
+    } else if (std.ascii.eqlIgnoreCase(type_tok, "varbinary")) {
+        col_type = .IB_VARBINARY;
+        len = 255;
+    } else {
+        return .DB_UNSUPPORTED;
+    }
+
+    var attr: ib_col_attr_t = .IB_COL_NONE;
+    while (true) {
+        const tok = sqlNextToken(def, &pos) orelse break;
+        if (std.mem.eql(u8, tok, "(")) {
+            const num = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+            const parsed = sqlParseLen(num) orelse return .DB_INVALID_INPUT;
+            const close = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+            if (!std.mem.eql(u8, close, ")")) {
+                return .DB_INVALID_INPUT;
+            }
+            len = parsed;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(tok, "unsigned")) {
+            attr = @enumFromInt(@intFromEnum(attr) | @intFromEnum(ib_col_attr_t.IB_COL_UNSIGNED));
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(tok, "not")) {
+            const next = sqlNextToken(def, &pos) orelse return .DB_INVALID_INPUT;
+            if (!std.ascii.eqlIgnoreCase(next, "null")) {
+                return .DB_INVALID_INPUT;
+            }
+            attr = @enumFromInt(@intFromEnum(attr) | @intFromEnum(ib_col_attr_t.IB_COL_NOT_NULL));
+            continue;
+        }
+        if (sqlParseLen(tok)) |parsed| {
+            len = parsed;
+            continue;
+        }
+    }
+
+    cols.append(.{ .name = first, .col_type = col_type, .attr = attr, .len = len }) catch return .DB_OUT_OF_MEMORY;
+    _ = allocator;
+    return .DB_SUCCESS;
+}
+
+fn sqlParseColumns(defs: []const u8, allocator: std.mem.Allocator, cols: *ArrayList(SqlColumnDef), pk_cols: *ArrayList([]const u8)) ib_err_t {
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < defs.len) : (i += 1) {
+        const ch = defs[i];
+        if (ch == '(') {
+            depth += 1;
+        } else if (ch == ')') {
+            if (depth > 0) depth -= 1;
+        } else if (ch == ',' and depth == 0) {
+            const slice = std.mem.trim(u8, defs[start..i], " \t\r\n");
+            if (slice.len > 0) {
+                const err = sqlParseColumnDef(slice, allocator, cols, pk_cols);
+                if (err != .DB_SUCCESS) {
+                    return err;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    const tail = std.mem.trim(u8, defs[start..], " \t\r\n");
+    if (tail.len > 0) {
+        return sqlParseColumnDef(tail, allocator, cols, pk_cols);
+    }
+    return .DB_SUCCESS;
+}
+
 fn sqlArgsValidate(args: []const ib_sql_arg_t) ib_err_t {
     for (args) |arg| {
         switch (arg) {
@@ -1717,19 +1915,122 @@ fn execSqlCommon(sql: []const u8, args: []const ib_sql_arg_t, ddl: bool) ib_err_
         return arg_err;
     }
 
+    const statement = sqlTrim(sql);
+    if (statement.len == 0) {
+        return .DB_INVALID_INPUT;
+    }
+
+    var pos: usize = 0;
+    sqlSkipSpaces(statement, &pos);
+
     const trx = ib_trx_begin(.IB_TRX_READ_COMMITTED) orelse return .DB_OUT_OF_MEMORY;
+    errdefer _ = ib_trx_rollback(trx);
+
+    var needs_unlock = false;
     if (ddl) {
         const lock_err = ib_schema_lock_exclusive(trx);
         if (lock_err != .DB_SUCCESS) {
-            _ = ib_trx_rollback(trx);
             return lock_err;
         }
+        needs_unlock = true;
+    }
+    defer {
+        if (needs_unlock) {
+            _ = ib_schema_unlock(trx);
+        }
+    }
 
+    var exec_err: ib_err_t = .DB_UNSUPPORTED;
+    if (sqlConsumeKeyword(statement, &pos, "select")) {
+        if (ddl) {
+            exec_err = .DB_INVALID_INPUT;
+        } else {
+            const expr_sql = std.mem.trim(u8, statement[pos..], " \t\r\n");
+            if (expr_sql.len == 0) {
+                exec_err = .DB_INVALID_INPUT;
+            } else {
+                if (pars.core.pars_sql(expr_sql, std.heap.page_allocator)) |_| {
+                    exec_err = .DB_SUCCESS;
+                } else |_| {
+                    exec_err = .DB_INVALID_INPUT;
+                }
+            }
+        }
+    } else if (sqlConsumeKeyword(statement, &pos, "create")) {
+        sqlSkipSpaces(statement, &pos);
+        if (!sqlConsumeKeyword(statement, &pos, "table")) {
+            exec_err = .DB_UNSUPPORTED;
+        } else if (!ddl) {
+            exec_err = .DB_INVALID_INPUT;
+        } else {
+            sqlSkipSpaces(statement, &pos);
+            const name = sqlNextToken(statement, &pos) orelse return .DB_INVALID_INPUT;
+            sqlSkipSpaces(statement, &pos);
+            const open = sqlNextToken(statement, &pos) orelse return .DB_INVALID_INPUT;
+            if (!std.mem.eql(u8, open, "(")) {
+                return .DB_INVALID_INPUT;
+            }
+            const defs = statement[pos..];
+            const close_idx = std.mem.lastIndexOfScalar(u8, defs, ')') orelse return .DB_INVALID_INPUT;
+            const cols_blob = defs[0..close_idx];
+
+            var columns = ArrayList(SqlColumnDef).init(std.heap.page_allocator);
+            defer columns.deinit();
+            var pk_cols = ArrayList([]const u8).init(std.heap.page_allocator);
+            defer pk_cols.deinit();
+            exec_err = sqlParseColumns(cols_blob, std.heap.page_allocator, &columns, &pk_cols);
+            if (exec_err == .DB_SUCCESS) {
+                var tbl_sch: ib_tbl_sch_t = null;
+                exec_err = ib_table_schema_create(name, &tbl_sch, .IB_TBL_COMPACT, 0);
+                if (exec_err == .DB_SUCCESS) {
+                    defer ib_table_schema_delete(tbl_sch);
+                    for (columns.items) |col| {
+                        exec_err = ib_table_schema_add_col(tbl_sch, col.name, col.col_type, col.attr, 0, col.len);
+                        if (exec_err != .DB_SUCCESS) break;
+                    }
+                    if (exec_err == .DB_SUCCESS and pk_cols.items.len > 0) {
+                        var idx_sch: ib_idx_sch_t = null;
+                        exec_err = ib_table_schema_add_index(tbl_sch, "PRIMARY", &idx_sch);
+                        if (exec_err == .DB_SUCCESS) {
+                            for (pk_cols.items) |col_name| {
+                                exec_err = ib_index_schema_add_col(idx_sch, col_name, 0);
+                                if (exec_err != .DB_SUCCESS) break;
+                            }
+                            if (exec_err == .DB_SUCCESS) {
+                                exec_err = ib_index_schema_set_clustered(idx_sch);
+                            }
+                        }
+                    }
+                    if (exec_err == .DB_SUCCESS) {
+                        var table_id: ib_id_t = 0;
+                        exec_err = ib_table_create(trx, tbl_sch, &table_id);
+                    }
+                }
+            }
+        }
+    } else if (sqlConsumeKeyword(statement, &pos, "drop")) {
+        sqlSkipSpaces(statement, &pos);
+        if (!sqlConsumeKeyword(statement, &pos, "table")) {
+            exec_err = .DB_UNSUPPORTED;
+        } else if (!ddl) {
+            exec_err = .DB_INVALID_INPUT;
+        } else {
+            sqlSkipSpaces(statement, &pos);
+            const name = sqlNextToken(statement, &pos) orelse return .DB_INVALID_INPUT;
+            exec_err = ib_table_drop(trx, name);
+        }
+    }
+
+    if (exec_err != .DB_SUCCESS) {
+        return exec_err;
+    }
+
+    if (needs_unlock) {
         const unlock_err = ib_schema_unlock(trx);
         if (unlock_err != .DB_SUCCESS) {
-            _ = ib_trx_rollback(trx);
             return unlock_err;
         }
+        needs_unlock = false;
     }
 
     return ib_trx_commit(trx);
@@ -5996,21 +6297,35 @@ test "config readonly after startup" {
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_shutdown(.IB_SHUTDOWN_NORMAL));
 }
 
-test "exec sql stubs validate input" {
+test "exec sql parses basic select and ddl" {
+    _ = ib_shutdown(.IB_SHUTDOWN_NORMAL);
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_init());
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_startup("barracuda"));
+    defer _ = ib_shutdown(.IB_SHUTDOWN_NORMAL);
+
     try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_sql("", 0));
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_sql("select 1", 0));
     try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_sql("select 1", 1));
 
     try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("", 0));
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql("create table t(a int)", 0));
-    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("create table t(a int)", 2));
+    try std.testing.expectEqual(errors.DbErr.DB_INVALID_INPUT, ib_exec_ddl_sql("select 1", 0));
+
+    const create_sql = "create table db/execsql1(id int, name varchar(8), primary key(id))";
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql(create_sql, 0));
+
+    var table_id: ib_id_t = 0;
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_table_get_id("db/execsql1", &table_id));
+    try std.testing.expect(table_id != 0);
+
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql("drop table db/execsql1", 0));
 
     const args = [_]ib_sql_arg_t{
         .{ .text = .{ .name = ":name", .value = "alice" } },
         .{ .int = .{ .name = ":id", .value = 42, .unsigned = true, .len = 4 } },
     };
     try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_sql_args("select :id", &args));
-    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql_args("create table t(a int)", &args));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql_args(create_sql, &args));
+    try std.testing.expectEqual(errors.DbErr.DB_SUCCESS, ib_exec_ddl_sql("drop table db/execsql1", 0));
 
     const bad_args = [_]ib_sql_arg_t{
         .{ .int = .{ .name = "id", .value = 1, .unsigned = false, .len = 3 } },

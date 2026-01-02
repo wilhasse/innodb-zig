@@ -32,6 +32,8 @@ pub const Expr = union(enum) {
     }
 };
 
+pub const ParserError = error{ ParseError, OutOfMemory, InvalidCharacter, Overflow };
+
 pub const BinaryExpr = struct {
     op: BinaryOp,
     left: *Expr,
@@ -43,7 +45,7 @@ pub const Parser = struct {
     current: lexer.Token,
     allocator: std.mem.Allocator,
 
-    pub fn init(input: []const u8, allocator: std.mem.Allocator) !Parser {
+    pub fn init(input: []const u8, allocator: std.mem.Allocator) ParserError!Parser {
         var lex = lexer.Lexer.init(input, allocator);
         const tok = try lex.nextToken();
         return .{ .lex = lex, .current = tok, .allocator = allocator };
@@ -53,11 +55,11 @@ pub const Parser = struct {
         self.current.deinit(self.allocator);
     }
 
-    pub fn parseExpression(self: *Parser) !*Expr {
+    pub fn parseExpression(self: *Parser) ParserError!*Expr {
         return self.parseOr();
     }
 
-    fn parseOr(self: *Parser) !*Expr {
+    fn parseOr(self: *Parser) ParserError!*Expr {
         var left = try self.parseAnd();
         while (self.current.kind == pars.PARS_OR_TOKEN) {
             try self.advance();
@@ -67,7 +69,7 @@ pub const Parser = struct {
         return left;
     }
 
-    fn parseAnd(self: *Parser) !*Expr {
+    fn parseAnd(self: *Parser) ParserError!*Expr {
         var left = try self.parseComparison();
         while (self.current.kind == pars.PARS_AND_TOKEN) {
             try self.advance();
@@ -77,7 +79,7 @@ pub const Parser = struct {
         return left;
     }
 
-    fn parseComparison(self: *Parser) !*Expr {
+    fn parseComparison(self: *Parser) ParserError!*Expr {
         var left = try self.parsePrimary();
         const kind = self.current.kind;
         if (kind == '=' or kind == pars.PARS_NE_TOKEN or kind == pars.PARS_GE_TOKEN or kind == pars.PARS_LE_TOKEN) {
@@ -94,7 +96,7 @@ pub const Parser = struct {
         return left;
     }
 
-    fn parsePrimary(self: *Parser) !*Expr {
+    fn parsePrimary(self: *Parser) ParserError!*Expr {
         const tok = self.current;
         if (tok.kind == pars.PARS_ID_TOKEN) {
             try self.advance();
@@ -122,19 +124,19 @@ pub const Parser = struct {
         return error.ParseError;
     }
 
-    fn makeBinary(self: *Parser, op: BinaryOp, left: *Expr, right: *Expr) !*Expr {
+    fn makeBinary(self: *Parser, op: BinaryOp, left: *Expr, right: *Expr) ParserError!*Expr {
         const node = try self.allocator.create(Expr);
         node.* = .{ .binary = .{ .op = op, .left = left, .right = right } };
         return node;
     }
 
-    fn allocExpr(self: *Parser, value: Expr) !*Expr {
+    fn allocExpr(self: *Parser, value: Expr) ParserError!*Expr {
         const node = try self.allocator.create(Expr);
         node.* = value;
         return node;
     }
 
-    fn advance(self: *Parser) !void {
+    fn advance(self: *Parser) ParserError!void {
         self.current.deinit(self.allocator);
         self.current = try self.lex.nextToken();
     }
@@ -144,7 +146,10 @@ test "parser simple expression" {
     var parser = try Parser.init("a = 1 AND b <> 'x'", std.testing.allocator);
     defer parser.deinit();
     const expr = try parser.parseExpression();
-    defer expr.deinit(std.testing.allocator);
+    defer {
+        expr.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(expr);
+    }
     try std.testing.expect(expr.* == .binary);
     try std.testing.expect(expr.binary.op == .and_op);
 }
@@ -153,7 +158,10 @@ test "parser identifier only" {
     var parser = try Parser.init("foo", std.testing.allocator);
     defer parser.deinit();
     const expr = try parser.parseExpression();
-    defer expr.deinit(std.testing.allocator);
+    defer {
+        expr.deinit(std.testing.allocator);
+        std.testing.allocator.destroy(expr);
+    }
     try std.testing.expect(expr.* == .ident);
     try std.testing.expectEqualStrings("foo", expr.ident);
 }

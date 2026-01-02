@@ -297,6 +297,11 @@ pub fn fil_set_max_space_id_if_bigger(max_id: ulint) void {
     }
 }
 
+pub fn fil_get_max_space_id() ulint {
+    const sys = ensureSystem();
+    return sys.max_space_id;
+}
+
 pub fn fil_write_flushed_lsn_to_data_files(lsn: ib_uint64_t, arch_log_no: ulint) ulint {
     _ = lsn;
     _ = arch_log_no;

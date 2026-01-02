@@ -1,4 +1,5 @@
 const std = @import("std");
+const ArrayList = std.array_list.Managed;
 const pars = @import("mod.zig");
 
 pub const Token = struct {
@@ -107,7 +108,7 @@ pub const Lexer = struct {
     fn lexString(self: *Lexer) !Token {
         const start = self.pos;
         self.pos += 1;
-        var out = std.ArrayList(u8).init(self.allocator);
+        var out = ArrayList(u8).init(self.allocator);
         errdefer out.deinit();
 
         while (self.pos < self.input.len) {

@@ -121,7 +121,7 @@ test "sym add int literal" {
     defer {
         const ptr = data.dfield_get_data(&node.common.val).?;
         const len = data.dfield_get_len(&node.common.val);
-        allocator.free(@as([*]u8, @ptrCast(ptr))[0..len]);
+        allocator.free(@as([*]u8, @ptrCast(@constCast(ptr)))[0..len]);
         allocator.destroy(node);
     }
     try std.testing.expectEqual(compat.TRUE, node.resolved);
@@ -141,7 +141,7 @@ test "sym add string literal" {
         const len = data.dfield_get_len(&node.common.val);
         if (ptr) |p| {
             if (len > 0) {
-                allocator.free(@as([*]u8, @ptrCast(p))[0..len]);
+                allocator.free(@as([*]u8, @ptrCast(@constCast(p)))[0..len]);
             }
         }
         allocator.destroy(node);

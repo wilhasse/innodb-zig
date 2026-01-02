@@ -189,8 +189,21 @@ pub fn trx_roll_try_truncate(trx: *trx_t) void {
             limit = dulintAdd(biggest, 1);
         }
     }
-    // TODO: limit should be used for actual undo processing
-    _ = &limit;
+    if (trx.undo_stack.items.len == 0) {
+        return;
+    }
+    var write: usize = 0;
+    for (trx.undo_stack.items) |rec| {
+        if (dulintCmp(rec.undo_no, limit) < 0) {
+            if (rec.data.len > 0) {
+                trx.allocator.free(rec.data);
+            }
+            continue;
+        }
+        trx.undo_stack.items[write] = rec;
+        write += 1;
+    }
+    trx.undo_stack.items.len = write;
 }
 
 pub fn trx_undo_rec_reserve(trx: *trx_t, undo_no: undo_no_t) bool {
@@ -522,4 +535,20 @@ test "trx roll pop top record honors limit" {
     defer if (rec.data.len > 0) std.testing.allocator.free(rec.data);
     try std.testing.expectEqual(@as(ulint, 2), rec.undo_no.low);
     try std.testing.expectEqualStrings("b", rec.data);
+}
+
+test "trx roll try truncate drops old undo records" {
+    var trx = trx_t{ .allocator = std.testing.allocator };
+    defer trx_deinit(&trx);
+    trx.undo_no_arr = trx_undo_arr_create(std.testing.allocator);
+    trx.undo_no = .{ .high = 0, .low = 2 };
+
+    trx_undo_record_push(&trx, .{ .undo_no = .{ .high = 0, .low = 1 }, .data = "a" });
+    trx_undo_record_push(&trx, .{ .undo_no = .{ .high = 0, .low = 2 }, .data = "b" });
+    trx_undo_record_push(&trx, .{ .undo_no = .{ .high = 0, .low = 3 }, .data = "c" });
+
+    trx_roll_try_truncate(&trx);
+    try std.testing.expectEqual(@as(usize, 2), trx.undo_stack.items.len);
+    try std.testing.expectEqual(@as(ulint, 2), trx.undo_stack.items[0].undo_no.low);
+    try std.testing.expectEqual(@as(ulint, 3), trx.undo_stack.items[1].undo_no.low);
 }

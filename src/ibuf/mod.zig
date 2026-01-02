@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../ut/compat.zig");
 const buf = @import("../buf/mod.zig");
+const fil = @import("../fil/mod.zig");
 const dict = @import("../dict/mod.zig");
 
 pub const module_name = "ibuf";
@@ -41,6 +42,8 @@ pub const ibuf_t = struct {
 pub var ibuf_use: ibuf_use_t = .IBUF_USE_INSERT;
 pub var ibuf: ?*ibuf_t = null;
 pub var ibuf_flush_count: ulint = 0;
+pub var ibuf_max_tablespace_id: ulint = 0;
+var ibuf_inside_count: ulint = 0;
 
 const FreeBitsKey = struct {
     space: ulint,
@@ -88,9 +91,12 @@ fn ibuf_ensure() *ibuf_t {
 pub fn ibuf_init_at_db_start() void {
     _ = ibuf_free_bits_map();
     _ = ibuf_ensure();
+    ibuf_update_max_tablespace_id();
 }
 
-pub fn ibuf_update_max_tablespace_id() void {}
+pub fn ibuf_update_max_tablespace_id() void {
+    ibuf_max_tablespace_id = fil.fil_get_max_space_id();
+}
 
 pub fn ibuf_bitmap_page_init(block: *buf_block_t, mtr: *mtr_t) void {
     ibuf_free_bits_set(block.page.space, block.page.page_no, 0);
@@ -148,10 +154,16 @@ pub fn ibuf_should_try(index: *dict.dict_index_t, ignore_sec_unique: ulint) iboo
 }
 
 pub fn ibuf_inside() ibool {
-    return compat.FALSE;
+    return if (ibuf_inside_count > 0) compat.TRUE else compat.FALSE;
 }
 
 pub fn ibuf_merge_or_delete_for_page(space: ulint, page_no: ulint, merged_recs: ulint) ibool {
+    ibuf_inside_count += 1;
+    defer {
+        if (ibuf_inside_count > 0) {
+            ibuf_inside_count -= 1;
+        }
+    }
     const state = ibuf_ensure();
     state.n_merges += 1;
     state.n_merged_recs += merged_recs;
@@ -286,4 +298,22 @@ test "ibuf free bits tracking and merge" {
     try std.testing.expectEqual(@as(ulint, 1), state.n_merges);
     try std.testing.expectEqual(@as(ulint, 7), state.n_merged_recs);
     try std.testing.expectEqual(@as(u8, 0), ibuf_free_bits_get(1, 5));
+}
+
+test "ibuf update max tablespace id and inside flag" {
+    fil.fil_init(0, 32);
+    defer fil.fil_close();
+
+    var space_id: ulint = 0;
+    const err = fil.fil_create_new_single_table_tablespace(&space_id, "ibufmax", compat.FALSE, 0, 1);
+    try std.testing.expectEqual(fil.DB_SUCCESS, err);
+
+    ibuf_max_tablespace_id = 0;
+    ibuf_update_max_tablespace_id();
+    try std.testing.expect(ibuf_max_tablespace_id >= space_id);
+
+    ibuf_inside_count = 0;
+    try std.testing.expectEqual(compat.FALSE, ibuf_inside());
+    _ = ibuf_merge_or_delete_for_page(space_id, 0, 0);
+    try std.testing.expectEqual(compat.FALSE, ibuf_inside());
 }
